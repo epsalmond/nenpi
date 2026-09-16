@@ -1290,7 +1290,7 @@ class Scan:
         self.snapshots = []  # type: List[Dict[str, Any]]
         self.boundaries = {}  # type: Dict[Tuple[str, str], List[float]]
         self.compactions = {}  # type: Dict[Tuple[str, str], List[float]]
-        self.claimed = {}  # type: Dict[str, str]
+        self.claimed = {}  # type: Dict[Tuple[str, str], str]
         self.forks = {}  # type: Dict[Tuple[str, str], Dict[str, int]]
         self.files_read = 0
         self.files_seen = 0
@@ -1376,8 +1376,8 @@ def absorb(scan: Scan, entry: FileIndex, harness: str) -> None:
     claimed = scan.claimed
     kept = scan.events[harness]
     for row in entry.events:
-        call_id = row[EVENT_ID]
-        if call_id:
+        call_id = (harness, row[EVENT_ID]) if row[EVENT_ID] else None
+        if call_id is not None:
             owner = claimed.get(call_id)
             if owner is not None:
                 # Same API call seen again: a resumed or forked transcript
@@ -1413,7 +1413,7 @@ def window_events(scan: Scan, since: Optional[float], until: Optional[float]) ->
         ]
 
 
-def rebuild_totals(scan: Scan, weights: Weights, args: argparse.Namespace) -> None:
+def rebuild_totals(scan: Scan) -> None:
     """Derive per-session token totals and weighted units from surviving events."""
     for summary in scan.sessions.values():
         summary.models = {}
@@ -2826,7 +2826,7 @@ def prepare(args: argparse.Namespace) -> Analysis:
     scan = collect(args, since)
     if not getattr(args, "whole_session", False):
         window_events(scan, since, until)
-    rebuild_totals(scan, weights, args)
+    rebuild_totals(scan)
     analysis = Analysis(scan, weights, since, until, args)
     # Prompt keys must exist before attribution so measured drain can be split
     # down to the prompt as well as the session.
