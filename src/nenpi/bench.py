@@ -349,23 +349,31 @@ class Sampler:
 
 def foreign_sessions(
     qd_script: Path, since: str, start: float, end: float, own: Sequence[str]
-) -> List[str]:
-    """Claude sessions other than this run's that had API turns in the interval."""
+) -> Tuple[List[str], bool]:
+    """Claude sessions other than this run's that had API turns in the interval.
+
+    Returns the sessions found and whether the check actually ran. A check that
+    could not run is not evidence of an idle window, so its failure is reported
+    rather than read as a clean result.
+    """
     command = [sys.executable, str(qd_script), "sessions", "--harness", "claude",
                "--since", since, "--json", "--top", "200"]
     try:
         result = subprocess.run(command, check=False, capture_output=True, timeout=300)
     except (OSError, subprocess.SubprocessError) as error:
         warn("contamination check failed (%s)" % type(error).__name__)
-        return []
+        return [], False
     if result.returncode != 0:
         warn("contamination check exited %d" % result.returncode)
-        return []
+        return [], False
     try:
         payload = json.loads(result.stdout.decode("utf-8", "replace"))
     except ValueError:
         warn("contamination check returned no JSON")
-        return []
+        return [], False
+    if not isinstance(payload, Mapping) or not isinstance(payload.get("sessions"), list):
+        warn("contamination check returned no session list")
+        return [], False
     mine = set(own)
     found = []
     for row in payload.get("sessions") or []:
@@ -380,7 +388,7 @@ def foreign_sessions(
             continue
         if float(row_end) >= start and float(row_start) <= end:
             found.append(session_id)
-    return sorted(set(found))
+    return sorted(set(found)), True
 
 
 # --------------------------------------------------------------------------
@@ -538,6 +546,7 @@ class ScenarioRun:
         self.ticks = []  # type: List[Dict[str, Any]]
         self.stop_reason = "incomplete"
         self.contaminated_by = []  # type: List[str]
+        self.contamination_reasons = []  # type: List[str]
         self.rollover = False
         self.start_percent = None  # type: Optional[float]
         self.measured_context = None  # type: Optional[int]
@@ -594,8 +603,9 @@ class ScenarioRun:
             "cost_usd": self.cost_usd,
             "ticks": self.ticks,
             "stop_reason": self.stop_reason,
-            "contaminated": bool(self.contaminated_by),
+            "contaminated": bool(self.contaminated_by or self.contamination_reasons),
             "contaminated_by": list(self.contaminated_by),
+            "contamination_reasons": list(self.contamination_reasons),
             "window_rollover": self.rollover,
         }
 
@@ -1326,11 +1336,15 @@ def command_run(args: argparse.Namespace) -> int:
     own_sessions = []  # type: List[str]
     started = time.time()
     if args.require_idle:
-        foreign = foreign_sessions(args.quota_drain, args.contamination_since,
-                                   started - 600.0, started, own_sessions)
+        foreign, checked = foreign_sessions(args.quota_drain, args.contamination_since,
+                                            started - 600.0, started, own_sessions)
         if foreign:
             warn("--require-idle: %d other Claude session(s) active in the last 10 minutes"
                  % len(foreign))
+            return EXIT_GUARD
+        if not checked:
+            warn("--require-idle: the contamination check did not run, so an idle "
+                 "window cannot be confirmed; nothing was spent")
             return EXIT_GUARD
 
     run_id = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime(started))
@@ -1362,11 +1376,25 @@ def command_run(args: argparse.Namespace) -> int:
             for scenario in scenarios:
                 print("running %s" % scenario.key)
                 scenario_start = time.time()
+                before, before_checked = foreign_sessions(
+                    args.quota_drain, args.contamination_since,
+                    scenario_start - 300.0, scenario_start, own_sessions)
                 state = run_scenario(scenario, args, sampler, budget, workdir,
                                      calls_log, own_sessions)
-                foreign = foreign_sessions(args.quota_drain, args.contamination_since,
-                                           scenario_start, state.ended, own_sessions)
-                state.contaminated_by = foreign
+                after, after_checked = foreign_sessions(
+                    args.quota_drain, args.contamination_since,
+                    scenario_start, state.ended, own_sessions)
+                # The pre-check runs before this scenario's own session ids are
+                # known, so its findings are re-filtered once they are.
+                state.contaminated_by = sorted(
+                    (set(before) | set(after)) - set(own_sessions)
+                )
+                if not (before_checked and after_checked):
+                    # A check that did not run cannot clear the window.
+                    state.contamination_reasons.append("check_failed")
+                if state.contaminated_by:
+                    state.contamination_reasons.append("foreign_session")
+                foreign = state.contaminated_by or state.contamination_reasons
                 record = state.as_json()
                 records.append(record)
                 scenario_log.write(json.dumps(record, sort_keys=True) + "\n")

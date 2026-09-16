@@ -505,6 +505,39 @@ class Contamination(Harness):
         self.assertEqual(result.returncode, 0, result.stderr.decode("utf-8", "replace"))
         self.assertFalse(self.scenario_records()[0]["contaminated"])
 
+    def test_a_failed_check_contaminates_the_scenario(self) -> None:
+        # An unreadable sessions payload is not evidence of a clean window.
+        self.sessions_fixture.write_text("not json", encoding="utf-8")
+        self.environment["BENCH_FAKE_SESSIONS"] = str(self.sessions_fixture)
+        result = self.run_scenarios("--models", "claude-haiku-4-5", "--contexts", "10k",
+                                    "--cache", "warm")
+        self.assertEqual(result.returncode, 0, result.stderr.decode("utf-8", "replace"))
+        record = self.scenario_records()[0]
+        self.assertTrue(record["contaminated"])
+        self.assertIn("check_failed", record["contamination_reasons"])
+
+    def test_require_idle_refuses_when_the_check_fails(self) -> None:
+        self.sessions_fixture.write_text("not json", encoding="utf-8")
+        self.environment["BENCH_FAKE_SESSIONS"] = str(self.sessions_fixture)
+        result = self.bench(
+            "run", "--yes", "--require-idle", "--quota-drain", str(self.fake_drain),
+            "--sample-interval", "0", "--models", "claude-haiku-4-5", "--contexts", "10k",
+        )
+        self.assertEqual(result.returncode, QB.EXIT_GUARD)
+        self.assertIn(b"did not run", result.stderr)
+        self.assertEqual(self.fake_calls(), [])
+
+    def test_a_session_active_before_the_scenario_contaminates_it(self) -> None:
+        now = time.time()
+        self.write_sessions([{"harness": "claude", "session_id": "earlier-one",
+                              "start": now - 200, "end": now - 100}])
+        result = self.run_scenarios("--models", "claude-haiku-4-5", "--contexts", "10k",
+                                    "--cache", "warm")
+        self.assertEqual(result.returncode, 0, result.stderr.decode("utf-8", "replace"))
+        record = self.scenario_records()[0]
+        self.assertTrue(record["contaminated"])
+        self.assertEqual(record["contaminated_by"], ["earlier-one"])
+
     def test_require_idle_refuses_to_start(self) -> None:
         now = time.time()
         self.write_sessions([{"harness": "claude", "session_id": "someone-else",
