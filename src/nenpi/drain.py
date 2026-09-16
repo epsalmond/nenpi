@@ -17,6 +17,7 @@ import argparse
 import bisect
 import hashlib
 import json
+import math
 import os
 import re
 import shutil
@@ -28,9 +29,13 @@ from typing import Any, Dict, Iterable, Iterator, List, Mapping, Optional, Seque
 
 
 PREFIX = "QUOTA_DRAIN_"
-CACHE_SCHEMA = 1
+CACHE_SCHEMA = 2
 JSON_SCHEMA = 1
 LONG_CONTEXT_THRESHOLD = 200_000
+CONTEXT_REDUCTION_FRACTION = 0.30
+MIN_REDUCTION_CONTEXT = 20_000
+REDUCTION_PERSISTENCE_TURNS = 3
+BOUNDARY_DEDUP_SECONDS = 5.0
 MAX_CONFIG_JSON_BYTES = 128 * 1024 * 1024
 DEDUP_CARRY_IDS = 64
 PROGRESS_INTERVAL_SECONDS = 0.5
@@ -85,7 +90,15 @@ CODEX_LINE_MARKERS = (
     b'"turn_context"',
     b'"token_usage_record"',
     b'"token_count"',
+    b'"task_started"',
+    b'"compacted"',
 )
+
+# A Claude user line that carries a tool result is a fan-out step, not a new
+# prompt, and its payload is the bulk of a transcript's bytes. Screening those
+# out before json.loads keeps the scan cheap.
+CLAUDE_USER_MARKERS = (b'"type":"user"', b'"type": "user"')
+CLAUDE_NOT_A_PROMPT = (b'"toolUseResult"', b'"tool_result"')
 
 ANSI = {
     "reset": "\033[0m",
@@ -560,6 +573,10 @@ class FileIndex:
         self.cumulative = None  # type: Optional[Dict[str, int]]
         self.last_session = ""
         self.last_model = UNWEIGHTED
+        self.boundaries = []  # type: List[List[Any]]
+        self.compactions = []  # type: List[List[Any]]
+        self.thread_id = ""
+        self.is_subagent = False
 
     def to_json(self) -> Dict[str, Any]:
         return {
@@ -575,6 +592,10 @@ class FileIndex:
             "cumulative": self.cumulative,
             "last_session": self.last_session,
             "last_model": self.last_model,
+            "boundaries": self.boundaries,
+            "compactions": self.compactions,
+            "thread_id": self.thread_id,
+            "is_subagent": self.is_subagent,
         }
 
     @classmethod
@@ -592,21 +613,65 @@ class FileIndex:
         index.cumulative = payload.get("cumulative")
         index.last_session = str(payload.get("last_session", ""))
         index.last_model = str(payload.get("last_model", UNWEIGHTED))
+        index.boundaries = list(payload.get("boundaries") or [])
+        index.compactions = list(payload.get("compactions") or [])
+        index.thread_id = str(payload.get("thread_id", ""))
+        index.is_subagent = bool(payload.get("is_subagent"))
         return index
 
 
-# Event layout: [session_id, model, timestamp, k0, k1, k2, k3, long_context]
+# Event layout, one row per deduped API call:
+# [session_id, model, timestamp, k0, k1, k2, k3, long_context, subagent, turn_id]
+# assemble_prompts appends the owning prompt index as EVENT_PROMPT.
 EVENT_SESSION, EVENT_MODEL, EVENT_TS = 0, 1, 2
 EVENT_KINDS = 3
 EVENT_LONG = 7
+EVENT_SUB = 8
+EVENT_TURN = 9
+EVENT_THREAD = 10
+EVENT_PROMPT = 11
+EVENT_STORED_WIDTH = 11
 
 
 def event_tokens(event: Sequence[Any], kinds: Sequence[str]) -> Dict[str, int]:
     return dict((kind, int(event[EVENT_KINDS + offset])) for offset, kind in enumerate(kinds))
 
 
+def event_context(event: Sequence[Any], harness: str) -> int:
+    """Tokens the harness re-sent to the API for this one call."""
+    if harness == "claude":
+        # input + cache_read + both cache-write TTLs
+        return int(event[3]) + int(event[4]) + int(event[5]) + int(event[6])
+    # Codex splits input into uncached and cached; together they are the context.
+    return int(event[3]) + int(event[4])
+
+
 # --------------------------------------------------------------------------
 # Claude parsing
+
+
+def is_claude_prompt(record: Mapping[str, Any], is_subagent_file: bool) -> bool:
+    """True for a line that represents a person typing, not a fan-out step."""
+    if record.get("isSidechain") or is_subagent_file or record.get("isMeta"):
+        return False
+    if "toolUseResult" in record:
+        return False
+    message = record.get("message")
+    if not isinstance(message, dict):
+        return False
+    content = message.get("content")
+    if isinstance(content, str):
+        return bool(content.strip())
+    if not isinstance(content, list):
+        return False
+    for block in content:
+        if not isinstance(block, dict):
+            continue
+        if block.get("type") == "tool_result":
+            return False
+    return any(
+        isinstance(block, dict) and block.get("type") == "text" for block in content
+    )
 
 
 def parse_claude_file(path: Path, index: FileIndex) -> FileIndex:
@@ -616,7 +681,12 @@ def parse_claude_file(path: Path, index: FileIndex) -> FileIndex:
     offset = index.offset
     for position, raw in read_lines_from(path, index.offset):
         offset = position
-        if b'"usage"' not in raw and b'"cost-state"' not in raw:
+        wants_usage = b'"usage"' in raw or b'"cost-state"' in raw
+        wants_prompt = (
+            any(marker in raw for marker in CLAUDE_USER_MARKERS)
+            and not any(marker in raw for marker in CLAUDE_NOT_A_PROMPT)
+        )
+        if not wants_usage and not wants_prompt:
             continue
         try:
             record = json.loads(raw)
@@ -639,6 +709,13 @@ def parse_claude_file(path: Path, index: FileIndex) -> FileIndex:
                 "totalDuration": record.get("totalDuration"),
                 "totalAPIDuration": record.get("totalAPIDuration"),
             }
+            continue
+        if kind == "user":
+            if is_claude_prompt(record, is_subagent_file):
+                epoch = parse_timestamp(record.get("timestamp"))
+                if epoch is not None:
+                    index.boundaries.append([session_id, epoch])
+                    summary.touch(epoch)
             continue
         if kind != "assistant":
             continue
@@ -697,6 +774,9 @@ def parse_claude_file(path: Path, index: FileIndex) -> FileIndex:
                     write_5m,
                     write_1h,
                     1 if long_context else 0,
+                    1 if sidechain else 0,
+                    "",
+                    "",
                 ]
             )
     index.offset = offset
@@ -760,17 +840,37 @@ def parse_codex_file(path: Path, index: FileIndex) -> FileIndex:
         if not isinstance(record, dict):
             continue
         kind = record.get("type")
+        epoch = parse_timestamp(record.get("timestamp"))
+
+        if kind == "compacted":
+            # Fields sit directly on the record. Only the timestamp and the
+            # window id are read; the history fields alongside them
+            # (`message`, `replacement_history`, `guardian_history`,
+            # `retained_context`) hold prompt text and are never touched.
+            if epoch is not None and session_id:
+                index.compactions.append(
+                    [session_id, epoch, str(record.get("window_id") or "")]
+                )
+            continue
+
         payload = record.get("payload")
         if not isinstance(payload, dict):
             continue
-        epoch = parse_timestamp(record.get("timestamp"))
 
         if kind == "session_meta":
-            candidate = payload.get("id")
-            if isinstance(candidate, str) and candidate:
-                session_id = candidate
+            # A Codex session spans several rollouts: the root thread plus one
+            # file per spawned subagent, all sharing `session_id`.
+            thread = payload.get("id")
+            if isinstance(thread, str) and thread:
+                index.thread_id = thread
+            umbrella = payload.get("session_id")
+            if isinstance(umbrella, str) and umbrella:
+                session_id = umbrella
+            elif isinstance(thread, str) and thread:
+                session_id = thread
             if not session_id:
                 session_id = path.stem
+            index.is_subagent = is_codex_subagent(payload)
             summary = index.sessions.setdefault(session_id, SessionSummary("codex", session_id))
             cwd = payload.get("cwd")
             if isinstance(cwd, str) and cwd:
@@ -789,6 +889,8 @@ def parse_codex_file(path: Path, index: FileIndex) -> FileIndex:
         summary = index.sessions.setdefault(session_id, SessionSummary("codex", session_id))
 
         if kind == "turn_context":
+            if epoch is not None and not index.is_subagent:
+                add_boundary(index.boundaries, session_id, epoch)
             candidate = payload.get("model")
             collaboration = payload.get("collaboration_mode")
             if isinstance(collaboration, dict):
@@ -810,7 +912,24 @@ def parse_codex_file(path: Path, index: FileIndex) -> FileIndex:
             thread_usage = payload.get("thread_token_usage")
             if isinstance(thread_usage, dict):
                 summary.thread_usage = codex_usage_tokens(thread_usage)
-            record_event(index.events, summary, session_id, model, epoch, tokens, CODEX_KINDS)
+            turn_id = payload.get("turn_id")
+            record_event(
+                index.events,
+                summary,
+                session_id,
+                model,
+                epoch,
+                tokens,
+                CODEX_KINDS,
+                turn=turn_id if isinstance(turn_id, str) else "",
+                thread=index.thread_id or path.stem,
+                sidechain=index.is_subagent,
+            )
+            continue
+
+        if kind == "event_msg" and payload.get("type") == "task_started":
+            if epoch is not None and not index.is_subagent:
+                add_boundary(index.boundaries, session_id, epoch)
             continue
 
         if kind == "event_msg" and payload.get("type") == "token_count":
@@ -837,9 +956,44 @@ def parse_codex_file(path: Path, index: FileIndex) -> FileIndex:
                 session_key, SessionSummary("codex", session_key)
             )
             record_event(
-                index.events, summary, session_key, event_model, event_epoch, delta, CODEX_KINDS
+                index.events,
+                summary,
+                session_key,
+                event_model,
+                event_epoch,
+                delta,
+                CODEX_KINDS,
+                thread=index.thread_id or path.stem,
+                sidechain=index.is_subagent,
             )
     return index
+
+
+def is_codex_subagent(payload: Mapping[str, Any]) -> bool:
+    """True when a rollout is a spawned subagent thread rather than the root."""
+    if payload.get("parent_thread_id"):
+        return True
+    if payload.get("thread_source") == "subagent":
+        return True
+    source = payload.get("source")
+    if isinstance(source, str):
+        return source == "subagent"
+    if isinstance(source, Mapping):
+        return "subagent" in source
+    return False
+
+
+def add_boundary(boundaries: List[List[Any]], session_id: str, epoch: float) -> None:
+    """Record a prompt start, collapsing the task_started/turn_context pair.
+
+    Codex writes both within a second or two of each other for the same user
+    turn, so a naive append would double every prompt.
+    """
+    if boundaries:
+        last_session, last_epoch = boundaries[-1][0], boundaries[-1][1]
+        if last_session == session_id and abs(epoch - last_epoch) <= BOUNDARY_DEDUP_SECONDS:
+            return
+    boundaries.append([session_id, epoch])
 
 
 def record_event(
@@ -850,16 +1004,22 @@ def record_event(
     epoch: Optional[float],
     tokens: Mapping[str, int],
     kinds: Sequence[str],
+    turn: str = "",
+    thread: str = "",
+    sidechain: bool = False,
 ) -> None:
     context_size = tokens.get("input", 0) + tokens.get("cached_input", 0)
     long_context = context_size > LONG_CONTEXT_THRESHOLD
     summary.touch(epoch)
-    summary.add(model, tokens, long_context=long_context)
+    summary.add(model, tokens, sidechain=sidechain, long_context=long_context)
     if epoch is None:
         return
     row = [session_id, model, epoch]
     row.extend(int(tokens.get(kind, 0)) for kind in kinds)
     row.append(1 if long_context else 0)
+    row.append(1 if sidechain else 0)
+    row.append(turn)
+    row.append(thread)
     events.append(row)
 
 
@@ -951,6 +1111,9 @@ class Cache:
     def mark(self, path: Path) -> None:
         self.dirty.add(str(path))
 
+    def forget(self, path: Path) -> None:
+        self.entries.pop(str(path), None)
+
     def flush(self) -> None:
         for key in sorted(self.dirty):
             entry = self.entries.get(key)
@@ -1003,6 +1166,8 @@ class Scan:
         self.sessions = {}  # type: Dict[Tuple[str, str], SessionSummary]
         self.events = {"claude": [], "codex": []}  # type: Dict[str, List[List[Any]]]
         self.snapshots = []  # type: List[Dict[str, Any]]
+        self.boundaries = {}  # type: Dict[Tuple[str, str], List[float]]
+        self.compactions = {}  # type: Dict[Tuple[str, str], List[float]]
         self.files_read = 0
         self.files_seen = 0
         self.bytes_read = 0
@@ -1054,11 +1219,12 @@ def collect(args: argparse.Namespace, since: Optional[float]) -> Scan:
             cache.mark(path)
             scan.files_read += 1
         absorb(scan, entry, kind)
+        try:
+            cache.flush()
+        except OSError as error:
+            warn("cache not written: %s" % error)
+        cache.forget(path)
     progress.finish()
-    try:
-        cache.flush()
-    except OSError as error:
-        warn("cache not written: %s" % error)
     return scan
 
 
@@ -1067,12 +1233,15 @@ def absorb(scan: Scan, entry: FileIndex, harness: str) -> None:
         key = (harness, session_id)
         existing = scan.sessions.get(key)
         if existing is None:
-            clone = SessionSummary.from_json(summary.to_json())
-            scan.sessions[key] = clone
+            scan.sessions[key] = SessionSummary.from_json(summary.to_json())
         else:
             existing.merge(summary)
     scan.events[harness].extend(entry.events)
     scan.snapshots.extend(entry.snapshots)
+    for row in entry.boundaries:
+        scan.boundaries.setdefault((harness, str(row[0])), []).append(float(row[1]))
+    for row in entry.compactions:
+        scan.compactions.setdefault((harness, str(row[0])), []).append(float(row[1]))
 
 
 # --------------------------------------------------------------------------
@@ -1089,6 +1258,7 @@ class Interval:
         self.resets_at = resets_at
         self.rollover = rollover
         self.sessions = {}  # type: Dict[str, float]
+        self.prompts = {}  # type: Dict[Tuple[str, Any], float]
         self.features = {}  # type: Dict[Tuple[str, str], float]
 
 
@@ -1202,6 +1372,7 @@ def attribute(
         high = bisect.bisect_right(stamps, interval.end)
         total = 0.0
         shares = {}  # type: Dict[str, float]
+        prompt_shares = {}  # type: Dict[Tuple[str, Any], float]
         for event in ordered[low:high]:
             tokens = event_tokens(event, CODEX_KINDS)
             units = weights.codex_units(event[EVENT_MODEL], tokens)
@@ -1209,6 +1380,9 @@ def attribute(
                 continue
             total += units
             shares[event[EVENT_SESSION]] = shares.get(event[EVENT_SESSION], 0.0) + units
+            if len(event) > EVENT_PROMPT and event[EVENT_PROMPT] is not None:
+                prompt_key = (event[EVENT_SESSION], event[EVENT_PROMPT])
+                prompt_shares[prompt_key] = prompt_shares.get(prompt_key, 0.0) + units
             for kind in CODEX_FIT_KINDS:
                 feature = (event[EVENT_MODEL], kind)
                 interval.features[feature] = (
@@ -1218,6 +1392,412 @@ def attribute(
             continue
         for session_id, units in shares.items():
             interval.sessions[session_id] = interval.drain * units / total
+        for prompt_key, units in prompt_shares.items():
+            interval.prompts[prompt_key] = interval.drain * units / total
+
+
+# --------------------------------------------------------------------------
+# prompts, fan-out, and context reductions
+
+
+class Prompt:
+    """One user turn and the whole fan-out of API calls it triggered."""
+
+    def __init__(self, harness: str, session_id: str, index: int):
+        self.harness = harness
+        self.session_id = session_id
+        self.index = index
+        self.start = None  # type: Optional[float]
+        self.end = None  # type: Optional[float]
+        self.turns = 0
+        self.sub_turns = 0
+        self.context_start = 0
+        self.context_peak = 0
+        self.tokens = empty_tokens(CLAUDE_KINDS if harness == "claude" else CODEX_KINDS)
+        self.units = 0.0
+        self.resent_units = 0.0
+        self.input_tokens = 0
+        self.drain_percent = None  # type: Optional[float]
+        self.model = UNWEIGHTED
+        self.reduction = ""
+
+    @property
+    def kinds(self) -> Sequence[str]:
+        return CLAUDE_KINDS if self.harness == "claude" else CODEX_KINDS
+
+    @property
+    def wall_seconds(self) -> float:
+        if self.start is None or self.end is None:
+            return 0.0
+        return max(0.0, self.end - self.start)
+
+    def to_json(self) -> Dict[str, Any]:
+        return {
+            "harness": self.harness,
+            "session_id": self.session_id,
+            "short_id": short_id(self.session_id),
+            "index": self.index,
+            "start": self.start,
+            "end": self.end,
+            "wall_seconds": self.wall_seconds,
+            "api_turns": self.turns,
+            "subagent_turns": self.sub_turns,
+            "context_start": self.context_start,
+            "context_peak": self.context_peak,
+            "tokens": self.tokens,
+            "input_side_tokens": self.input_tokens,
+            "weighted_units": self.units,
+            "resent_units": self.resent_units,
+            "drain_percent": self.drain_percent,
+            "model": self.model,
+            "reduction": self.reduction,
+        }
+
+
+def input_side_units(harness: str, model: str, tokens: Mapping[str, int], weights: Weights,
+                     cache_read_weight: Optional[float]) -> float:
+    """Weighted cost of context sent to the API, excluding generated output."""
+    if harness == "claude":
+        trimmed = dict((kind, tokens.get(kind, 0)) for kind in CLAUDE_KINDS if kind != "output")
+        return weights.claude_units(model, trimmed, cache_read_weight)
+    trimmed = dict((kind, tokens.get(kind, 0)) for kind in CODEX_FIT_KINDS if kind != "output")
+    return weights.codex_units(model, trimmed)
+
+
+def assemble_prompts(
+    scan: Scan, weights: Weights, args: argparse.Namespace
+) -> Dict[Tuple[str, str], List[Prompt]]:
+    """Group API calls under the user prompt that triggered them.
+
+    Codex numbers its own turns, so `turn_id` is authoritative for the root
+    thread. Claude has no turn id, so calls fall under the most recent
+    user-prompt line. Subagent calls belong to whichever prompt was running
+    when they started, in both harnesses.
+    """
+    assembled = {}  # type: Dict[Tuple[str, str], List[Prompt]]
+    for harness, events in scan.events.items():
+        kinds = CLAUDE_KINDS if harness == "claude" else CODEX_KINDS
+        for session_id, rows in group_events_by_session(events).items():
+            bounds = sorted(scan.boundaries.get((harness, session_id), []))
+            groups = group_rows_by_prompt(rows, bounds, harness)
+            prompts = []
+            for position, (start_ts, group) in enumerate(groups, start=1):
+                prompts.append(
+                    build_prompt(harness, session_id, position, start_ts, group, kinds,
+                                 weights, args)
+                )
+            if prompts:
+                assembled[(harness, session_id)] = prompts
+    return assembled
+
+
+def group_rows_by_prompt(
+    rows: Sequence[List[Any]], bounds: Sequence[float], harness: str
+) -> List[Tuple[float, List[List[Any]]]]:
+    main = [row for row in rows if not row[EVENT_SUB]]
+    spawned = [row for row in rows if row[EVENT_SUB]]
+    if not main:
+        main, spawned = list(rows), []
+    groups = assign_prompt_keys(main, bounds, harness)
+    starts = [start for start, _ in groups]
+    for row in spawned:
+        position = bisect.bisect_right(starts, row[EVENT_TS]) - 1
+        groups[max(0, position)][1].append(row)
+    for _, group in groups:
+        group.sort(key=lambda row: row[EVENT_TS])
+    return groups
+
+
+def build_prompt(
+    harness: str,
+    session_id: str,
+    position: int,
+    start_ts: float,
+    group: Sequence[List[Any]],
+    kinds: Sequence[str],
+    weights: Weights,
+    args: argparse.Namespace,
+) -> Prompt:
+    prompt = Prompt(harness, session_id, position)
+    prompt.start = start_ts
+    baseline = 0.0
+    seen_main = False
+    for row in group:
+        if len(row) <= EVENT_PROMPT:
+            row.extend([None] * (EVENT_PROMPT + 1 - len(row)))
+        row[EVENT_PROMPT] = position
+        tokens = event_tokens(row, kinds)
+        context = event_context(row, harness)
+        prompt.end = row[EVENT_TS]
+        prompt.turns += 1
+        if row[EVENT_SUB]:
+            prompt.sub_turns += 1
+        else:
+            prompt.context_peak = max(prompt.context_peak, context)
+            if not seen_main:
+                prompt.context_start = context
+                prompt.model = row[EVENT_MODEL]
+                baseline = input_side_units(
+                    harness, row[EVENT_MODEL], tokens, weights,
+                    args.claude_cache_read_weight
+                )
+                seen_main = True
+        for kind in kinds:
+            prompt.tokens[kind] += tokens[kind]
+        prompt.input_tokens += context
+        if harness == "claude":
+            prompt.units += weights.claude_units(
+                row[EVENT_MODEL], tokens, args.claude_cache_read_weight
+            )
+        else:
+            prompt.units += weights.codex_units(row[EVENT_MODEL], tokens)
+        prompt.resent_units += input_side_units(
+            harness, row[EVENT_MODEL], tokens, weights, args.claude_cache_read_weight
+        )
+    prompt.resent_units = max(0.0, prompt.resent_units - baseline)
+    if prompt.start is None:
+        prompt.start = group[0][EVENT_TS] if group else None
+    return prompt
+
+
+def assign_prompt_keys(
+    rows: Sequence[List[Any]], bounds: Sequence[float], harness: str
+) -> List[Tuple[float, List[List[Any]]]]:
+    """Return ordered (prompt start, rows) groups for one session's main thread."""
+    groups = []  # type: List[Tuple[Any, List[List[Any]]]]
+    order = {}  # type: Dict[Any, int]
+    use_turns = harness == "codex" and all(row[EVENT_TURN] for row in rows)
+    for row in rows:
+        if use_turns:
+            key = row[EVENT_TURN]
+        else:
+            position = bisect.bisect_right(bounds, row[EVENT_TS]) - 1
+            key = bounds[position] if position >= 0 else None
+        slot = order.get(key)
+        if slot is None:
+            order[key] = len(groups)
+            groups.append((key, [row]))
+        else:
+            groups[slot][1].append(row)
+    anchored = []
+    for key, group in groups:
+        if use_turns or key is None:
+            # A turn id carries no time; anchor to the task_started line that
+            # preceded its first call so wall time covers the user's wait.
+            first_ts = group[0][EVENT_TS]
+            position = bisect.bisect_right(bounds, first_ts) - 1
+            anchored.append((bounds[position] if position >= 0 else first_ts, group))
+        else:
+            anchored.append((key, group))
+    anchored.sort(key=lambda item: item[0])
+    return anchored
+
+
+class Reduction:
+    def __init__(self, harness: str, session_id: str, epoch: float, kind: str,
+                 before: int, after: int):
+        self.harness = harness
+        self.session_id = session_id
+        self.epoch = epoch
+        self.kind = kind
+        self.before = before
+        self.after = after
+        self.turns_after = 0
+        self.saved_units = 0.0
+        self.saved_units_upper = 0.0
+        self.model = UNWEIGHTED
+
+    @property
+    def removed(self) -> int:
+        return max(0, self.before - self.after)
+
+    def to_json(self) -> Dict[str, Any]:
+        return {
+            "harness": self.harness,
+            "short_id": short_id(self.session_id),
+            "time": self.epoch,
+            "kind": self.kind,
+            "before": self.before,
+            "after": self.after,
+            "removed_tokens": self.removed,
+            "turns_after": self.turns_after,
+            "model": self.model,
+            "saved_units": self.saved_units,
+            "saved_units_upper_bound": self.saved_units_upper,
+        }
+
+
+def detect_reductions(
+    scan: Scan, weights: Weights, args: argparse.Namespace
+) -> List[Reduction]:
+    """Find points where one thread's context shrank sharply.
+
+    Codex writes a `compacted` record for its own compaction. The ported
+    /shake writes no marker at all, so any large unexplained drop is reported
+    as `unmarked`. Comparisons stay inside one thread: a Codex session runs
+    several concurrent subagent threads whose small contexts would otherwise
+    read as drops against the root thread's.
+    """
+    found = []
+    for harness, events in scan.events.items():
+        for (session_id, thread), rows in group_events_by_thread(events).items():
+            if len(rows) < REDUCTION_PERSISTENCE_TURNS + 2:
+                continue
+            marks = sorted(scan.compactions.get((harness, session_id), []))
+            for position in range(1, len(rows) - REDUCTION_PERSISTENCE_TURNS):
+                previous = rows[position - 1]
+                current = rows[position]
+                before = event_context(previous, harness)
+                after = event_context(current, harness)
+                if before < MIN_REDUCTION_CONTEXT:
+                    continue
+                ceiling = before * (1.0 - CONTEXT_REDUCTION_FRACTION)
+                if after >= ceiling:
+                    continue
+                # A genuine reduction sticks. Codex interleaves a second,
+                # smaller-context call stream into the same thread, so a drop
+                # that bounces straight back is that stream, not a reduction.
+                window = rows[position + 1 : position + 1 + REDUCTION_PERSISTENCE_TURNS]
+                if any(event_context(row, harness) >= ceiling for row in window):
+                    continue
+                marked = any(
+                    previous[EVENT_TS] < mark <= current[EVENT_TS] for mark in marks
+                )
+                reduction = Reduction(
+                    harness,
+                    session_id,
+                    current[EVENT_TS],
+                    "compact" if marked else "unmarked",
+                    before,
+                    after,
+                )
+                reduction.model = current[EVENT_MODEL]
+                reduction.turns_after = len(rows) - position - 1
+                estimate_savings(reduction, weights, args)
+                found.append(reduction)
+    found.sort(key=lambda item: item.saved_units, reverse=True)
+    return found
+
+
+def group_events_by_thread(
+    events: Sequence[List[Any]]
+) -> Dict[Tuple[str, str], List[List[Any]]]:
+    grouped = {}  # type: Dict[Tuple[str, str], List[List[Any]]]
+    for row in events:
+        thread = row[EVENT_THREAD] if len(row) > EVENT_THREAD and row[EVENT_THREAD] else ""
+        if not thread:
+            # Claude has no thread id; subagent transcripts are the only
+            # parallel context and they are already flagged.
+            thread = "sub" if row[EVENT_SUB] else "main"
+        grouped.setdefault((row[EVENT_SESSION], thread), []).append(row)
+    for rows in grouped.values():
+        rows.sort(key=lambda row: row[EVENT_TS])
+    return grouped
+
+
+def estimate_savings(
+    reduction: Reduction, weights: Weights, args: argparse.Namespace
+) -> None:
+    """Price the context every later turn no longer had to re-send.
+
+    Removed context would mostly have been served from cache, so the cache-read
+    rate is the estimate and the uncached rate is the upper bound.
+    """
+    per_turn = reduction.removed / 1_000_000.0
+    entry = weights.model_entry(reduction.harness, reduction.model)
+    if entry is None:
+        return
+    if reduction.harness == "claude":
+        cached_rate = float(entry.get("cache_read", 0.0))
+        if args.claude_cache_read_weight is not None:
+            cached_rate = float(entry.get("input", 0.0)) * args.claude_cache_read_weight
+        uncached_rate = float(entry.get("input", 0.0))
+    else:
+        cached_rate = float(entry.get("cached_input", 0.0))
+        uncached_rate = float(entry.get("input", 0.0))
+    reduction.saved_units = per_turn * reduction.turns_after * cached_rate
+    reduction.saved_units_upper = per_turn * reduction.turns_after * uncached_rate
+
+
+def group_events_by_session(events: Sequence[Sequence[Any]]) -> Dict[str, List[Sequence[Any]]]:
+    grouped = {}  # type: Dict[str, List[Sequence[Any]]]
+    for row in events:
+        grouped.setdefault(row[EVENT_SESSION], []).append(row)
+    for rows in grouped.values():
+        rows.sort(key=lambda row: row[EVENT_TS])
+    return grouped
+
+
+def percentile(values: Sequence[float], fraction: float) -> float:
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    position = int(math.ceil(fraction * len(ordered))) - 1
+    return ordered[max(0, min(len(ordered) - 1, position))]
+
+
+def solve_normal(matrix: Sequence[Sequence[float]], target: Sequence[float]) -> List[float]:
+    """Ordinary least squares by Gaussian elimination on the normal equations."""
+    rows = len(matrix)
+    if rows == 0 or not matrix[0]:
+        return []
+    columns = len(matrix[0])
+    gram = [[0.0] * (columns + 1) for _ in range(columns)]
+    for row in range(rows):
+        line = matrix[row]
+        for i in range(columns):
+            for j in range(columns):
+                gram[i][j] += line[i] * line[j]
+            gram[i][columns] += line[i] * target[row]
+    for i in range(columns):
+        pivot = max(range(i, columns), key=lambda r: abs(gram[r][i]))
+        if abs(gram[pivot][i]) < 1e-12:
+            return [0.0] * columns
+        gram[i], gram[pivot] = gram[pivot], gram[i]
+        divisor = gram[i][i]
+        for j in range(i, columns + 1):
+            gram[i][j] /= divisor
+        for r in range(columns):
+            if r == i or gram[r][i] == 0.0:
+                continue
+            factor = gram[r][i]
+            for j in range(i, columns + 1):
+                gram[r][j] -= factor * gram[i][j]
+    return [gram[i][columns] for i in range(columns)]
+
+
+def fit_growth(prompts: Sequence[Prompt]) -> Dict[str, Any]:
+    """Fit per-prompt cost against prompt index, linearly and quadratically."""
+    points = [(float(prompt.index), prompt.units) for prompt in prompts]
+    if len(points) < 3:
+        return {"samples": len(points), "better": "insufficient"}
+    xs = [point[0] for point in points]
+    ys = [point[1] for point in points]
+    linear_design = [[x, 1.0] for x in xs]
+    quadratic_design = [[x * x, x, 1.0] for x in xs]
+    linear = solve_normal(linear_design, ys)
+    quadratic = solve_normal(quadratic_design, ys)
+    tail_start = int(len(prompts) * 0.8)
+    tail = sum(prompt.units for prompt in prompts[tail_start:])
+    total = sum(ys)
+    return {
+        "samples": len(points),
+        "linear": {"slope": linear[0], "intercept": linear[1],
+                   "r_squared": r_squared(linear_design, ys, linear)},
+        "quadratic": {
+            "square_term": quadratic[0],
+            "linear_term": quadratic[1],
+            "intercept": quadratic[2],
+            "r_squared": r_squared(quadratic_design, ys, quadratic),
+        },
+        "better": (
+            "quadratic"
+            if r_squared(quadratic_design, ys, quadratic)
+            > r_squared(linear_design, ys, linear) + 0.01
+            else "linear"
+        ),
+        "last_20_percent_share": (tail / total) if total > 0 else 0.0,
+    }
 
 
 # --------------------------------------------------------------------------
@@ -1311,6 +1891,11 @@ class Row:
         self.primary_model = UNWEIGHTED
         self.estimated = False
         self.relative = 0.0
+        self.prompt_count = 0
+        self.api_turns = 0
+        self.turns_p90 = 0.0
+        self.peak_context = 0
+        self.resent_units = 0.0
 
 
 def session_rows(
@@ -1365,6 +1950,30 @@ def session_rows(
                 row.sub_units += weights.codex_units(model, tokens)
         rows.append(row)
     return rows
+
+
+def attach_fanout(rows: Sequence[Row], analysis: "Analysis") -> None:
+    """Summarise each session's prompt fan-out onto its report row."""
+    for row in rows:
+        prompts = [
+            prompt
+            for prompt in analysis.prompts_for(row.summary.harness, row.summary.session_id)
+            if analysis.in_range(prompt.start) or analysis.in_range(prompt.end)
+        ]
+        if not prompts:
+            continue
+        row.prompt_count = len(prompts)
+        row.api_turns = sum(prompt.turns for prompt in prompts)
+        row.turns_p90 = percentile([float(prompt.turns) for prompt in prompts], 0.9)
+        row.peak_context = max(prompt.context_peak for prompt in prompts)
+        row.resent_units = sum(prompt.resent_units for prompt in prompts)
+
+
+def resent_share(row: Row) -> float:
+    """Share of a session's weighted cost spent re-sending context it already sent."""
+    if row.units <= 0:
+        return 0.0
+    return min(1.0, row.resent_units / row.units)
 
 
 def apply_codex_drain(rows: Sequence[Row], intervals: Sequence[Interval]) -> None:
@@ -1597,7 +2206,7 @@ def render_sessions(rows: Sequence[Row], args: argparse.Namespace, paint: Painte
     columns = [
         ("H", 1), ("session", 8), ("cwd", 18), ("model", 18), ("start", 16),
         ("dur", 6), ("in", 7), ("cached", 7), ("write", 7), ("out", 7),
-        ("units", 9), ("drain", 10),
+        ("units", 9), ("drain", 10), ("prm", 4), ("resent", 6),
     ]
     fixed = sum(size for _, size in columns) + len(columns)
     bar_width = max(6, width - fixed - 1)
@@ -1631,6 +2240,8 @@ def render_sessions(rows: Sequence[Row], args: argparse.Namespace, paint: Painte
             format_tokens(row.tokens.get("output", 0)),
             "%.2f" % row.units,
             drain_text,
+            "%d" % row.prompt_count if row.prompt_count else "-",
+            "%.0f%%" % (100.0 * resent_share(row)) if row.resent_units else "-",
         ]
         body = " ".join(
             value.ljust(size)[:size] for value, (_, size) in zip(cells, columns)
@@ -1638,14 +2249,18 @@ def render_sessions(rows: Sequence[Row], args: argparse.Namespace, paint: Painte
         glyphs = bar(row.relative, 1.0, bar_width)
         style = "claude" if summary.harness == "claude" else "codex"
         lines.append(body + " " + paint(glyphs, style))
-        if row.sub_units > 0:
-            lines.append(
-                paint(
-                    "%s of which subagents: %s units, %d requests"
-                    % (" " * 10, "%.2f" % row.sub_units, summary.sub_requests),
-                    "dim",
-                )
+        detail = []
+        if row.api_turns:
+            detail.append(
+                "api turns %d, turns/prompt p90 %.0f, peak context %s"
+                % (row.api_turns, row.turns_p90, format_tokens(row.peak_context))
             )
+        if row.sub_units > 0:
+            detail.append(
+                "subagents %d requests / %.2f units" % (summary.sub_requests, row.sub_units)
+            )
+        if detail:
+            lines.append(paint(" " * 10 + "; ".join(detail), "dim"))
     return lines
 
 
@@ -1704,6 +2319,12 @@ def row_json(row: Row) -> Dict[str, Any]:
         "drain_percent": row.drain_percent,
         "drain_is_estimate": row.estimated,
         "relative_to_harness_peak": row.relative,
+        "prompts": row.prompt_count,
+        "api_turns": row.api_turns,
+        "turns_per_prompt_p90": row.turns_p90,
+        "peak_context_tokens": row.peak_context,
+        "resent_units": row.resent_units,
+        "resent_share": resent_share(row),
         "share_of_window_percent": row.share_of_window,
         "window_resets_at": row.resets_at,
     }
@@ -1713,21 +2334,69 @@ def row_json(row: Row) -> Dict[str, Any]:
 # subcommands
 
 
-def prepare(args: argparse.Namespace) -> Tuple[Scan, Weights, Optional[float], Optional[float]]:
+class Analysis:
+    def __init__(self, scan: Scan, weights: Weights, since: Optional[float],
+                 until: Optional[float], args: argparse.Namespace):
+        self.args = args
+        self.scan = scan
+        self.weights = weights
+        self.since = since
+        self.until = until
+        self.window = None  # type: Optional[str]
+        self.intervals = []  # type: List[Interval]
+        self.prompts = {}  # type: Dict[Tuple[str, str], List[Prompt]]
+
+    def prompts_for(self, harness: str, session_id: str) -> List[Prompt]:
+        return self.prompts.get((harness, session_id), [])
+
+    def in_range(self, epoch: Optional[float]) -> bool:
+        if epoch is None:
+            return False
+        if self.since is not None and epoch < self.since:
+            return False
+        if self.until is not None and epoch > self.until:
+            return False
+        return True
+
+
+def prepare(args: argparse.Namespace) -> Analysis:
     now = time.time()
     since = parse_since(args.since, now)
     until = parse_since(args.until, now) if getattr(args, "until", None) else None
     weights = load_weights(getattr(args, "use_calibrated", False))
     scan = collect(args, since)
-    return scan, weights, since, until
+    analysis = Analysis(scan, weights, since, until, args)
+    # Prompt keys must exist before attribution so measured drain can be split
+    # down to the prompt as well as the session.
+    analysis.prompts = assemble_prompts(scan, weights, args)
+    analysis.window = choose_window(scan.snapshots, args.window)
+    analysis.intervals = build_intervals(scan.snapshots, analysis.window)
+    attribute(analysis.intervals, scan.events["codex"], weights)
+    apply_prompt_drain(analysis)
+    return analysis
+
+
+def apply_prompt_drain(analysis: Analysis) -> None:
+    shares = {}  # type: Dict[Tuple[str, Any], float]
+    for interval in analysis.intervals:
+        for key, value in interval.prompts.items():
+            shares[key] = shares.get(key, 0.0) + value
+    for (harness, session_id), prompts in analysis.prompts.items():
+        if harness != "codex":
+            continue
+        for prompt in prompts:
+            value = shares.get((session_id, prompt.index))
+            if value is not None:
+                prompt.drain_percent = value
 
 
 def command_sessions(args: argparse.Namespace) -> int:
-    scan, weights, since, until = prepare(args)
+    analysis = prepare(args)
+    scan, weights = analysis.scan, analysis.weights
+    since, until = analysis.since, analysis.until
+    window, intervals = analysis.window, analysis.intervals
     rows = session_rows(scan, weights, args, since, until)
-    window = choose_window(scan.snapshots, args.window)
-    intervals = build_intervals(scan.snapshots, window)
-    attribute(intervals, scan.events["codex"], weights)
+    attach_fanout(rows, analysis)
     apply_codex_drain(rows, intervals)
     dollars_per_percent = claude_dollars_per_percent()
     apply_claude_estimate(rows, dollars_per_percent)
@@ -1760,7 +2429,9 @@ def command_sessions(args: argparse.Namespace) -> int:
 
 
 def command_timeline(args: argparse.Namespace) -> int:
-    scan, weights, since, until = prepare(args)
+    analysis = prepare(args)
+    scan, weights = analysis.scan, analysis.weights
+    since, until = analysis.since, analysis.until
     bucket_seconds = {"1h": 3600, "5h": 18000, "1d": 86400}[args.bucket]
     buckets = {}  # type: Dict[int, Dict[str, float]]
     for harness, events in scan.events.items():
@@ -1781,7 +2452,7 @@ def command_timeline(args: argparse.Namespace) -> int:
             slot = int(epoch // bucket_seconds) * bucket_seconds
             entry = buckets.setdefault(slot, {"claude": 0.0, "codex": 0.0, "used_percent": 0.0})
             entry[harness] += units
-    timeline_window = choose_window(scan.snapshots, args.window)
+    timeline_window = analysis.window
     for row in scan.snapshots:
         epoch = row["ts"]
         if since is not None and epoch < since:
@@ -1832,10 +2503,10 @@ def command_timeline(args: argparse.Namespace) -> int:
 
 
 def command_windows(args: argparse.Namespace) -> int:
-    scan, weights, since, until = prepare(args)
-    window = choose_window(scan.snapshots, args.window)
-    intervals = build_intervals(scan.snapshots, window)
-    attribute(intervals, scan.events["codex"], weights)
+    analysis = prepare(args)
+    scan, weights = analysis.scan, analysis.weights
+    since, until = analysis.since, analysis.until
+    window, intervals = analysis.window, analysis.intervals
     windows = {}  # type: Dict[Tuple[Any, Any], Dict[str, Any]]
     for row in scan.snapshots:
         if since is not None and row["ts"] < since:
@@ -1910,12 +2581,12 @@ def top_session_list(sessions: Mapping[str, float], top: int) -> List[Dict[str, 
 
 
 def command_calibrate(args: argparse.Namespace) -> int:
-    scan, weights, since, until = prepare(args)
+    analysis = prepare(args)
+    scan, weights = analysis.scan, analysis.weights
+    since, until = analysis.since, analysis.until
     if args.harness == "claude":
         return calibrate_claude(args)
-    window = choose_window(scan.snapshots, args.window)
-    intervals = build_intervals(scan.snapshots, window)
-    attribute(intervals, scan.events["codex"], weights)
+    window, intervals = analysis.window, analysis.intervals
     usable = [interval for interval in intervals if not interval.rollover and interval.features]
     features = sorted(set(key for interval in usable for key in interval.features))
     if len(usable) < len(features) or not features:
@@ -1982,8 +2653,324 @@ def calibrate_claude(args: argparse.Namespace) -> int:
     return 0
 
 
+def command_prompts(args: argparse.Namespace) -> int:
+    analysis = prepare(args)
+    matches = [
+        (key, prompts)
+        for key, prompts in analysis.prompts.items()
+        if key[1].replace("-", "").startswith(args.session.replace("-", ""))
+        or key[1].startswith(args.session)
+    ]
+    if not matches:
+        warn("no session matching %r; run `quota-drain sessions` for ids" % args.session)
+        return 1
+    if len(matches) > 1:
+        warn(
+            "%r matches %d sessions (%s); using the busiest"
+            % (args.session, len(matches), ", ".join(short_id(key[1]) for key, _ in matches[:5]))
+        )
+    (harness, session_id), prompts = max(
+        matches, key=lambda item: sum(prompt.units for prompt in item[1])
+    )
+    mark_reductions(prompts, analysis)
+    growth = fit_growth(prompts)
+    shown = prompts[-args.top:] if args.top and len(prompts) > args.top else prompts
+    if args.json:
+        print(
+            json.dumps(
+                {
+                    "schema": JSON_SCHEMA,
+                    "command": "prompts",
+                    "harness": harness,
+                    "short_id": short_id(session_id),
+                    "growth": growth,
+                    "prompts": [prompt.to_json() for prompt in shown],
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        return 0
+    paint = make_painter(args)
+    width = terminal_width(args)
+    print(
+        paint(
+            "session %s (%s) - %d prompts, %d API calls"
+            % (
+                short_id(session_id),
+                harness,
+                len(prompts),
+                sum(prompt.turns for prompt in prompts),
+            ),
+            "bold",
+        )
+    )
+    print("")
+    print(paint("%-4s %-16s %6s %6s %10s %10s %10s %9s %-8s" % (
+        "#", "start", "wall", "turns", "ctx start", "ctx peak", "input sent", "units", "note"),
+        "bold"))
+    for prompt in shown:
+        print(
+            "%-4d %-16s %6s %6d %10s %10s %10s %9.2f %-8s"
+            % (
+                prompt.index,
+                local_label(prompt.start or 0),
+                format_duration(prompt.wall_seconds),
+                prompt.turns,
+                format_tokens(prompt.context_start),
+                format_tokens(prompt.context_peak),
+                format_tokens(prompt.input_tokens),
+                prompt.units,
+                prompt.reduction or "",
+            )
+        )
+    print("")
+    bar_width = max(10, width - 30)
+    peak_input = max([prompt.input_tokens for prompt in shown] or [0])
+    print(paint("input tokens sent per prompt (█ uncached, ▒ cached)", "bold"))
+    for prompt in shown:
+        cached = prompt.tokens.get("cache_read", 0) + prompt.tokens.get("cached_input", 0)
+        uncached = max(0, prompt.input_tokens - cached)
+        total_cells = int(round(prompt.input_tokens / peak_input * bar_width)) if peak_input else 0
+        cached_cells = int(round(total_cells * cached / prompt.input_tokens)) if prompt.input_tokens else 0
+        glyphs = paint("█" * (total_cells - cached_cells), "codex") + paint("▒" * cached_cells, "dim")
+        print("%-4d %10s %s" % (prompt.index, format_tokens(prompt.input_tokens), glyphs))
+    print("")
+    peak_context = max([prompt.context_peak for prompt in shown] or [0])
+    print(paint("context size at peak per prompt", "bold"))
+    for prompt in shown:
+        cells = int(round(prompt.context_peak / peak_context * bar_width)) if peak_context else 0
+        print(
+            "%-4d %10s %s"
+            % (prompt.index, format_tokens(prompt.context_peak), paint("▁" * cells, "claude"))
+        )
+    print("")
+    print(paint(describe_growth(growth), "bold"))
+    return 0
+
+
+def describe_growth(growth: Mapping[str, Any]) -> str:
+    if growth.get("better") == "insufficient":
+        return "growth: too few prompts to fit (%d)" % growth.get("samples", 0)
+    linear = growth["linear"]
+    quadratic = growth["quadratic"]
+    return (
+        "growth: %s fits better | linear slope %.3f u/prompt (R^2 %.3f) | "
+        "quadratic x^2 term %.4f (R^2 %.3f) | last 20%% of prompts = %.0f%% of session cost"
+        % (
+            growth["better"],
+            linear["slope"],
+            linear["r_squared"],
+            quadratic["square_term"],
+            quadratic["r_squared"],
+            100.0 * growth["last_20_percent_share"],
+        )
+    )
+
+
+def mark_reductions(prompts: Sequence[Prompt], analysis: "Analysis") -> None:
+    reductions = detect_reductions_cached(analysis)
+    for prompt in prompts:
+        for reduction in reductions:
+            if reduction.session_id != prompt.session_id:
+                continue
+            if prompt.start is not None and prompt.end is not None:
+                if prompt.start <= reduction.epoch <= prompt.end:
+                    prompt.reduction = reduction.kind
+
+
+_REDUCTION_CACHE = {}  # type: Dict[int, List[Reduction]]
+
+
+def detect_reductions_cached(analysis: "Analysis") -> List[Reduction]:
+    key = id(analysis)
+    found = _REDUCTION_CACHE.get(key)
+    if found is None:
+        found = detect_reductions(analysis.scan, analysis.weights, analysis.args)
+        _REDUCTION_CACHE[key] = found
+    return found
+
+
+def command_fanout(args: argparse.Namespace) -> int:
+    analysis = prepare(args)
+    prompts = [
+        prompt
+        for prompts in analysis.prompts.values()
+        for prompt in prompts
+        if analysis.in_range(prompt.start) or analysis.in_range(prompt.end)
+    ]
+    if not prompts:
+        print("no prompts in range")
+        return 0
+    turns = [float(prompt.turns) for prompt in prompts]
+    contexts = [float(prompt.context_peak) for prompt in prompts]
+    top = sorted(prompts, key=lambda prompt: prompt.input_tokens, reverse=True)[:15]
+    cwds = {}  # type: Dict[Tuple[str, str], str]
+    for (harness, session_id), summary in analysis.scan.sessions.items():
+        cwds[(harness, session_id)] = cwd_label(summary.cwd)
+    summary_json = {
+        "schema": JSON_SCHEMA,
+        "command": "fanout",
+        "prompts": len(prompts),
+        "turns_per_prompt": {
+            "p50": percentile(turns, 0.5),
+            "p90": percentile(turns, 0.9),
+            "max": max(turns),
+        },
+        "context_at_prompt": {
+            "p50": percentile(contexts, 0.5),
+            "p90": percentile(contexts, 0.9),
+            "max": max(contexts),
+        },
+        "turns_histogram": histogram(turns, (1, 2, 3, 5, 10, 20, 50, 100)),
+        "context_histogram": histogram(
+            contexts, (10_000, 50_000, 100_000, 200_000, 400_000, 800_000)
+        ),
+        "top_prompts": [
+            dict(prompt.to_json(), cwd=cwds.get((prompt.harness, prompt.session_id), "-"))
+            for prompt in top
+        ],
+    }
+    if args.json:
+        print(json.dumps(summary_json, indent=2, sort_keys=True))
+        return 0
+    paint = make_painter(args)
+    print(paint("%d prompts across %d sessions" % (len(prompts), len(analysis.prompts)), "bold"))
+    print(
+        "turns/prompt  p50 %.0f  p90 %.0f  max %.0f"
+        % (percentile(turns, 0.5), percentile(turns, 0.9), max(turns))
+    )
+    print(
+        "context/prompt p50 %s  p90 %s  max %s"
+        % (
+            format_tokens(percentile(contexts, 0.5)),
+            format_tokens(percentile(contexts, 0.9)),
+            format_tokens(max(contexts)),
+        )
+    )
+    print("")
+    render_histogram(paint, "API turns per prompt", summary_json["turns_histogram"],
+                     terminal_width(args))
+    print("")
+    render_histogram(paint, "peak context per prompt", summary_json["context_histogram"],
+                     terminal_width(args), tokens=True)
+    print("")
+    print(paint("top 15 single prompts by input tokens sent", "bold"))
+    print(paint("%-7s %-10s %-18s %5s %6s %10s %10s" % (
+        "harness", "session", "cwd", "#", "turns", "ctx peak", "input"), "bold"))
+    for prompt in top:
+        print(
+            "%-7s %-10s %-18s %5d %6d %10s %10s"
+            % (
+                prompt.harness,
+                short_id(prompt.session_id),
+                cwds.get((prompt.harness, prompt.session_id), "-")[:18],
+                prompt.index,
+                prompt.turns,
+                format_tokens(prompt.context_peak),
+                format_tokens(prompt.input_tokens),
+            )
+        )
+    return 0
+
+
+def histogram(values: Sequence[float], edges: Sequence[float]) -> List[Dict[str, Any]]:
+    buckets = []
+    previous = 0.0
+    for edge in edges:
+        buckets.append({"lower": previous, "upper": edge, "count": 0})
+        previous = edge
+    buckets.append({"lower": previous, "upper": None, "count": 0})
+    for value in values:
+        placed = False
+        for bucket in buckets[:-1]:
+            if value < bucket["upper"]:
+                bucket["count"] += 1
+                placed = True
+                break
+        if not placed:
+            buckets[-1]["count"] += 1
+    return buckets
+
+
+def render_histogram(paint: "Painter", title: str, buckets: Sequence[Mapping[str, Any]],
+                     width: int, tokens: bool = False) -> None:
+    print(paint(title, "bold"))
+    peak = max([bucket["count"] for bucket in buckets] or [0])
+    bar_width = max(10, width - 34)
+    for bucket in buckets:
+        lower = format_tokens(bucket["lower"]) if tokens else "%.0f" % bucket["lower"]
+        upper = (
+            (format_tokens(bucket["upper"]) if tokens else "%.0f" % bucket["upper"])
+            if bucket["upper"] is not None
+            else "+"
+        )
+        cells = int(round(bucket["count"] / peak * bar_width)) if peak else 0
+        print("%9s - %-9s %7d %s" % (lower, upper, bucket["count"], "█" * cells))
+
+
+def command_reductions(args: argparse.Namespace) -> int:
+    analysis = prepare(args)
+    found = [
+        reduction
+        for reduction in detect_reductions_cached(analysis)
+        if analysis.in_range(reduction.epoch)
+    ][: args.top]
+    if args.json:
+        print(
+            json.dumps(
+                {
+                    "schema": JSON_SCHEMA,
+                    "command": "reductions",
+                    "reductions": [reduction.to_json() for reduction in found],
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        return 0
+    paint = make_painter(args)
+    if not found:
+        print("no context reductions detected in range")
+        return 0
+    print(
+        paint(
+            "context reductions (>%d%% drop between consecutive API calls)"
+            % int(CONTEXT_REDUCTION_FRACTION * 100),
+            "bold",
+        )
+    )
+    print(
+        paint(
+            "%-7s %-10s %-9s %-16s %9s %9s %9s %6s %10s %10s"
+            % ("harness", "session", "kind", "time", "before", "after", "removed",
+               "turns", "saved", "upper"),
+            "bold",
+        )
+    )
+    for reduction in found:
+        print(
+            "%-7s %-10s %-9s %-16s %9s %9s %9s %6d %10.2f %10.2f"
+            % (
+                reduction.harness,
+                short_id(reduction.session_id),
+                reduction.kind,
+                local_label(reduction.epoch),
+                format_tokens(reduction.before),
+                format_tokens(reduction.after),
+                format_tokens(reduction.removed),
+                reduction.turns_after,
+                reduction.saved_units,
+                reduction.saved_units_upper,
+            )
+        )
+    return 0
+
+
 def command_verify(args: argparse.Namespace) -> int:
-    scan, weights, since, until = prepare(args)
+    analysis = prepare(args)
+    scan, weights = analysis.scan, analysis.weights
+    since, until = analysis.since, analysis.until
     report = []
     for (harness, session_id), summary in sorted(scan.sessions.items()):
         if since is not None and (summary.end or 0) < since:
@@ -2218,6 +3205,19 @@ def build_parser() -> argparse.ArgumentParser:
     calibrate = sub.add_parser("calibrate", help="fit weights against measured drain")
     add_common(calibrate)
     calibrate.set_defaults(handler=command_calibrate)
+
+    prompts = sub.add_parser("prompts", help="per-prompt fan-out and context growth for one session")
+    add_common(prompts)
+    prompts.add_argument("--session", required=True, metavar="ID_PREFIX")
+    prompts.set_defaults(handler=command_prompts)
+
+    fanout = sub.add_parser("fanout", help="turns-per-prompt and context distributions")
+    add_common(fanout)
+    fanout.set_defaults(handler=command_fanout)
+
+    reductions = sub.add_parser("reductions", help="points where a session's context shrank")
+    add_common(reductions)
+    reductions.set_defaults(handler=command_reductions)
 
     verify = sub.add_parser("verify", help="cross-check parsed totals against in-band summaries")
     add_common(verify)
