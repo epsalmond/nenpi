@@ -497,12 +497,15 @@ invocation, which dominates the runtime of a narrow query.
 Measured on `nas` over 2614 Claude transcripts (1.2 GB) and 3373 Codex
 rollouts (9.1 GB):
 
-| run | wall |
-| --- | --- |
-| full history, cold cache | ~41 s |
-| full history, warm cache | ~4 s |
-| `--since 3d`, cold cache | ~5 s |
-| `--since 3d`, warm cache | ~0.3 s |
+| run | wall | peak rss |
+| --- | --- | --- |
+| full history, cold cache | ~80 s | 577 MB |
+| full history, warm cache | ~7 s | 629 MB |
+| `--since 3d`, cold cache | ~10 s | 88 MB |
+| `--since 3d`, warm cache | ~1.2 s | 62 MB |
+
+A cold full sweep is the price of corpus-wide dedup: every transcript has to
+be read once before a replayed API call can be told from a new one.
 
 Only the structural fields are read: `type`, `message.usage`, `message.id`,
 `message.model`, timestamps, ids, `cwd`, and the Codex `rate_limits` and
