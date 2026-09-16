@@ -40,15 +40,21 @@ quota-drain timeline    [--bucket 1h|5h|1d]
 quota-drain windows     [--harness codex]
 quota-drain calibrate   [--harness codex|claude] [--since ...]
 quota-drain verify      [--since ...]
-quota-drain snapshot    [--stdin | --oauth [--config-dir PATH]]
+quota-drain snapshot    [--stdin | --oauth [--config-dir PATH] | --compact]
 ```
 
 Common flags on every reporting subcommand: `--claude-root PATH` and
 `--codex-root PATH` (both repeatable) add transcript roots,
 `--claude-cache-read-weight FLOAT` overrides the disputed cache-read price,
 `--long-context-multiplier FLOAT` scales requests over 200K tokens (a no-op at
-its default of 1.0), `--use-calibrated` prefers a stored fit, and
+its default of 1.0), `--use-calibrated` prefers a stored fit,
+`--whole-session` reports each selected session's whole life rather than the
+part inside the range, `--ascii` draws bars without block glyphs, and
 `--rebuild-cache` discards the parse cache.
+
+`--since` and `--until` window the **events**, not just the session list. A
+session that started weeks ago and ran again this morning reports only this
+morning's tokens; `--whole-session` opts back into its lifetime totals.
 
 ### sessions
 
@@ -115,6 +121,24 @@ harnesses use the same non-negative least squares over snapshot intervals:
 each interval contributes its summed tokens per (model, kind) as features and
 its measured percent drain as the target.
 
+Least squares returns a number for every coefficient, including ones the data
+cannot separate: a model that only ever ran beside another, or one with too
+little token mass to move the target. Each coefficient reports the number of
+buckets it appears in, its share of token mass, its highest correlation with
+any other coefficient, and whether it sits at the non-negativity boundary. A
+coefficient is `unidentified` when it appears in fewer than 3 buckets, or
+correlates above 0.95 with another, or sits at zero with under 5% of the token
+mass. Unidentified coefficients are stored as null, never as a confident zero,
+because a zero weight prices that model as free.
+
+`--use-calibrated` converts the **whole** Codex table to percent per Mtok:
+fitted values where they are identified, and the rate card multiplied by one
+fitted global scale everywhere else. Half a table in fitted percents and half
+in rate-card credit units is not a scale — the two differ by orders of
+magnitude, so one model's event would absorb a whole interval while the rest
+rounded to nothing. If that global scale cannot be fit, no calibration is
+applied at all.
+
 Both vendors report utilisation in **whole percent**, so a single interval's
 target is almost always exactly 1.0 while its token features vary by orders of
 magnitude. Intervals are therefore summed into fixed time buckets
@@ -123,8 +147,10 @@ and not by drain matters: equal-drain buckets would make every target the same
 by construction and leave the fit no variance to explain. On 14 days of real
 Codex rollouts this is the difference between R² of -1.9 and R² of 0.93.
 
-A fit that scores R² at or below zero is stored with `"usable": false`,
-reported as `NOT USABLE`, and refused by `--use-calibrated`.
+A fit is `usable` only with R² of at least 0.5, at least one identified
+coefficient, and a fitted global scale; otherwise it is stored with
+`"usable": false`, reported as `NOT USABLE`, and refused by
+`--use-calibrated`.
 
 `--harness codex` writes the fit to
 `~/.local/state/quota-drain/codex-weights.json`; `--use-calibrated` then
@@ -152,10 +178,19 @@ forward, keeping a running maximum:
   concurrent session and is dropped.
 - Otherwise drain is the increase over the running maximum.
 
+Exactly one `window_minutes` value is ever used — whichever the snapshots
+report most often, or the one `--window` names — because a five-hour percent
+and a weekly percent have different denominators and adding them doubles every
+session's drain. Ties go to the shorter window. The header names the window in
+use. A window this tool has no name for is still selected and reported by its
+minute count.
+
 Each interval's drain is split across the sessions that recorded token deltas
 inside it, in proportion to their weighted tokens. A session's measured drain
 is the sum of its shares; `share_of_window` is its share of everything
-attributed to the same window instance.
+attributed to the same window instance. A rolled-over window's interval starts
+no earlier than the moment that window opened (`resets_at` minus its length),
+so its drain is never charged to sessions that had already finished.
 
 Two details matter and are easy to get wrong:
 
@@ -192,6 +227,14 @@ once per streamed content block — typically three times, with identical
 `message.id` and `requestId`. **Deduplicating on `message.id` is mandatory**;
 without it totals are roughly 3x too high.
 
+Dedup is corpus-wide, not per file. A forked or resumed session writes a new
+transcript under a **new `sessionId`** that replays the original's assistant
+lines verbatim — same `message.id`, same timestamps, same usage. On this host
+2.1% of tokens in the 600 newest transcripts were cross-file replays. The
+oldest file to record an API call keeps it; a session that lost calls to
+another reports `fork_of` and `duplicate_turns`. Codex is deduped the same way
+on `response_id`.
+
 Quota draw is modelled as API list-price dollars per model, because the
 officially stated factors are model, length and effort, and because the
 `limit_dollars` / `used_dollars` field names in `.claude.json` indicate
@@ -210,6 +253,10 @@ Model ids are normalised by stripping a trailing date suffix, so
 `claude-haiku-4-5-20251001` prices as `claude-haiku-4-5`. `<synthetic>` and
 unrecognised model strings are counted in an `unweighted` bucket and priced at
 zero; the header reports the total.
+
+Working directories are stored and printed as a **basename only**, with a
+stable hash of the full path for grouping. The full path is customer-
+identifying and never reaches the cache or the report.
 
 Subagent transcripts live at `<session-dir>/subagents/agent-<id>.jsonl`
 (sometimes nested deeper) and carry the parent's `sessionId` with
@@ -308,13 +355,18 @@ quota-drain snapshot --oauth [--config-dir ~/.claude]
 ```
 
 `--config-dir` is repeatable; with none given, every `~/.claude*` directory
-holding a `.credentials.json` with a `claudeAiOauth` block is sampled. The
+holding a `.credentials.json` with a `claudeAiOauth` block is sampled. **On
+macOS the CLI keeps these credentials in the login Keychain instead of on
+disk**, so `--oauth` finds nothing there and says so; reading the Keychain is
+deliberately not implemented. The
 access token is read from that file, held in memory for the request, and never
 printed, logged, or written anywhere. `expiresAt` is checked first; an expired
 token is skipped with a note on stderr and no refresh is attempted.
 
 Guards: one attempt per invocation, a 15 s timeout, a minimum of 60 s between
-calls per config dir, and a 10-minute backoff after an HTTP 429. Poll state
+calls per config dir, a 10-minute backoff after an HTTP 429, and a private
+opener that refuses redirects — urllib would otherwise forward the bearer
+token to whatever host answered. Poll state
 lives in `~/.local/state/quota-drain/oauth-poll.json` and holds timestamps
 only.
 
@@ -365,8 +417,14 @@ stdout byte for byte so it can sit inside the statusline pipeline:
 ... | quota-drain snapshot --stdin | bash ~/.claude/statusline-command.sh
 ```
 
-It never fails the pipeline: the passthrough happens before any parsing and
-every error after it is swallowed.
+It never fails the pipeline: the passthrough is wrapped end to end, every
+error is swallowed, and it always exits 0. It appends only when a window's
+utilisation or reset time actually moved, so a statusline that runs on every
+prompt does not grow the log.
+
+`quota-drain snapshot --compact` drops repeated entries and anything older
+than 60 days. Reporting subcommands read only the entries inside the requested
+range.
 
 ### no flag
 
@@ -421,9 +479,14 @@ unrecognised is left unweighted.
 
 Roughly 10 GB of rollouts. Files stream line by line with a byte-offset cache
 of one JSON shard per transcript under `~/.cache/quota-drain/`, keyed by path
-with `size`, `mtime` and `offset`. A grown file resumes from its stored
-offset; a file that shrank or whose mtime moved backwards is reparsed whole; a
-partial trailing line is left for the next run. `--since` prunes by Codex
+with `size`, `mtime` and `offset`. Each shard also stores a hash of the file's
+first 4 KiB and of the 256 bytes before the resume offset: size and mtime
+alone miss an in-place rewrite that happens to grow the file, which would
+resume mid-record and silently skip the rest. A grown file resumes from its
+stored offset; a file that shrank, whose mtime moved backwards, or whose
+fingerprints changed is reparsed whole; a partial trailing line is left for
+the next run. A full sweep prunes shards for transcripts that no longer exist,
+and superseded schema directories are removed on every run. `--since` prunes by Codex
 directory date and by file mtime before anything is opened, so a narrow query
 never touches the shards of files outside the window.
 
@@ -479,6 +542,8 @@ applied above 200K tokens so it can be tested later.
 ## Limits
 
 - Fast mode is not detectable from transcripts, so Astra's 2.5x is not applied.
+- Bars use Unicode block glyphs and fall back to ASCII when stdout is not
+  UTF-8 or under `--ascii`.
 - Codex `used_percent` arrives in whole percent, which caps how finely drain
   can be attributed; calibration needs multi-day ranges and time bucketing
   before it means anything.
@@ -494,7 +559,7 @@ applied above 200K tokens so it can be tested later.
 ## Verification
 
 ```sh
-scripts/test-quota-drain                                  # 57 synthetic-fixture tests
+scripts/test-quota-drain                                  # 82 synthetic-fixture tests
 python3 -m py_compile scripts/quota-drain
 uv run --python 3.9 --no-project scripts/test-quota-drain # 3.9 floor
 ```
