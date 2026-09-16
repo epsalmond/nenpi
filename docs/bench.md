@@ -233,6 +233,21 @@ record of the run rather than a price table. Only a usable fit is written to
 `claude-weights.json` at all; an unusable one lands beside it as
 `claude-weights.unusable.json`, which nothing loads.
 
+### Merging a fit into quota-drain by hand
+
+Copying the `claude` section into `~/.config/quota-drain/weights.json` mixes
+two units. The fitted numbers are percent per million tokens; every kind the
+section omits keeps its built-in price, which is USD per million tokens. A
+partial fit merged that way prices some kinds in percent and the rest in
+dollars, and the two differ by orders of magnitude, so one kind's tokens will
+swamp the rest. `fallback_scale` is what converts the omitted kinds onto the
+fitted unit, and quota-drain does not yet apply it when merging a Claude fit.
+
+Until it does, merge only a fit that identifies all four kinds for the models
+you care about — `input`, `cache_read`, `cache_write_5m` and `output` — so no
+kind falls back. `quota-bench report` names every unidentified kind and its
+reason.
+
 `QUOTA_DRAIN_HOME_DIR`, `QUOTA_DRAIN_CACHE_DIR`, `QUOTA_DRAIN_STATE_DIR` and
 `QUOTA_DRAIN_CONFIG_DIR` relocate all of it, exactly as they do for
 quota-drain.
@@ -296,7 +311,7 @@ spending a run.
 ## Verification
 
 ```sh
-scripts/test-quota-bench                                  # 53 tests, no quota spent
+scripts/test-quota-bench                                  # 58 tests, no quota spent
 python3 -m py_compile scripts/quota-bench
 uv run --python 3.9 --no-project scripts/test-quota-bench # 3.9 floor
 ```
@@ -315,3 +330,19 @@ scripts/quota-bench run --models claude-haiku-4-5-20251001 --contexts 10k \
 One tick produces an upper bound rather than a measurement, and a single
 scenario identifies nothing, so that run writes no weights file: it proves the
 plumbing, and the matrix is what produces a fit.
+
+## Follow-ups
+
+Known work this tool does not do yet:
+
+- **Retry a transient sampler failure.** One failed poll ends the run today.
+  A bounded retry window — a few attempts inside the time the freshness limit
+  allows — would let a run survive a single timeout without ever letting it
+  spend blind.
+- **Scale omitted kinds on merge.** Applying `fallback_scale` to the kinds a
+  fit leaves out would put a partial fit on one unit and remove the
+  merge-by-hand caveat above.
+- **Project spend inside the run.** The budget is checked against the newest
+  sample, so calls made since then are unaccounted. Stopping when observed
+  spend plus the projected spend of the calls made since the last sample
+  exceeds the five-hour budget would close the blind window.
