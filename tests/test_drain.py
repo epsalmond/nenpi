@@ -1036,6 +1036,40 @@ class OutputContracts(Harness):
         self.assertNotIn("\033[", text)
         self.assertIn("66666666", text)
 
+    def test_table_fits_120_columns(self) -> None:
+        now = time.time() - 600
+        self.write_claude(
+            "width.jsonl",
+            [
+                claude_assistant_line(
+                    now, "eeee0001-1111-2222-3333-444444444444", "msg_w",
+                    input_tokens=1_234_567, cache_read=98_765_432,
+                    cache_write_5m=12_345, output_tokens=654_321
+                )
+            ],
+        )
+        result = self.run_tool("sessions", "--no-color", "--width", "120")
+        self.assertEqual(result.returncode, 0, result.stderr.decode("utf-8", "replace"))
+        for line in result.stdout.decode("utf-8").splitlines():
+            self.assertLessEqual(len(line), 120, line)
+
+    def test_ascii_falls_back_when_asked(self) -> None:
+        now = time.time() - 600
+        self.write_claude(
+            "ascii.jsonl",
+            [
+                claude_assistant_line(
+                    now, "eeee0002-1111-2222-3333-444444444444", "msg_a",
+                    output_tokens=1000
+                )
+            ],
+        )
+        result = self.run_tool("sessions", "--no-color", "--ascii", "--width", "150")
+        text = result.stdout.decode("utf-8")
+        self.assertEqual(result.returncode, 0)
+        self.assertNotIn("\u2588", text)
+        self.assertIn("#", text)
+
     def test_timeline_buckets(self) -> None:
         now = time.time() - 7200
         session = "77777777-aaaa-2222-3333-444444444444"
@@ -1111,6 +1145,76 @@ class Snapshots(Harness):
         result = self.run_tool("snapshot", "--stdin", stdin=payload)
         self.assertEqual(result.returncode, 0)
         self.assertEqual(result.stdout, payload)
+
+    def test_stdin_appends_only_on_change(self) -> None:
+        payload = json.dumps(
+            {"rate_limits": {"five_hour": {"used_percentage": 42.5,
+                                           "resets_at": "2026-09-16T21:30:00Z"}}}
+        ).encode("utf-8")
+        for _ in range(3):
+            self.assertEqual(self.run_tool("snapshot", "--stdin", stdin=payload).stdout,
+                             payload)
+        moved = json.dumps(
+            {"rate_limits": {"five_hour": {"used_percentage": 44.0,
+                                           "resets_at": "2026-09-16T21:30:00Z"}}}
+        ).encode("utf-8")
+        self.run_tool("snapshot", "--stdin", stdin=moved)
+        logged = (self.root / "state" / "snapshots.jsonl").read_text(encoding="utf-8")
+        self.assertEqual(len(logged.strip().splitlines()), 2)
+
+    def test_compact_drops_repeats_and_stale_entries(self) -> None:
+        path = self.root / "state" / "snapshots.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        now = time.time()
+        records = [
+            {"source": "oauth", "config_dir": ".claude", "ts": now - 90 * 86400,
+             "windows": {"five_hour": {"utilization_percent": 1.0}}},
+            {"source": "oauth", "config_dir": ".claude", "ts": now - 3600,
+             "windows": {"five_hour": {"utilization_percent": 5.0}}},
+            {"source": "oauth", "config_dir": ".claude", "ts": now - 1800,
+             "windows": {"five_hour": {"utilization_percent": 5.0}}},
+            {"source": "oauth", "config_dir": ".claude", "ts": now - 900,
+             "windows": {"five_hour": {"utilization_percent": 7.0}}},
+        ]
+        path.write_text(
+            "".join(json.dumps(record) + "\n" for record in records), encoding="utf-8"
+        )
+        result = self.run_tool("snapshot", "--compact")
+        self.assertEqual(result.returncode, 0)
+        self.assertIn(b"kept 2", result.stdout)
+        kept = [
+            json.loads(line)
+            for line in path.read_text(encoding="utf-8").strip().splitlines()
+        ]
+        self.assertEqual(
+            [record["windows"]["five_hour"]["utilization_percent"] for record in kept],
+            [5.0, 7.0],
+        )
+
+    def test_version_comes_from_a_parsed_field(self) -> None:
+        now = time.time() - 600
+        self.write_claude(
+            "ver.jsonl",
+            [
+                json.dumps(
+                    {
+                        "type": "user",
+                        "sessionId": "eeee0003-1111-2222-3333-444444444444",
+                        "timestamp": iso(now),
+                        "message": {"role": "user",
+                                    "content": 'pasted text with "version":"9.9.9" inside'},
+                    }
+                ),
+                claude_assistant_line(
+                    now + 1, "eeee0003-1111-2222-3333-444444444444", "msg_v",
+                    output_tokens=10
+                ),
+            ],
+        )
+        with self.env_applied():
+            version = QD.detect_claude_version()
+        # The assistant fixture declares 2.1.273; the pasted string must lose.
+        self.assertEqual(version, "2.1.273")
 
     def test_config_snapshot_dedupes_by_fetched_at(self) -> None:
         config = self.home / ".claude" / ".claude.json"
@@ -1545,41 +1649,62 @@ class OauthSampler(Harness):
         return config
 
     def sample(self, args_list: Sequence[str], response: Any = None,
-               status: Optional[int] = None) -> List[Dict[str, Any]]:
+               status: Optional[int] = None, redirect_to: Optional[str] = None
+               ) -> List[Dict[str, Any]]:
         import io
         import urllib.error
         import urllib.request
 
         captured = {}
+        harness = self
 
         class FakeResponse(io.BytesIO):
-            def __enter__(self_inner):
-                return self_inner
+            def close(self_inner):
+                io.BytesIO.close(self_inner)
 
-            def __exit__(self_inner, *exc):
-                return False
+        class FakeOpener(object):
+            """Stands in for the private opener the sampler builds."""
 
-        def fake_urlopen(request, timeout=None):
-            captured["url"] = request.full_url
-            captured["headers"] = dict(request.header_items())
-            captured["timeout"] = timeout
-            if status is not None:
-                raise urllib.error.HTTPError(
-                    request.full_url, status, "rate limited", {}, None
-                )
-            body = json.dumps(response if response is not None else self.RESPONSE)
-            return FakeResponse(body.encode("utf-8"))
+            def __init__(self_inner, *handlers):
+                self_inner.handlers = handlers
 
-        original = urllib.request.urlopen
-        urllib.request.urlopen = fake_urlopen
+            def open(self_inner, request, timeout=None):
+                captured["url"] = request.full_url
+                captured["headers"] = dict(request.header_items())
+                captured["timeout"] = timeout
+                captured["handlers"] = self_inner.handlers
+                if redirect_to is not None:
+                    # Exercise the installed handler rather than asserting on
+                    # its presence: a redirect must never be followed while
+                    # the request carries a bearer token.
+                    for handler in self_inner.handlers:
+                        if isinstance(handler, urllib.request.HTTPRedirectHandler):
+                            handler.redirect_request(
+                                request, None, 302, "Found",
+                                {"Location": redirect_to}, redirect_to
+                            )
+                    raise AssertionError("redirect was not refused")
+                if status is not None:
+                    raise urllib.error.HTTPError(
+                        request.full_url, status, "rate limited", {}, None
+                    )
+                body = json.dumps(response if response is not None else harness.RESPONSE)
+                return FakeResponse(body.encode("utf-8"))
+
+        original = QD.build_oauth_opener
+        QD.build_oauth_opener = lambda: FakeOpener(*QD.build_oauth_opener_handlers())
         stdout = sys.stdout
+        stderr = sys.stderr
         sys.stdout = io.StringIO()
+        sys.stderr = io.StringIO()
         try:
             with self.env_applied():
                 QD.main(list(args_list))
         finally:
+            self.messages = sys.stderr.getvalue()
             sys.stdout = stdout
-            urllib.request.urlopen = original
+            sys.stderr = stderr
+            QD.build_oauth_opener = original
         self.captured = captured
         path = self.root / "state" / "snapshots.jsonl"
         if not path.is_file():
@@ -1638,6 +1763,12 @@ class OauthSampler(Harness):
         self.assertEqual(rows, [])
         state = json.loads((self.root / "state" / "oauth-poll.json").read_text(encoding="utf-8"))
         self.assertGreater(state[".claude"]["blocked_until"], time.time())
+
+    def test_redirects_are_refused(self) -> None:
+        self.write_credentials()
+        rows = self.sample(["snapshot", "--oauth"], redirect_to="https://evil.example/usage")
+        self.assertEqual(rows, [])
+        self.assertIn("usage request failed", self.messages)
 
     def test_expired_token_is_skipped(self) -> None:
         self.write_credentials(expires_in=-10.0)

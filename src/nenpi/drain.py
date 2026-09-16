@@ -22,6 +22,7 @@ import os
 import re
 import shutil
 import sys
+import textwrap
 import time
 import urllib.error
 import urllib.request
@@ -46,8 +47,8 @@ OAUTH_MIN_INTERVAL_SECONDS = 60.0
 OAUTH_BACKOFF_SECONDS = 600.0
 OAUTH_TIMEOUT_SECONDS = 15.0
 OAUTH_WINDOWS = ("five_hour", "seven_day", "seven_day_opus", "seven_day_sonnet")
-FALLBACK_CLAUDE_VERSION = "2.1.273"
-VERSION_IN_LINE = re.compile(r'"version"\s*:\s*"([0-9][^"]{0,31})"')
+SNAPSHOT_RETENTION_DAYS = 60
+FALLBACK_CLAUDE_VERSION = "unknown"
 DEDUP_CARRY_IDS = 64
 PROGRESS_INTERVAL_SECONDS = 0.5
 
@@ -121,6 +122,10 @@ ANSI = {
 }
 
 BAR_GLYPHS = "▏▎▍▌▋▊▉█"
+ASCII_GLYPHS = {
+    "█": "#", "▄": "=", "▀": "-", "▒": ":", "▁": ".",
+    "▏": "|", "▎": "|", "▍": "|", "▌": "|", "▋": "|", "▊": "|", "▉": "|",
+}
 
 
 def env_path(name: str, default: Path) -> Path:
@@ -1248,6 +1253,7 @@ class Progress:
         self.label = label
         self.done = 0
         self.last = 0.0
+        self.width = 0
 
     def step(self) -> None:
         self.done += 1
@@ -1257,15 +1263,16 @@ class Progress:
         if now - self.last < PROGRESS_INTERVAL_SECONDS and self.done < self.total:
             return
         self.last = now
-        sys.stderr.write(
-            "\rquota-drain: %s %d/%d" % (self.label, self.done, self.total)
-        )
+        line = "quota-drain: %s %d/%d" % (self.label, self.done, self.total)
+        self.width = max(self.width, len(line))
+        sys.stderr.write("\r" + line)
         sys.stderr.flush()
 
     def finish(self) -> None:
-        if self.enabled:
-            sys.stderr.write("\r\033[K")
-            sys.stderr.flush()
+        if not self.enabled:
+            return
+        sys.stderr.write("\r" + " " * self.width + "\r")
+        sys.stderr.flush()
 
 
 # --------------------------------------------------------------------------
@@ -2441,37 +2448,28 @@ def apply_codex_drain(rows: Sequence[Row], intervals: Sequence[Interval]) -> Non
                 row.share_of_window = 100.0 * windows[resets_at] / total
 
 
-def claude_dollars_per_percent() -> Optional[float]:
+def claude_dollars_per_percent(
+    since: Optional[float] = None, until: Optional[float] = None
+) -> Optional[float]:
     """Derive dollars-per-percent from logged Claude utilisation snapshots.
 
     Anthropic ships `limit_dollars` / `used_dollars` as null on every plan seen
     so far, so this normally returns None and Claude drain stays dollar-
     equivalent rather than a percent.
     """
-    path = state_dir() / "snapshots.jsonl"
-    if not path.is_file():
-        return None
     observations = []
-    try:
-        with open(path, encoding="utf-8") as handle:
-            for line in handle:
-                try:
-                    record = json.loads(line)
-                except ValueError:
-                    continue
-                window = (record.get("windows") or {}).get("five_hour")
-                if not isinstance(window, dict):
-                    continue
-                limit = window.get("limit_dollars")
-                if isinstance(limit, (int, float)) and limit > 0:
-                    observations.append(float(limit) / 100.0)
-                    continue
-                used = window.get("utilization_percent")
-                spent = window.get("used_dollars")
-                if isinstance(spent, (int, float)) and isinstance(used, (int, float)) and used > 0:
-                    observations.append(float(spent) / float(used))
-    except OSError:
-        return None
+    for record in iter_snapshots(since, until):
+        window = (record.get("windows") or {}).get("five_hour")
+        if not isinstance(window, dict):
+            continue
+        limit = window.get("limit_dollars")
+        if isinstance(limit, (int, float)) and limit > 0:
+            observations.append(float(limit) / 100.0)
+            continue
+        used = window.get("utilization_percent")
+        spent = window.get("used_dollars")
+        if isinstance(spent, (int, float)) and isinstance(used, (int, float)) and used > 0:
+            observations.append(float(spent) / float(used))
     if not observations:
         return None
     observations.sort()
@@ -2495,18 +2493,34 @@ def apply_claude_estimate(rows: Sequence[Row], dollars_per_percent: Optional[flo
 
 
 class Painter:
-    def __init__(self, enabled: bool):
+    def __init__(self, enabled: bool, ascii_only: bool = False):
         self.enabled = enabled
+        self.ascii_only = ascii_only
 
     def __call__(self, text: str, *styles: str) -> str:
+        text = self.glyphs(text)
         if not self.enabled or not styles:
             return text
         prefix = "".join(ANSI.get(style, "") for style in styles)
         return prefix + text + ANSI["reset"]
 
+    def glyphs(self, text: str) -> str:
+        if not self.ascii_only:
+            return text
+        for block, plain in ASCII_GLYPHS.items():
+            text = text.replace(block, plain)
+        return text
+
+
+def ascii_output(args: argparse.Namespace) -> bool:
+    if getattr(args, "ascii", False):
+        return True
+    encoding = (getattr(sys.stdout, "encoding", "") or "").lower()
+    return "utf" not in encoding
+
 
 def make_painter(args: argparse.Namespace) -> Painter:
-    return Painter(sys.stdout.isatty() and not args.no_color)
+    return Painter(sys.stdout.isatty() and not args.no_color, ascii_output(args))
 
 
 def terminal_width(args: argparse.Namespace) -> int:
@@ -2639,18 +2653,18 @@ def latest_codex_plan(snapshots: Sequence[Mapping[str, Any]]) -> str:
 
 def render_sessions(rows: Sequence[Row], args: argparse.Namespace, paint: Painter,
                     width: int) -> List[str]:
+    # Sized so the whole table plus a bar fits an 80x24 terminal's 120-column
+    # descendant; anything wider goes to the bar.
     columns = [
-        ("H", 1), ("session", 8), ("cwd", 18), ("model", 18), ("start", 16),
-        ("dur", 6), ("in", 7), ("cached", 7), ("write", 7), ("out", 7),
-        ("units", 9), ("drain", 10), ("prm", 4), ("resent", 6),
+        ("H", 1), ("session", 8), ("cwd", 12), ("model", 14), ("start", 11),
+        ("dur", 6), ("in", 6), ("cached", 6), ("write", 6), ("out", 6),
+        ("units", 8), ("drain", 9), ("prm", 3), ("resent", 6),
     ]
     fixed = sum(size for _, size in columns) + len(columns)
-    bar_width = max(6, width - fixed - 1)
-    header = (
-        " ".join(name.ljust(size)[:size] for name, size in columns)
-        + " "
-        + "share".ljust(bar_width)[:bar_width]
-    )
+    bar_width = max(0, width - fixed - 1)
+    header = " ".join(name.ljust(size)[:size] for name, size in columns)
+    if bar_width:
+        header += " " + "share".ljust(bar_width)[:bar_width]
     lines = [paint(header, "bold")]
 
     for row in rows:
@@ -2668,7 +2682,7 @@ def render_sessions(rows: Sequence[Row], args: argparse.Namespace, paint: Painte
             short_id(summary.session_id),
             cwd_label(summary.cwd),
             row.primary_model,
-            local_label(summary.start or summary.end or 0),
+            local_label(summary.start or summary.end or 0, "%m-%d %H:%M"),
             format_duration((summary.end or 0) - (summary.start or 0)),
             format_tokens(row.tokens.get("input", 0)),
             format_tokens(cached),
@@ -2682,9 +2696,10 @@ def render_sessions(rows: Sequence[Row], args: argparse.Namespace, paint: Painte
         body = " ".join(
             value.ljust(size)[:size] for value, (_, size) in zip(cells, columns)
         )
-        glyphs = bar(row.relative, 1.0, bar_width)
         style = "claude" if summary.harness == "claude" else "codex"
-        lines.append(body + " " + paint(glyphs, style))
+        if bar_width:
+            body += " " + paint(bar(row.relative, 1.0, bar_width), style)
+        lines.append(body)
         detail = []
         if row.api_turns:
             detail.append(
@@ -2784,6 +2799,7 @@ class Analysis:
         self.window = None  # type: Optional[str]
         self.intervals = []  # type: List[Interval]
         self.prompts = {}  # type: Dict[Tuple[str, str], List[Prompt]]
+        self.reductions = None  # type: Optional[List[Reduction]]
 
     def prompts_for(self, harness: str, session_id: str) -> List[Prompt]:
         return self.prompts.get((harness, session_id), [])
@@ -2848,7 +2864,7 @@ def command_sessions(args: argparse.Namespace) -> int:
     rows = session_rows(scan, weights, args, since, until)
     attach_fanout(rows, analysis)
     apply_codex_drain(rows, intervals)
-    dollars_per_percent = claude_dollars_per_percent()
+    dollars_per_percent = claude_dollars_per_percent(since, until)
     apply_claude_estimate(rows, dollars_per_percent)
     score_rows(rows)
     rows = sort_rows(rows, args.sort)[: args.top]
@@ -2867,13 +2883,15 @@ def command_sessions(args: argparse.Namespace) -> int:
         print(json.dumps(payload, indent=2, sort_keys=True))
         return 0
     paint = make_painter(args)
+    width = terminal_width(args)
     for line in header_lines(scan, rows, weights, args, dollars_per_percent, window):
-        print(paint(line, "dim"))
+        for wrapped in textwrap.wrap(line, width, subsequent_indent="  ") or [""]:
+            print(paint(wrapped, "dim"))
     if not rows:
         print("no sessions in range")
         return 0
     print("")
-    for line in render_sessions(rows, args, paint, terminal_width(args)):
+    for line in render_sessions(rows, args, paint, width):
         print(line)
     return 0
 
@@ -3025,6 +3043,9 @@ def top_session_list(sessions: Mapping[str, float], top: int) -> List[Dict[str, 
 
 
 def command_calibrate(args: argparse.Namespace) -> int:
+    if args.harness == "all":
+        # Fitting is per harness; scanning the other one buys nothing.
+        args.harness = "codex"
     analysis = prepare(args)
     scan, weights = analysis.scan, analysis.weights
     since, until = analysis.since, analysis.until
@@ -3109,16 +3130,13 @@ CLAUDE_WINDOW_MINUTES = {"five_hour": 300, "seven_day": 10080,
                          "seven_day_opus": 10080, "seven_day_sonnet": 10080}
 
 
-def load_claude_snapshots(window: str) -> List[Dict[str, Any]]:
-    """Read logged Claude utilisation observations as snapshot rows.
-
-    Shaped like the Codex `rate_limits` rows so the same interval builder and
-    NNLS fit apply to both harnesses.
-    """
+def iter_snapshots(
+    since: Optional[float] = None, until: Optional[float] = None
+) -> Iterator[Dict[str, Any]]:
+    """Yield logged snapshot records inside the requested range."""
     path = state_dir() / "snapshots.jsonl"
-    rows = []
     if not path.is_file():
-        return rows
+        return
     try:
         with open(path, encoding="utf-8") as handle:
             for line in handle:
@@ -3126,27 +3144,48 @@ def load_claude_snapshots(window: str) -> List[Dict[str, Any]]:
                     record = json.loads(line)
                 except ValueError:
                     continue
-                entry = (record.get("windows") or {}).get(window)
-                if not isinstance(entry, dict):
+                if not isinstance(record, dict):
                     continue
-                used = entry.get("utilization_percent")
                 epoch = record.get("ts")
-                if not isinstance(used, (int, float)) or not isinstance(epoch, (int, float)):
+                if not isinstance(epoch, (int, float)):
                     continue
-                rows.append(
-                    {
-                        "ts": float(epoch),
-                        "limit_id": "claude",
-                        "plan_type": str(record.get("config_dir") or "default"),
-                        "window_minutes": CLAUDE_WINDOW_MINUTES.get(window, 300),
-                        "used_percent": float(used),
-                        "resets_at": entry.get("resets_at"),
-                        "limit_dollars": entry.get("limit_dollars"),
-                        "used_dollars": entry.get("used_dollars"),
-                    }
-                )
+                if since is not None and epoch < since:
+                    continue
+                if until is not None and epoch > until:
+                    continue
+                yield record
     except OSError:
-        return []
+        return
+
+
+def load_claude_snapshots(
+    window: str, since: Optional[float] = None, until: Optional[float] = None
+) -> List[Dict[str, Any]]:
+    """Read logged Claude utilisation observations as snapshot rows.
+
+    Shaped like the Codex `rate_limits` rows so the same interval builder and
+    NNLS fit apply to both harnesses.
+    """
+    rows = []
+    for record in iter_snapshots(since, until):
+        entry = (record.get("windows") or {}).get(window)
+        if not isinstance(entry, dict):
+            continue
+        used = entry.get("utilization_percent")
+        if not isinstance(used, (int, float)):
+            continue
+        rows.append(
+            {
+                "ts": float(record["ts"]),
+                "limit_id": "claude",
+                "plan_type": str(record.get("config_dir") or "default"),
+                "window_minutes": CLAUDE_WINDOW_MINUTES.get(window, 300),
+                "used_percent": float(used),
+                "resets_at": entry.get("resets_at"),
+                "limit_dollars": entry.get("limit_dollars"),
+                "used_dollars": entry.get("used_dollars"),
+            }
+        )
     rows.sort(key=lambda row: row["ts"])
     return rows
 
@@ -3174,8 +3213,7 @@ def calibrate_claude(args: argparse.Namespace, analysis: "Analysis") -> int:
     for window in ("five_hour", "seven_day"):
         rows = [
             row
-            for row in load_claude_snapshots(window)
-            if analysis.since is None or row["ts"] >= analysis.since
+            for row in load_claude_snapshots(window, analysis.since, analysis.until)
         ]
         if len(rows) < 2:
             continue
@@ -3191,7 +3229,7 @@ def calibrate_claude(args: argparse.Namespace, analysis: "Analysis") -> int:
             (model, dict((kind, value) for kind, value in entry.items()))
             for model, entry in fit["models"].items()
         )
-        fit["dollars_per_percent"] = claude_dollars_per_percent()
+        fit["dollars_per_percent"] = claude_dollars_per_percent(analysis.since, analysis.until)
         results[window] = fit
     if not results:
         warn(
@@ -3376,16 +3414,12 @@ def mark_reductions(prompts: Sequence[Prompt], analysis: "Analysis") -> None:
                     prompt.reduction = reduction.kind
 
 
-_REDUCTION_CACHE = {}  # type: Dict[int, List[Reduction]]
-
-
 def detect_reductions_cached(analysis: "Analysis") -> List[Reduction]:
-    key = id(analysis)
-    found = _REDUCTION_CACHE.get(key)
-    if found is None:
-        found = detect_reductions(analysis.scan, analysis.weights, analysis.args)
-        _REDUCTION_CACHE[key] = found
-    return found
+    if analysis.reductions is None:
+        analysis.reductions = detect_reductions(
+            analysis.scan, analysis.weights, analysis.args
+        )
+    return analysis.reductions
 
 
 def command_fanout(args: argparse.Namespace) -> int:
@@ -3645,8 +3679,16 @@ def command_verify(args: argparse.Namespace) -> int:
     return 0
 
 
+CLI_VERSION = re.compile(r"^\d+\.\d+\.\d+$")
+
+
 def detect_claude_version() -> str:
-    """Read the CLI version off the newest transcript, for the User-Agent."""
+    """Read the CLI version off the newest transcript, for the User-Agent.
+
+    Only a top-level `version` field of a parsed line is accepted, and only
+    when it looks like a version: a regex over the raw tail would let message
+    content reach an outbound header.
+    """
     newest = None
     newest_mtime = 0.0
     for root in discover_roots(home_dir(), "claude"):
@@ -3667,8 +3709,17 @@ def detect_claude_version() -> str:
             tail = handle.read().decode("utf-8", "replace")
     except OSError:
         return FALLBACK_CLAUDE_VERSION
-    found = VERSION_IN_LINE.findall(tail)
-    return found[-1] if found else FALLBACK_CLAUDE_VERSION
+    for line in reversed(tail.splitlines()):
+        try:
+            record = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(record, dict):
+            continue
+        version = record.get("version")
+        if isinstance(version, str) and CLI_VERSION.match(version):
+            return version
+    return FALLBACK_CLAUDE_VERSION
 
 
 def oauth_config_dirs(requested: Sequence[str]) -> List[Path]:
@@ -3713,6 +3764,23 @@ def save_poll_state(state: Mapping[str, Mapping[str, float]]) -> None:
     path.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
+class RefuseRedirect(urllib.request.HTTPRedirectHandler):
+    """Redirects would forward the Authorization header to another host."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: D102
+        raise urllib.error.HTTPError(
+            req.full_url, code, "refusing redirect while holding a token", headers, fp
+        )
+
+
+def build_oauth_opener_handlers() -> List[Any]:
+    return [RefuseRedirect()]
+
+
+def build_oauth_opener() -> "urllib.request.OpenerDirector":
+    return urllib.request.build_opener(*build_oauth_opener_handlers())
+
+
 def fetch_oauth_usage(token: str, version: str) -> Dict[str, Any]:
     request = urllib.request.Request(
         OAUTH_USAGE_URL,
@@ -3724,8 +3792,12 @@ def fetch_oauth_usage(token: str, version: str) -> Dict[str, Any]:
         },
         method="GET",
     )
-    with urllib.request.urlopen(request, timeout=OAUTH_TIMEOUT_SECONDS) as response:
+    opener = build_oauth_opener()
+    response = opener.open(request, timeout=OAUTH_TIMEOUT_SECONDS)
+    try:
         body = response.read().decode("utf-8")
+    finally:
+        response.close()
     payload = json.loads(body)
     return payload if isinstance(payload, dict) else {}
 
@@ -3789,7 +3861,11 @@ def oauth_snapshot_record(config: Path, payload: Mapping[str, Any], now: float
 def snapshot_from_oauth(destination: Path, args: argparse.Namespace) -> int:
     configs = oauth_config_dirs(args.config_dir)
     if not configs:
-        warn("no config dir with a .credentials.json claudeAiOauth block")
+        warn(
+            "no config dir holds a .credentials.json with a claudeAiOauth block. "
+            "On macOS the CLI keeps these in the login Keychain instead, which "
+            "this tool does not read; see docs/quota-drain.md"
+        )
         return 1
     state = load_poll_state()
     version = detect_claude_version()
@@ -3845,15 +3921,21 @@ def command_snapshot(args: argparse.Namespace) -> int:
     destination = state_dir() / "snapshots.jsonl"
     if args.stdin:
         return snapshot_from_stdin(destination)
+    if args.compact:
+        return compact_snapshots(destination)
     if args.oauth:
         return snapshot_from_oauth(destination, args)
     return snapshot_from_configs(destination)
 
 
 def snapshot_from_stdin(destination: Path) -> int:
-    raw = sys.stdin.buffer.read()
-    sys.stdout.buffer.write(raw)
-    sys.stdout.buffer.flush()
+    raw = b""
+    try:
+        raw = sys.stdin.buffer.read()
+        sys.stdout.buffer.write(raw)
+        sys.stdout.buffer.flush()
+    except Exception:  # a closed pipe must not fail the statusline
+        return 0
     try:
         payload = json.loads(raw.decode("utf-8"))
         limits = payload.get("rate_limits")
@@ -3871,12 +3953,79 @@ def snapshot_from_stdin(destination: Path) -> int:
                              "resets_at": window.get("resets_at")}
         if not windows:
             return 0
+        if windows == last_statusline_windows(destination):
+            # The statusline runs on every prompt; only a change is news.
+            return 0
         append_snapshot(
             destination,
             {"source": "statusline", "ts": time.time(), "windows": windows},
         )
     except Exception:  # never break the statusline pipeline
         return 0
+    return 0
+
+
+def last_statusline_windows(destination: Path) -> Optional[Dict[str, Any]]:
+    """The windows of the newest statusline record, read from the file tail."""
+    try:
+        with open(destination, "rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            size = handle.tell()
+            handle.seek(max(0, size - 65536))
+            tail = handle.read().decode("utf-8", "replace")
+    except OSError:
+        return None
+    for line in reversed(tail.splitlines()):
+        try:
+            record = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(record, dict) and record.get("source") == "statusline":
+            windows = record.get("windows")
+            return windows if isinstance(windows, dict) else None
+    return None
+
+
+def compact_snapshots(destination: Path) -> int:
+    """Drop repeats and anything past the retention window."""
+    if not destination.is_file():
+        print("no snapshots to compact")
+        return 0
+    cutoff = time.time() - SNAPSHOT_RETENTION_DAYS * 86400
+    kept = []  # type: List[str]
+    previous = {}  # type: Dict[Tuple[str, str], str]
+    removed = 0
+    try:
+        with open(destination, encoding="utf-8") as handle:
+            for line in handle:
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                try:
+                    record = json.loads(stripped)
+                except ValueError:
+                    removed += 1
+                    continue
+                epoch = record.get("ts")
+                if isinstance(epoch, (int, float)) and epoch < cutoff:
+                    removed += 1
+                    continue
+                key = (str(record.get("source") or ""), str(record.get("config_dir") or ""))
+                shape = json.dumps(record.get("windows"), sort_keys=True)
+                if previous.get(key) == shape:
+                    removed += 1
+                    continue
+                previous[key] = shape
+                kept.append(json.dumps(record, sort_keys=True))
+    except OSError as error:
+        warn("cannot compact %s: %s" % (destination, error))
+        return 1
+    temporary = destination.with_name(destination.name + ".tmp")
+    with open(temporary, "w", encoding="utf-8") as handle:
+        for line in kept:
+            handle.write(line + "\n")
+    os.replace(str(temporary), str(destination))
+    print("kept %d snapshot(s), dropped %d" % (len(kept), removed))
     return 0
 
 
@@ -3971,6 +4120,8 @@ def add_common(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--rebuild-cache", action="store_true")
     parser.add_argument("--json", action="store_true")
     parser.add_argument("--no-color", action="store_true")
+    parser.add_argument("--ascii", action="store_true",
+                        help="draw bars with ASCII; automatic on a non-UTF-8 stdout")
     parser.add_argument("--width", type=int, default=None, metavar="N")
     parser.add_argument("--claude-cache-read-weight", type=float, default=None, metavar="FLOAT")
     parser.add_argument("--long-context-multiplier", type=float, default=1.0, metavar="FLOAT")
@@ -4003,7 +4154,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     calibrate = sub.add_parser("calibrate", help="fit weights against measured drain")
     add_common(calibrate)
-    calibrate.set_defaults(handler=command_calibrate)
+    calibrate.set_defaults(handler=command_calibrate, harness="codex")
 
     prompts = sub.add_parser("prompts", help="per-prompt fan-out and context growth for one session")
     add_common(prompts)
@@ -4027,6 +4178,8 @@ def build_parser() -> argparse.ArgumentParser:
                           help="read statusline JSON on stdin and pass it through unchanged")
     snapshot.add_argument("--oauth", action="store_true",
                           help="sample live utilisation from the Claude oauth usage endpoint")
+    snapshot.add_argument("--compact", action="store_true",
+                          help="drop repeated entries and anything past retention")
     snapshot.add_argument("--config-dir", action="append", default=[], metavar="PATH")
     snapshot.set_defaults(handler=command_snapshot)
 
@@ -4037,7 +4190,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     arguments = list(sys.argv[1:] if argv is None else argv)
     # The statusline pipeline calls this thousands of times a day; get the
     # bytes moving before building the full parser.
-    if arguments[:2] == ["snapshot", "--stdin"]:
+    if arguments == ["snapshot", "--stdin"]:
         return snapshot_from_stdin(state_dir() / "snapshots.jsonl")
     parser = build_parser()
     args = parser.parse_args(arguments)
