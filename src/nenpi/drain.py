@@ -1186,15 +1186,17 @@ class Cache:
             entry = FileIndex(harness)
             self.entries[key] = entry
             return entry, True
-        head_hash, tail_hash = content_fingerprint(path, entry.offset)
-        if entry.head_hash and (head_hash, tail_hash) != (entry.head_hash, entry.tail_hash):
-            # Rewritten in place; the stored offset no longer names a record
-            # boundary, so the file is read again from the start.
-            entry = FileIndex(harness)
-            self.entries[key] = entry
-            return entry, True
         if stat.st_size == entry.size and abs(stat.st_mtime - entry.mtime) <= 1:
             return entry, False
+        # About to resume from the stored offset, so check that the bytes
+        # behind it are still the ones that were parsed. An in-place rewrite
+        # that happens to grow the file moves size and mtime like an append
+        # but leaves the offset pointing mid-record.
+        if entry.head_hash and entry.offset > 0:
+            if content_fingerprint(path, entry.offset) != (entry.head_hash, entry.tail_hash):
+                entry = FileIndex(harness)
+                self.entries[key] = entry
+                return entry, True
         return entry, True
 
     def drop_old_schemas(self) -> None:
@@ -1208,21 +1210,23 @@ class Cache:
                 shutil.rmtree(str(child), ignore_errors=True)
 
     def prune(self, live: Iterable[str]) -> None:
-        """Delete shards for transcripts that no longer exist."""
-        alive = set(live)
+        """Delete shards for transcripts that no longer exist.
+
+        Shard names are a pure function of the transcript path, so the live
+        set can be compared by name; parsing every shard to read its `path`
+        would cost more than the whole scan.
+        """
         root = self.root / ("v%d" % CACHE_SCHEMA)
         if not root.is_dir():
             return
+        expected = set(self.shard_path(key).name for key in live)
         for shard in root.rglob("*.json"):
-            try:
-                stored = json.loads(shard.read_text(encoding="utf-8")).get("path")
-            except (OSError, ValueError, AttributeError):
+            if shard.name in expected:
                 continue
-            if isinstance(stored, str) and stored not in alive:
-                try:
-                    shard.unlink()
-                except OSError:
-                    continue
+            try:
+                shard.unlink()
+            except OSError:
+                continue
 
     def mark(self, path: Path) -> None:
         self.dirty.add(str(path))
