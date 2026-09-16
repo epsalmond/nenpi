@@ -1468,9 +1468,12 @@ class OauthSampler(Harness):
             }
         )
         urllib.request.urlopen = fake_urlopen
+        stdout = sys.stdout
+        sys.stdout = io.StringIO()
         try:
             QD.main(list(args_list))
         finally:
+            sys.stdout = stdout
             urllib.request.urlopen = original
             os.environ.clear()
             os.environ.update(environment)
