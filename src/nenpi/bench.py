@@ -40,6 +40,9 @@ DEFAULT_MAX_PERCENT_WEEKLY = 1.0
 DEFAULT_TICKS = 2
 DEFAULT_MAX_CALLS = 400
 DEFAULT_SAMPLE_INTERVAL = 60.0
+# A call may only be launched while the newest utilisation sample is younger
+# than this; older than it, the budget check is reading a stale number.
+MIN_SAMPLE_AGE = 90.0
 DEFAULT_CALL_TIMEOUT = 900.0
 DEFAULT_CONTAMINATION_WINDOW = "6h"
 
@@ -91,8 +94,12 @@ WORDS_PER_TOKEN = 0.75
 EXIT_OK = 0
 EXIT_USAGE = 1
 EXIT_DEPENDENCY = 2
+# A guard stopped the run: the budget was reached, or utilisation stopped being
+# observable, or another session was in the window. Distinct codes so a caller
+# can tell a completed measurement from one that was cut short.
 EXIT_BUDGET = 3
-EXIT_CONTAMINATED = 4
+EXIT_GUARD = 4
+EXIT_MAX_CALLS = 5
 
 
 def warn(message: str) -> None:
@@ -257,13 +264,16 @@ class Sampler:
     about it crosses this boundary.
     """
 
-    def __init__(self, qd: Any, script: Path, config_dirs: Sequence[str], interval: float):
+    def __init__(self, qd: Any, script: Path, config_dirs: Sequence[str], interval: float,
+                 max_age: float):
         self.qd = qd
         self.script = script
         self.config_dirs = list(config_dirs)
         self.interval = interval
+        self.max_age = max_age
         self.last_attempt = 0.0
         self.latest = None  # type: Optional[Sample]
+        self.failure = None  # type: Optional[str]
         # The snapshot log holds two months of observations; a run only ever
         # wants the newest, so every read is bounded to the recent tail.
         self.since = time.time() - 3600.0
@@ -272,6 +282,12 @@ class Sampler:
         return (now or time.time()) - self.last_attempt >= self.interval
 
     def sample(self, force: bool = False) -> Optional[Sample]:
+        """Sample if due. Any failure is recorded; it is never swallowed.
+
+        A run that cannot see utilisation cannot see what it is spending, so
+        every failure mode - the sampler exiting non-zero, crashing, or logging
+        no new observation - has to reach the caller.
+        """
         now = time.time()
         if not force and not self.due(now):
             return self.latest
@@ -280,14 +296,41 @@ class Sampler:
         for config in self.config_dirs:
             command += ["--config-dir", config]
         try:
-            subprocess.run(command, check=False, capture_output=True, timeout=120)
+            result = subprocess.run(command, check=False, capture_output=True, timeout=120)
         except (OSError, subprocess.SubprocessError) as error:
-            warn("sampler failed (%s)" % type(error).__name__)
+            self.failure = "sampler failed (%s)" % type(error).__name__
+            return self.latest
+        if result.returncode != 0:
+            self.failure = "sampler exited %d" % result.returncode
             return self.latest
         observed = self.read_latest()
-        if observed is not None:
-            self.latest = observed
+        if observed is None:
+            self.failure = "sampler logged no readable observation"
+            return self.latest
+        if self.latest is not None and observed.ts <= self.latest.ts:
+            self.failure = "sampler logged no new observation"
+            return self.latest
+        self.latest = observed
+        self.failure = None
         return self.latest
+
+    def stale_for(self, now: Optional[float] = None) -> Optional[float]:
+        """Age of the newest observation when it is older than `max_age`."""
+        if self.latest is None:
+            return float("inf")
+        age = (now or time.time()) - self.latest.ts
+        return age if age > self.max_age else None
+
+    def blocker(self) -> Optional[str]:
+        """Why a call must not be launched right now, if anything."""
+        if self.failure is not None:
+            return self.failure
+        age = self.stale_for()
+        if age is None:
+            return None
+        if age == float("inf"):
+            return "no utilisation sample yet"
+        return "newest utilisation sample is %.0fs old (limit %.0fs)" % (age, self.max_age)
 
     def read_latest(self) -> Optional[Sample]:
         windows = {}
@@ -602,13 +645,14 @@ def run_scenario(scenario: Scenario, args: argparse.Namespace, sampler: Sampler,
     last_percent = seen.percent(args.window) if seen is not None else None
     state.start_percent = last_percent
 
-    def poll() -> None:
+    def poll(force: bool = False) -> None:
         """Sample if due, then fold the observation into ticks and the budget."""
         nonlocal last_percent
-        if not sampler.due():
+        if not force and not sampler.due():
             return
-        sample = sampler.sample()
-        if sample is None:
+        previous = sampler.latest
+        sample = sampler.sample(force=force)
+        if sample is None or (previous is not None and sample.ts <= previous.ts):
             return
         for rolled in budget.observe(sample):
             if rolled == args.window:
@@ -649,6 +693,16 @@ def run_scenario(scenario: Scenario, args: argparse.Namespace, sampler: Sampler,
             break
 
         wait_for_cache_mode()
+        # A call may only be launched while utilisation is observable. Without
+        # a fresh sample the budget check above is measuring a stale number,
+        # and the run would spend past its cap without noticing.
+        if sampler.blocker() is not None:
+            poll(force=True)
+        blocker = sampler.blocker()
+        if blocker is not None:
+            warn("%s: %s; stopping before the next call" % (scenario.key, blocker))
+            state.stop_reason = "sampler:" + blocker
+            break
         if scenario.cache == "cold":
             filler = filler_text(scenario.context_tokens,
                                  seed=hash_seed("%s#%d" % (scenario.key, state.calls)))
@@ -1256,10 +1310,15 @@ def command_run(args: argparse.Namespace) -> int:
         warn("no claude executable at %r" % args.claude)
         return EXIT_DEPENDENCY
 
-    sampler = Sampler(_QD, args.quota_drain, args.config_dir, args.sample_interval)
+    max_sample_age = args.max_sample_age
+    if max_sample_age is None:
+        max_sample_age = max(MIN_SAMPLE_AGE, 2.0 * args.sample_interval)
+    sampler = Sampler(_QD, args.quota_drain, args.config_dir, args.sample_interval,
+                      max_sample_age)
     baseline = sampler.sample(force=True)
     if baseline is None:
-        warn("no utilisation sample; check `quota-drain snapshot --oauth`")
+        warn("no utilisation sample (%s); check `quota-drain snapshot --oauth`"
+             % (sampler.failure or "no observation logged"))
         return EXIT_DEPENDENCY
     budget = Budget({args.window: args.max_percent, "seven_day": args.max_percent_weekly})
     budget.observe(baseline)
@@ -1272,7 +1331,7 @@ def command_run(args: argparse.Namespace) -> int:
         if foreign:
             warn("--require-idle: %d other Claude session(s) active in the last 10 minutes"
                  % len(foreign))
-            return EXIT_CONTAMINATED
+            return EXIT_GUARD
 
     run_id = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime(started))
     directory = run_dir(run_id)
@@ -1285,6 +1344,7 @@ def command_run(args: argparse.Namespace) -> int:
         "max_percent": args.max_percent,
         "max_percent_weekly": args.max_percent_weekly,
         "sample_interval_s": args.sample_interval,
+        "max_sample_age_s": max_sample_age,
         "filler_channel": args.filler_channel,
         "scenarios": [scenario.key for scenario in scenarios],
         "baseline": baseline.as_json(),
@@ -1318,6 +1378,13 @@ def command_run(args: argparse.Namespace) -> int:
                     warn("budget reached on %s; stopping the run"
                          % state.stop_reason.split(":", 1)[1])
                     status = EXIT_BUDGET
+                    break
+                if state.stop_reason.startswith("sampler:"):
+                    warn("utilisation is no longer observable; stopping the run")
+                    status = EXIT_GUARD
+                    break
+                if state.stop_reason == "max-calls":
+                    status = EXIT_MAX_CALLS
                     break
                 if state.stop_reason == "call-failed":
                     status = EXIT_DEPENDENCY
@@ -1404,6 +1471,9 @@ def build_parser() -> argparse.ArgumentParser:
                      help="passed through to `quota-drain snapshot --oauth`")
     run.add_argument("--sample-interval", type=float, default=DEFAULT_SAMPLE_INTERVAL,
                      metavar="SECONDS")
+    run.add_argument("--max-sample-age", type=float, default=None, metavar="SECONDS",
+                     help="stop before the next call when the newest sample is older "
+                          "(default: twice --sample-interval, at least 90s)")
     run.add_argument("--call-timeout", type=float, default=DEFAULT_CALL_TIMEOUT,
                      metavar="SECONDS")
     run.add_argument("--write-heavy-gap", type=float, default=WRITE_HEAVY_GAP_SECONDS,

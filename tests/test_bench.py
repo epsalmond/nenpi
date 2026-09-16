@@ -173,6 +173,30 @@ for _name, _value in vars(_REAL).items():
 
 
 def _fake_snapshot() -> int:
+    if os.environ.get("BENCH_SAMPLER_FAIL_AFTER"):
+        attempts = 0
+        marker = os.environ["BENCH_FAKE_LOG"] + ".sampler-attempts"
+        if os.path.exists(marker):
+            with open(marker, encoding="utf-8") as handle:
+                attempts = int(handle.read().strip() or 0)
+        attempts += 1
+        with open(marker, "w", encoding="utf-8") as handle:
+            handle.write(str(attempts))
+        if attempts > int(os.environ["BENCH_SAMPLER_FAIL_AFTER"]):
+            sys.stderr.write("fake sampler failure\\n")
+            return 1
+    if os.environ.get("BENCH_SAMPLER_STALE_AFTER"):
+        attempts = 0
+        marker = os.environ["BENCH_FAKE_LOG"] + ".stale-attempts"
+        if os.path.exists(marker):
+            with open(marker, encoding="utf-8") as handle:
+                attempts = int(handle.read().strip() or 0)
+        attempts += 1
+        with open(marker, "w", encoding="utf-8") as handle:
+            handle.write(str(attempts))
+        if attempts > int(os.environ["BENCH_SAMPLER_STALE_AFTER"]):
+            # Exits clean and logs nothing: the snapshot stops advancing.
+            return 0
     weights = json.loads(os.environ["BENCH_FAKE_WEIGHTS"])
     total = 0.0
     log = os.environ["BENCH_FAKE_LOG"]
@@ -403,9 +427,59 @@ class Budgets(Harness):
     def test_max_calls_stops_a_scenario(self) -> None:
         result = self.run_scenarios("--models", "claude-haiku-4-5", "--contexts", "10k",
                                     "--cache", "warm", "--max-calls", "3")
-        self.assertEqual(result.returncode, 1, result.stderr.decode("utf-8", "replace"))
+        self.assertEqual(result.returncode, QB.EXIT_MAX_CALLS,
+                         result.stderr.decode("utf-8", "replace"))
         self.assertEqual(self.scenario_records()[0]["stop_reason"], "max-calls")
         self.assertIn(b"fewer than 3 ticks", result.stderr)
+
+
+class SamplerGuard(Harness):
+    def test_a_failing_sampler_stops_the_run(self) -> None:
+        # The baseline sample succeeds, then every later attempt exits 1. A run
+        # that cannot see utilisation cannot see what it is spending.
+        self.environment["BENCH_SAMPLER_FAIL_AFTER"] = "1"
+        result = self.run_scenarios("--models", "claude-haiku-4-5", "--contexts", "10k",
+                                    "--cache", "warm")
+        self.assertEqual(result.returncode, QB.EXIT_GUARD)
+        self.assertIn(b"sampler exited 1", result.stderr)
+        # One call was already launched against the last good sample; the
+        # failure is caught before a second one, so a dead sampler costs at
+        # most a single call rather than the whole budget.
+        self.assertEqual(len(self.fake_calls()), 1)
+        self.assertTrue(self.scenario_records()[0]["stop_reason"].startswith("sampler:"))
+
+    def test_a_sampler_that_never_works_spends_nothing(self) -> None:
+        self.environment["BENCH_SAMPLER_FAIL_AFTER"] = "0"
+        result = self.run_scenarios("--models", "claude-haiku-4-5", "--contexts", "10k",
+                                    "--cache", "warm")
+        self.assertEqual(result.returncode, QB.EXIT_DEPENDENCY)
+        self.assertIn(b"no utilisation sample", result.stderr)
+        self.assertEqual(self.fake_calls(), [])
+
+    def test_a_stale_sample_stops_the_run(self) -> None:
+        # The sampler keeps exiting clean but stops logging new observations.
+        self.environment["BENCH_SAMPLER_STALE_AFTER"] = "3"
+        result = self.bench(
+            "run", "--yes", "--quota-drain", str(self.fake_drain), "--sample-interval", "0",
+            "--max-sample-age", "1", "--ticks", "9", "--max-percent", "50",
+            "--max-percent-weekly", "50", "--models", "claude-haiku-4-5",
+            "--contexts", "10k", "--cache", "warm",
+        )
+        self.assertEqual(result.returncode, QB.EXIT_GUARD)
+        self.assertIn(b"no new observation", result.stderr)
+        # Two calls ran while sampling still worked; nothing after that.
+        self.assertLessEqual(len(self.fake_calls()), 3)
+
+    def test_sampler_freshness_is_checked_before_each_call(self) -> None:
+        sampler = QB.Sampler(QD, self.fake_drain, [], interval=0.0, max_age=90.0)
+        self.assertEqual(sampler.blocker(), "no utilisation sample yet")
+        sampler.latest = QB.Sample(time.time(), {"five_hour": 1.0})
+        self.assertIsNone(sampler.blocker())
+        sampler.latest = QB.Sample(time.time() - 600.0, {"five_hour": 1.0})
+        self.assertIn("600s old", sampler.blocker())
+        sampler.latest = QB.Sample(time.time(), {"five_hour": 1.0})
+        sampler.failure = "sampler exited 7"
+        self.assertEqual(sampler.blocker(), "sampler exited 7")
 
 
 class Contamination(Harness):
@@ -439,7 +513,7 @@ class Contamination(Harness):
             "run", "--yes", "--require-idle", "--quota-drain", str(self.fake_drain),
             "--sample-interval", "0", "--models", "claude-haiku-4-5", "--contexts", "10k",
         )
-        self.assertEqual(result.returncode, QB.EXIT_CONTAMINATED)
+        self.assertEqual(result.returncode, QB.EXIT_GUARD)
         self.assertIn(b"--require-idle", result.stderr)
         self.assertEqual(self.fake_calls(), [])
 
