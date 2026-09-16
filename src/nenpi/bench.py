@@ -396,14 +396,34 @@ def foreign_sessions(
 
 
 class CallResult:
-    def __init__(self, model: str, tokens: Mapping[str, int], cost: Optional[float],
-                 session_id: str, started: float, ended: float):
-        self.model = model
-        self.tokens = dict(tokens)
+    """One call's usage, kept per model.
+
+    A run can touch more than one model - a subagent, a compaction, an internal
+    helper - and blending those into one dict would price another model's
+    tokens at the requested model's weight. Each model keeps its own row.
+    """
+
+    def __init__(self, models: Mapping[str, Mapping[str, int]], requested: str,
+                 cost: Optional[float], session_id: str, started: float, ended: float):
+        self.models = dict((name, dict(counts)) for name, counts in models.items())
+        self.requested = requested
         self.cost = cost
         self.session_id = session_id
         self.started = started
         self.ended = ended
+
+    @property
+    def tokens(self) -> Dict[str, int]:
+        """Every model's tokens summed, for the call log and the budget."""
+        total = {}  # type: Dict[str, int]
+        for counts in self.models.values():
+            for kind, value in counts.items():
+                total[kind] = total.get(kind, 0) + value
+        return total
+
+    @property
+    def requested_tokens(self) -> Dict[str, int]:
+        return dict(self.models.get(self.requested) or {})
 
 
 def usage_tokens(usage: Mapping[str, Any]) -> Dict[str, int]:
@@ -459,30 +479,33 @@ def parse_result(payload: Mapping[str, Any], fallback_model: str) -> Optional[Ca
     if payload.get("type") != "result" or payload.get("is_error"):
         return None
     model_usage = payload.get("modelUsage")
-    tokens = {}  # type: Dict[str, int]
-    model = fallback_model
-    if isinstance(model_usage, Mapping) and model_usage:
-        best = None  # type: Optional[Tuple[int, str, Mapping[str, Any]]]
+    models = {}  # type: Dict[str, Dict[str, int]]
+    requested = normalize_model(fallback_model)
+    if isinstance(model_usage, Mapping):
         for name, entry in model_usage.items():
             if not isinstance(entry, Mapping):
                 continue
             counted = model_usage_tokens(entry)
-            weight = sum(counted.values())
+            if not sum(counted.values()):
+                continue
+            key = normalize_model(str(name))
+            booked = models.setdefault(key, dict((kind, 0) for kind in counted))
             for kind, value in counted.items():
-                tokens[kind] = tokens.get(kind, 0) + value
-            if best is None or weight > best[0]:
-                best = (weight, str(name), entry)
-        if best is not None:
-            model = best[1]
-    if not tokens:
+                booked[kind] = booked.get(kind, 0) + value
+    if not models:
+        # No modelUsage, or every entry zeroed: fall back to the main-loop
+        # block, which carries no model of its own.
         usage = payload.get("usage")
         if not isinstance(usage, Mapping):
             return None
-        tokens = usage_tokens(usage)
+        counted = usage_tokens(usage)
+        if not sum(counted.values()):
+            return None
+        models = {requested: counted}
     cost = payload.get("total_cost_usd")
     return CallResult(
-        normalize_model(model),
-        tokens,
+        models,
+        requested,
         float(cost) if isinstance(cost, (int, float)) else None,
         str(payload.get("session_id") or ""),
         0.0,
@@ -556,20 +579,24 @@ class ScenarioRun:
     def absorb(self, call: CallResult) -> None:
         self.calls += 1
         self.ended = call.ended
-        model = self.models.setdefault(
-            call.model, dict((kind, 0) for kind in _QD.CLAUDE_KINDS)
-        )
-        for kind, value in call.tokens.items():
-            self.cumulative[kind] = self.cumulative.get(kind, 0) + value
-            model[kind] = model.get(kind, 0) + value
+        for name, counts in call.models.items():
+            booked = self.models.setdefault(
+                name, dict((kind, 0) for kind in _QD.CLAUDE_KINDS)
+            )
+            for kind, value in counts.items():
+                self.cumulative[kind] = self.cumulative.get(kind, 0) + value
+                booked[kind] = booked.get(kind, 0) + value
         if call.cost:
             self.cost_usd += call.cost
         if self.measured_context is None:
+            # The context the scenario set up is the requested model's input
+            # side; another model's tokens are not this scenario's context.
+            requested = call.requested_tokens
             self.measured_context = (
-                call.tokens.get("input", 0)
-                + call.tokens.get("cache_read", 0)
-                + call.tokens.get("cache_write_5m", 0)
-                + call.tokens.get("cache_write_1h", 0)
+                requested.get("input", 0)
+                + requested.get("cache_read", 0)
+                + requested.get("cache_write_5m", 0)
+                + requested.get("cache_write_1h", 0)
             )
 
     def record_tick(self, sample: Sample, percent: float) -> None:
@@ -754,11 +781,12 @@ def write_call_line(handle, scenario: Scenario, call: CallResult,
     """One line per call. Usage and timing only; never prompt text."""
     record = {
         "scenario": scenario.key,
-        "model": call.model,
+        "model": call.requested,
         "started": call.started,
         "ended": call.ended,
         "duration_s": call.ended - call.started,
         "tokens": dict(call.tokens),
+        "models": dict((name, dict(counts)) for name, counts in call.models.items()),
         "cost_usd": call.cost,
         "session_id": call.session_id,
     }

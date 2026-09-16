@@ -137,6 +137,20 @@ def main() -> int:
             }
         },
     }
+    helper = os.environ.get("BENCH_FAKE_HELPER_MODEL")
+    if helper:
+        # A second model the run touched on its own, as a real session does
+        # when a subagent or an internal helper call is made.
+        result["modelUsage"][helper] = {
+            "inputTokens": 1000,
+            "cacheReadInputTokens": 0,
+            "cacheCreationInputTokens": 0,
+            "outputTokens": 100,
+            "webSearchRequests": 0,
+            "costUSD": 0.0001,
+            "contextWindow": 200000,
+            "maxOutputTokens": 8192,
+        }
     sys.stdout.write(json.dumps(result))
     return 0
 
@@ -789,6 +803,50 @@ class Hygiene(Harness):
 
 
 class ResultParsing(Harness):
+    def test_a_second_model_gets_its_own_row(self) -> None:
+        self.environment["BENCH_FAKE_HELPER_MODEL"] = "claude-opus-5"
+        result = self.run_scenarios("--models", "claude-haiku-4-5-20251001",
+                                    "--contexts", "10k", "--cache", "warm")
+        self.assertEqual(result.returncode, 0, result.stderr.decode("utf-8", "replace"))
+        record = self.scenario_records()[0]
+        self.assertEqual(sorted(record["models"]), ["claude-haiku-4-5", "claude-opus-5"])
+        self.assertEqual(record["models"]["claude-opus-5"]["input"], 1000 * record["calls"])
+        # The helper's tokens are not part of the scenario's context.
+        fixture = USAGE_FIXTURE["fresh|short"]
+        self.assertEqual(record["measured_context_tokens"],
+                         fixture["input"] + fixture["cache_read"] + fixture["cache_write"])
+        estimate = self.latest_report()["scenarios"][0]
+        self.assertIn("claude-opus-5", estimate["models"])
+        self.assertIn("claude-haiku-4-5", estimate["models"])
+
+    def test_two_models_are_not_blended(self) -> None:
+        call = QB.parse_result(
+            {
+                "type": "result", "is_error": False, "session_id": "s",
+                "modelUsage": {
+                    "claude-haiku-4-5-20251001": {"inputTokens": 10, "outputTokens": 1},
+                    "claude-opus-5": {"inputTokens": 500, "outputTokens": 50},
+                },
+            },
+            "claude-haiku-4-5-20251001",
+        )
+        self.assertEqual(call.requested, "claude-haiku-4-5")
+        self.assertEqual(call.models["claude-haiku-4-5"]["input"], 10)
+        self.assertEqual(call.models["claude-opus-5"]["input"], 500)
+        self.assertEqual(call.tokens["input"], 510)
+        self.assertEqual(call.requested_tokens["input"], 10)
+
+    def test_zeroed_model_usage_falls_back_to_usage(self) -> None:
+        call = QB.parse_result(
+            {
+                "type": "result", "is_error": False, "session_id": "s",
+                "modelUsage": {"claude-opus-5": {"inputTokens": 0, "outputTokens": 0}},
+                "usage": {"input_tokens": 7, "output_tokens": 2},
+            },
+            "claude-opus-5",
+        )
+        self.assertEqual(call.models["claude-opus-5"]["input"], 7)
+
     def test_model_usage_is_preferred(self) -> None:
         call = QB.parse_result(
             {
@@ -806,7 +864,8 @@ class ResultParsing(Harness):
             },
             "claude-sonnet-5",
         )
-        self.assertEqual(call.model, "claude-haiku-4-5")
+        self.assertEqual(call.requested, "claude-sonnet-5")
+        self.assertEqual(sorted(call.models), ["claude-haiku-4-5"])
         self.assertEqual(call.tokens["input"], 10)
         self.assertEqual(call.tokens["cache_read"], 20)
         self.assertEqual(call.tokens["cache_write_5m"], 30)
@@ -830,7 +889,7 @@ class ResultParsing(Harness):
             },
             "claude-opus-5",
         )
-        self.assertEqual(call.model, "claude-opus-5")
+        self.assertEqual(call.requested, "claude-opus-5")
         self.assertEqual(call.tokens["cache_write_5m"], 3)
         self.assertEqual(call.tokens["cache_write_1h"], 4)
         self.assertIsNone(call.cost)
