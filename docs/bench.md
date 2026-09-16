@@ -108,28 +108,48 @@ stdin. `--filler-channel system-prompt-file` writes it to a scratch file and
 passes `--system-prompt-file`; that flag appears in the CLI's own `--bare` help
 text but not in its option list, so it is opt-in rather than the default.
 
-## Budget and contamination
+## Guards
 
-`--max-percent` (3 by default) caps the five-hour window and
+Three things can make a run spend more than it should, and each one stops it.
+
+**The budget.** `--max-percent` (3 by default) caps the five-hour window and
 `--max-percent-weekly` (1) caps the seven-day window, both counted from the
-baseline sample taken before the first call. The check runs before every call;
-reaching either stops the run and exits 3. `--max-calls` (400) caps a single
-scenario so a badly sized scenario cannot run forever.
+baseline sample taken before the first call and both enforced whatever
+`--window` selects. The check runs before every call; reaching either stops the
+run and exits 3. `--max-calls` (400) caps a single scenario, and `run` refuses
+to start at all when the projection already exceeds the cap, unless
+`--force-projection` says otherwise.
 
-Any other interactive Claude session burning quota during the run lands in the
-same window and corrupts the measurement. Before each scenario and after it,
-`quota-drain sessions --harness claude --since 6h --json` is read and every
+**Observability.** A budget check reads the newest sample, so a call is
+launched only while that sample is younger than `--max-sample-age` (twice
+`--sample-interval`, at least 90 s). A sampler that exits non-zero, crashes, or
+logs no new observation stops the run before the next call and exits 4. This
+is the difference between spending one more call and spending the rest of the
+window blind.
+
+**Contamination.** Any other Claude session burning quota during the run lands
+in the same window and corrupts the measurement. Before each scenario and after
+it, `quota-drain sessions --harness claude --since 6h --json` is read and every
 Claude session that overlaps the scenario and is not one of this run's own
-sessions marks the scenario `contaminated`. Contaminated scenarios stay in the
-logs and out of the fit. `--require-idle` refuses to start at all (exit 4) when
-another Claude session was active in the previous ten minutes.
+marks it `contaminated`. A check that could not run is `check_failed`, which
+counts as contamination rather than as a clean window: under `--require-idle`
+it refuses to start (exit 4), and otherwise it keeps the scenario out of the
+fit. Contaminated scenarios stay in the logs.
 
 ## The fit
 
-Each uncontaminated scenario contributes one row: bracketed tokens per model
-and kind against the bracketed percent. Non-negative least squares over those
-rows gives percent per million tokens for each `(model, kind)` pair, using
-quota-drain's solver.
+Each scenario that was fully bracketed, uncontaminated and free of cache drift
+contributes one row: bracketed tokens per model and kind against the bracketed
+percent. Non-negative least squares over those rows gives percent per million
+tokens for each `(model, kind)` pair, using quota-drain's solver. Every model a
+call touched keeps its own row, so a subagent or internal helper call is not
+priced at the requested model's weight.
+
+A scenario with a single tick is an upper bound, not a measurement: it divides
+everything spent since the scenario started, including the partial percent
+burnt before that tick, by one percent. Those rows are excluded unless
+`--include-unbracketed` asks for them, as are drifted ones without
+`--include-drifted`; the report names every exclusion.
 
 The report prints the measured ratios against the API list ratios — cache read
 at 0.1x uncached input, output at 5x — which is the open question the fit
@@ -168,13 +188,16 @@ dollars.
 ~/.local/state/quota-drain/claude-weights.json             the fitted weights
 ```
 
-A call line holds the scenario key, the model, timings, usage by kind, the
-reported cost, the session id, and the utilisation sample nearest in time.
+A call line holds the scenario key, the requested model, per-model usage,
+timings, the reported cost, the session id, whether the call risked falling
+outside the cache TTL, and the utilisation sample nearest in time. meta.json
+records the flags every call carried and how many extra `--claude-arg` values
+were passed, never their contents.
 Prompt text, filler text and the OAuth token are never printed, logged or
 stored; a failing `claude` call is reported by exit status only, because its
 stderr can echo the prompt back.
 
-`claude-weights.json` carries both shapes quota-drain reads: a top-level
+`claude-weights.json` carries the shapes quota-drain reads: a top-level
 `claude` section shaped like the `codex` section of `codex-weights.json`, so
 `merge_weights` consumes it unchanged, and a `windows` section shaped like the
 `calibrate --harness claude` payload.
@@ -188,20 +211,27 @@ stderr can echo the prompt back.
   "fallback_scale": 0.71,
   "claude": {
     "unit": "percent_per_mtok",
+    "models": { "claude-haiku-4-5": { "input": 0.9, "cache_read": 0.12, "output": 4.7 } }
+  },
+  "fit": {
+    "unit": "percent_per_mtok",
     "models": {
       "claude-haiku-4-5": {
         "input": 0.9, "cache_read": 0.12, "output": 4.7, "cache_write_5m": null
       }
-    }
+    },
+    "diagnostics": { "claude-haiku-4-5": { "cache_write_5m": { "reasons": ["collinear"] } } }
   },
   "windows": { "five_hour": { "models": { "claude-haiku-4-5": { "input": 0.9 } } } }
 }
 ```
 
-A null is "the run could not measure this", not zero. A reader prices those
-from the rate card scaled by `fallback_scale`, and ignores a payload whose
-`usable` is false, exactly as `quota-drain --use-calibrated` treats the Codex
-fit.
+The `claude` section is the price table a reader merges, so it carries measured
+numbers only: a kind the fit could not identify is absent and keeps its
+built-in price. The nulls and the reason for each live in `fit`, which is a
+record of the run rather than a price table. Only a usable fit is written to
+`claude-weights.json` at all; an unusable one lands beside it as
+`claude-weights.unusable.json`, which nothing loads.
 
 `QUOTA_DRAIN_HOME_DIR`, `QUOTA_DRAIN_CACHE_DIR`, `QUOTA_DRAIN_STATE_DIR` and
 `QUOTA_DRAIN_CONFIG_DIR` relocate all of it, exactly as they do for
@@ -230,7 +260,8 @@ spending a run.
 | 1 | usage error, or no scenario reached its tick target |
 | 2 | missing dependency: no quota-drain, no `claude`, no baseline sample |
 | 3 | budget reached |
-| 4 | `--require-idle` found another active Claude session |
+| 4 | a guard stopped the run: the sampler, or a contaminated window under `--require-idle` |
+| 5 | a scenario hit `--max-calls` before its tick target |
 
 ## Limits
 
@@ -239,7 +270,20 @@ spending a run.
   cannot be measured at all.
 - Cache behaviour is observed, not controlled: `warm` is a label for calls made
   back to back with an identical prefix, and whether the prefix actually caches
-  is a property of the harness and the account.
+  is a property of the harness and the account. A warm call made more than
+  240 s after the previous one is recorded as `cache_ttl_risk` and its scenario
+  as `warm_drift`, which keeps it out of the fit unless `--include-drifted`.
+- The endpoint cannot be polled more than once a minute, so a run is blind
+  between samples and the budget is enforced at sample resolution. The overshoot
+  is bounded by what one sample interval of calls can spend, not by the cap, so
+  size scenarios and `--sample-interval` with that in mind.
+- The projection prices a fresh prefix as cache creation at 1.25x, including in
+  `cold` mode. Claude Code sets its own cache breakpoints, so this is the
+  conservative reading rather than a verified one; `--no-cold-as-creation`
+  prices cold as uncached input instead.
+- Calls run with the built-in tools off (`--tools ""`). The 2.1.273 `--help`
+  lists no turn limit, and with no tools there is nothing for a further turn to
+  do, so a run cannot fan out into work the scenario did not ask for.
 - The fit assumes drain is linear in tokens with no per-request or per-session
   component. A constant per-call cost would show up as residual, not as a term.
 - The planning projection uses a prior of 1.40 USD per percent when no fit and
@@ -252,7 +296,7 @@ spending a run.
 ## Verification
 
 ```sh
-scripts/test-quota-bench                                  # 31 tests, no quota spent
+scripts/test-quota-bench                                  # 53 tests, no quota spent
 python3 -m py_compile scripts/quota-bench
 uv run --python 3.9 --no-project scripts/test-quota-bench # 3.9 floor
 ```
@@ -267,3 +311,7 @@ decision each time; start with one cheap scenario:
 scripts/quota-bench run --models claude-haiku-4-5-20251001 --contexts 10k \
     --cache warm --ticks 1 --max-percent 1 --require-idle --yes
 ```
+
+One tick produces an upper bound rather than a measurement, and a single
+scenario identifies nothing, so that run writes no weights file: it proves the
+plumbing, and the matrix is what produces a fit.

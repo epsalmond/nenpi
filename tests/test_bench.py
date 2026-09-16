@@ -565,6 +565,36 @@ class SamplerGuard(Harness):
         self.assertEqual(sampler.blocker(), "sampler exited 7")
 
 
+class ManyCallsPerSample(Harness):
+    def test_the_budget_holds_when_calls_outrun_the_sampler(self) -> None:
+        # The endpoint cannot be polled more than once a minute, so a run is
+        # blind between samples. With a one-second interval and instant fake
+        # calls, many calls land inside one blind window; the budget still has
+        # to stop the run rather than let it spend on.
+        result = self.bench(
+            "run", "--yes", "--quota-drain", str(self.fake_drain), "--sample-interval", "1",
+            "--ticks", "9", "--max-percent", "5", "--max-percent-weekly", "50",
+            "--models", "claude-haiku-4-5", "--contexts", "10k", "--cache", "warm",
+        )
+        self.assertEqual(result.returncode, QB.EXIT_BUDGET,
+                         result.stderr.decode("utf-8", "replace"))
+        runs = sorted((self.root / "state" / "bench").iterdir())
+        lines = [json.loads(line) for line in
+                 (runs[-1] / "calls.jsonl").read_text(encoding="utf-8").splitlines()]
+        self.assertGreater(len(lines), 5)
+        per_sample = {}  # type: Dict[float, int]
+        for line in lines:
+            stamp = line["sample"]["ts"]
+            per_sample[stamp] = per_sample.get(stamp, 0) + 1
+        self.assertGreater(max(per_sample.values()), 1)
+        meta = json.loads((runs[-1] / "meta.json").read_text(encoding="utf-8"))
+        self.assertGreaterEqual(meta["budget"]["spent"]["five_hour"], 5.0)
+        # Each call is half a percent, so the blind window is what the overshoot
+        # is bounded by, not the cap.
+        self.assertLessEqual(meta["budget"]["spent"]["five_hour"], 0.5 * len(lines))
+        self.assertEqual(self.scenario_records()[0]["stop_reason"], "budget:five_hour")
+
+
 class Contamination(Harness):
     def test_a_foreign_session_flags_the_scenario(self) -> None:
         now = time.time()
