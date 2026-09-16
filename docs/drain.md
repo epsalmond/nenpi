@@ -1,0 +1,501 @@
+---
+description: quota-drain subcommands, the Codex measured and Claude modelled metering models, weight configuration, and what about subscription quota is official, community-sourced, or unknown.
+status: reference
+read-when: Attributing subscription-plan quota to agent sessions, tuning quota-drain weights, or wiring its snapshot sampler into a timer.
+---
+
+# quota-drain
+
+`scripts/quota-drain` reads Claude Code and Codex CLI transcripts on disk and
+reports which sessions drained how much **subscription-plan quota** — not API
+dollars. It is standalone: Python standard library only, Python 3.9 or newer,
+Linux and macOS.
+
+Two harnesses, two very different evidence bases:
+
+- **Codex is measured.** The CLI writes `rate_limits` snapshots of the shared
+  account pool into its own rollouts. Drain between consecutive snapshots is
+  real, and the tool splits it across the sessions that burned tokens in that
+  interval.
+- **Claude is modelled.** Nothing about quota is written into Claude
+  transcripts. Sessions are priced at API list rates and reported as a dollar
+  equivalent and a share, unless live utilisation snapshots have been sampled
+  (see [Snapshots](#snapshots)).
+
+The second thing it models is **why long sessions cost so much**: each user
+prompt triggers a fan-out of API calls that every re-send the whole context,
+so cost grows faster than session length. See
+[Fan-out and context growth](#fan-out-and-context-growth).
+
+## Subcommands
+
+```
+quota-drain sessions    [--harness claude|codex|all] [--since 7d|2026-09-10] [--until ...]
+                        [--window auto|five_hour|weekly] [--top 25]
+                        [--sort drain|tokens|start] [--json] [--no-color] [--width N]
+quota-drain prompts     --session <id-prefix> [--top N]
+quota-drain fanout      [--since ...] [--harness ...]
+quota-drain reductions  [--since ...]
+quota-drain timeline    [--bucket 1h|5h|1d]
+quota-drain windows     [--harness codex]
+quota-drain calibrate   [--harness codex|claude] [--since ...]
+quota-drain verify      [--since ...]
+quota-drain snapshot    [--stdin | --oauth [--config-dir PATH]]
+```
+
+Common flags on every reporting subcommand: `--claude-root PATH` and
+`--codex-root PATH` (both repeatable) add transcript roots,
+`--claude-cache-read-weight FLOAT` overrides the disputed cache-read price,
+`--long-context-multiplier FLOAT` scales requests over 200K tokens (a no-op at
+its default of 1.0), `--use-calibrated` prefers a stored fit, and
+`--rebuild-cache` discards the parse cache.
+
+### sessions
+
+One row per session, ranked by each row's share of its own harness peak, with
+a detail line underneath:
+
+```
+H session  cwd      model         start            dur    in     cached  write  out     units    drain    prm resent share
+X 01a09e1f arcade   gpt-6-astra   2026-09-13 21:14 6h57m  6.1M   302.1M  0      712.3K  3628.99  13.717%  16  87%   ████████
+          api turns 1725, turns/prompt p90 243, peak context 419.9K; subagents 993 requests / 236.98 units
+```
+
+`H` is `C` for Claude and `X` for Codex. `units` is weighted tokens: credit
+units for Codex, dollars for Claude. `drain` is the measured percent of the
+Codex window, or the Claude dollar equivalent. `resent` is the share of the
+session's cost spent re-sending context it had already sent
+([below](#fan-out-and-context-growth)).
+
+Codex drain and Claude drain are different units and cannot share a scale, so
+the ranking and the bar both use each row's fraction of its own harness's
+largest drainer. The header says so.
+
+### prompts
+
+Per-prompt breakdown for one session, plus two charts (input tokens sent per
+prompt, split cached and uncached; peak context per prompt) and a fitted
+growth summary:
+
+```
+growth: quadratic fits better | linear slope 41.2 u/prompt (R^2 0.71) |
+quadratic x^2 term 9.98 (R^2 0.998) | last 20% of prompts = 41% of session cost
+```
+
+The fit is ordinary least squares of per-prompt weighted units against prompt
+index, once linear and once quadratic; `better` names the higher R², requiring
+at least a 0.01 margin so near-ties report as linear.
+
+### fanout
+
+Across every session in range: the turns-per-prompt distribution (histogram
+plus p50/p90/max), the peak-context-per-prompt distribution, and the top 15
+single prompts by input tokens sent.
+
+### reductions
+
+Points where a session's context shrank sharply — see
+[Context reductions](#context-reductions).
+
+### windows
+
+Each observed Codex quota window: start, `resets_at`, peak `used_percent`, and
+the sessions that drained it.
+
+### verify
+
+Cross-checks the parse against the harnesses' own summaries: Claude deduped
+sums against the `cost-state` line's `modelUsage`, Codex summed usage deltas
+against the final `thread_token_usage`.
+
+### calibrate
+
+Fits weights against measured drain instead of trusting the rate card. Both
+harnesses use the same non-negative least squares over snapshot intervals:
+each interval contributes its summed tokens per (model, kind) as features and
+its measured percent drain as the target.
+
+Both vendors report utilisation in **whole percent**, so a single interval's
+target is almost always exactly 1.0 while its token features vary by orders of
+magnitude. Intervals are therefore summed into fixed time buckets
+(`--calibrate-bucket-hours`, default 2) before fitting. Bucketing by *time*
+and not by drain matters: equal-drain buckets would make every target the same
+by construction and leave the fit no variance to explain. On 14 days of real
+Codex rollouts this is the difference between R² of -1.9 and R² of 0.93.
+
+A fit that scores R² at or below zero is stored with `"usable": false`,
+reported as `NOT USABLE`, and refused by `--use-calibrated`.
+
+`--harness codex` writes the fit to
+`~/.local/state/quota-drain/codex-weights.json`; `--use-calibrated` then
+prefers it. `--harness claude` needs sampled snapshots and reports the
+measured cache-read rate beside the uncached-input rate, so the disputed 0.1x
+list ratio can be tested against observation.
+
+## Metering model
+
+### Codex: measured
+
+Every Codex `event_msg` of type `token_count` may carry a `rate_limits` block
+describing the shared account pool: `limit_id`, `plan_type`, and a `primary`
+and optional `secondary` window with `used_percent`, `window_minutes`
+(300 = five-hour, 10080 = weekly) and `resets_at` (Unix seconds).
+
+Observations from every Codex root are merged into one timeline per
+`(limit_id, plan_type, window_minutes)`. Within a timeline the tool walks
+forward, keeping a running maximum:
+
+- A reading whose `resets_at` moves forward starts a new window; its
+  `used_percent` is that window's drain so far and is attributed as a
+  `rollover` interval.
+- A reading from a window that has already rolled over is a stale poll from a
+  concurrent session and is dropped.
+- Otherwise drain is the increase over the running maximum.
+
+Each interval's drain is split across the sessions that recorded token deltas
+inside it, in proportion to their weighted tokens. A session's measured drain
+is the sum of its shares; `share_of_window` is its share of everything
+attributed to the same window instance.
+
+Two details matter and are easy to get wrong:
+
+- **`resets_at` jitters by a second or two between readings.** Comparing it
+  exactly makes every line look like a window rollover and inflates drain by
+  more than an order of magnitude. The tool buckets `resets_at` to the nearest
+  minute.
+- **`used_percent` is reported in whole percent.** A 1% step covers everything
+  since the previous change, so the tool spans each interval back to the last
+  reading at which the value moved, rather than charging the step to whichever
+  session happened to be running at the final poll.
+
+Token accounting follows the Codex protocol definitions
+(`codex-rs/protocol/src/protocol.rs`): `cached_input_tokens` is a **subset** of
+`input_tokens` (`TokenUsage::non_cached_input` subtracts it) and
+`reasoning_output_tokens` is a **subset** of `output_tokens`. Neither is added
+again. `cache_write_input_tokens` is reported for display only: it is part of
+the input count and OpenAI publishes no separate cache-write rate. Codex's own
+rollout budget weighs `output_tokens * sampling_weight + non_cached_input *
+prefill_weight`, which is the same shape this tool uses.
+
+Deltas come from `token_usage_record.payload.usage`. Rollouts old enough to
+lack that record fall back to diffing consecutive
+`event_msg token_count info.total_token_usage`; when both exist the records
+win.
+
+### Claude: modelled
+
+No rate-limit or quota data is written into Claude transcripts. Usage lives on
+`assistant` lines at `message.usage`, and the same usage object is repeated
+once per streamed content block — typically three times, with identical
+`message.id` and `requestId`. **Deduplicating on `message.id` is mandatory**;
+without it totals are roughly 3x too high.
+
+Quota draw is modelled as API list-price dollars per model, because the
+officially stated factors are model, length and effort, and because the
+`limit_dollars` / `used_dollars` field names in `.claude.json` indicate
+dollar-denominated metering. Built-in prices (USD per million tokens):
+
+| model | input | cache read | cache write 5m | cache write 1h | output |
+| --- | --- | --- | --- | --- | --- |
+| claude-opus-5 | 5.00 | 0.50 | 6.25 | 10.00 | 25.00 |
+| claude-opus-4-8 | 5.00 | 0.50 | 6.25 | 10.00 | 25.00 |
+| claude-fable-5-1 | 10.00 | 0.25 | 12.50 | 20.00 | 50.00 |
+| claude-fable-5 | 10.00 | 1.00 | 12.50 | 20.00 | 50.00 |
+| claude-sonnet-5 | 2.00 | 0.20 | 2.50 | 4.00 | 10.00 |
+| claude-haiku-4-5 | 1.00 | 0.10 | 1.25 | 2.00 | 5.00 |
+
+Model ids are normalised by stripping a trailing date suffix, so
+`claude-haiku-4-5-20251001` prices as `claude-haiku-4-5`. `<synthetic>` and
+unrecognised model strings are counted in an `unweighted` bucket and priced at
+zero; the header reports the total.
+
+Subagent transcripts live at `<session-dir>/subagents/agent-<id>.jsonl`
+(sometimes nested deeper) and carry the parent's `sessionId` with
+`isSidechain: true`. Their usage rolls up into the parent session and is also
+reported separately as "of which subagents".
+
+**The Claude denominator is UNKNOWN.** Without sampled snapshots the tool
+reports a dollar equivalent and each session's share of the Claude sessions
+listed. With snapshots it can fit percent (see below), and labels those
+figures `est`.
+
+### Codex sessions span several rollout files
+
+A Codex *session* is not a rollout. `session_meta.payload` carries `id` (this
+thread), `session_id` (the umbrella session) and, for a spawned subagent,
+`parent_thread_id` plus a `source` naming the spawn. Every subagent runs in
+its own `rollout-*.jsonl` under the parent's `session_id`.
+
+The tool keys sessions by `session_id` and rolls subagent threads up into the
+parent, matching the Claude behaviour, so a Codex session reports an
+"of which subagents" figure too.
+
+## Fan-out and context growth
+
+A prompt is one thing a person typed. Everything the harness does until the
+next prompt belongs to it, including subagent work started under it.
+
+- **Claude:** a `type: user` line on the main session (not `isSidechain`, not
+  `isMeta`) whose `message.content` is a string or contains a `text` block,
+  with no `toolUseResult` key and no `tool_result` block. Lines carrying tool
+  results are fan-out steps, not prompts.
+- **Codex:** `token_usage_record.payload.turn_id` groups API calls into turns
+  exactly. Where it is absent, a prompt starts at an `event_msg` of type
+  `task_started` or at a `turn_context` line; Codex writes both within a
+  second or two of each other for the same turn, so they are collapsed.
+
+Per prompt the tool records wall time, API turns (distinct Claude
+`message.id` / Codex `response_id`), context size at the start and at the
+peak, input tokens summed across the fan-out split into uncached, cache read
+and cache write, output tokens, weighted units, and measured or estimated
+drain.
+
+**Resent share** is the fraction of a session's weighted cost that went on
+context it had already sent: for each prompt, the input-side weighted cost of
+every API turn after the first, divided by the session's total weighted cost.
+On real sessions this runs 75-90%.
+
+## Context reductions
+
+`quota-drain reductions` finds points where one thread's context shrank
+sharply, and prices what that saved.
+
+- **`compact`** — a Codex `compacted` record was written between the two
+  calls. Its fields sit directly on the record (`window_number`, `window_id`,
+  `previous_window_id`, `compaction_response_id`,
+  `latest_token_usage_record`). The history fields alongside them (`message`,
+  `replacement_history`, `guardian_history`, `retained_context`) hold prompt
+  text; the tool never reads or stores them.
+- **`unmarked`** — a drop with no marker. The ported `/shake` writes no event
+  into Codex rollouts, so every shake lands here alongside manual context
+  edits.
+
+A reduction requires a drop of more than 30% in context between consecutive
+API calls of the **same thread**, from a base of at least 20K tokens, that
+still holds three calls later. Each guard exists for a reason:
+
+- Comparisons stay inside one thread because a Codex session runs several
+  concurrent subagent threads whose small contexts would otherwise read as
+  drops against the root thread's.
+- The drop must persist because Codex interleaves a second, smaller-context
+  call stream into the root thread; those dips bounce straight back and are
+  not reductions.
+
+Savings are the removed tokens times the number of later turns in the thread,
+priced at the cache-read rate (removed context would mostly have been cache
+hits) with the uncached rate printed as an upper bound.
+
+`unmarked` detection is a heuristic. **An explicit shake marker in the Codex
+fork would make this exact.** It should carry `kind`, `before`, `after`,
+`timestamp`, and `turn_id`.
+
+## Snapshots
+
+`quota-drain snapshot` logs Claude quota observations to
+`~/.local/state/quota-drain/snapshots.jsonl`. Three sources:
+
+### `--oauth` (recommended)
+
+Samples live utilisation from the Claude usage endpoint. This is the only
+source that is both current and available non-interactively: the cached copy
+in `.claude.json` is stale, and the statusline only runs while someone is
+using the CLI.
+
+```
+quota-drain snapshot --oauth [--config-dir ~/.claude]
+```
+
+`--config-dir` is repeatable; with none given, every `~/.claude*` directory
+holding a `.credentials.json` with a `claudeAiOauth` block is sampled. The
+access token is read from that file, held in memory for the request, and never
+printed, logged, or written anywhere. `expiresAt` is checked first; an expired
+token is skipped with a note on stderr and no refresh is attempted.
+
+Guards: one attempt per invocation, a 15 s timeout, a minimum of 60 s between
+calls per config dir, and a 10-minute backoff after an HTTP 429. Poll state
+lives in `~/.local/state/quota-drain/oauth-poll.json` and holds timestamps
+only.
+
+Stored per observation: `utilization` and `resets_at` for `five_hour`,
+`seven_day`, `seven_day_opus` and `seven_day_sonnet`; the `limits[]` entries
+(`kind`, `group`, `percent`, `severity`, `is_active`, `resets_at`, and the
+scoped model id or display name); and `spend.percent`. Organization and
+account identifiers are never stored.
+
+To sample every five minutes, without installing anything here:
+
+```ini
+# ~/.config/systemd/user/quota-drain-snapshot.service
+[Unit]
+Description=Sample Claude quota utilization
+
+[Service]
+Type=oneshot
+ExecStart=%h/git/management-plane/scripts/quota-drain snapshot --oauth
+```
+
+```ini
+# ~/.config/systemd/user/quota-drain-snapshot.timer
+[Unit]
+Description=Sample Claude quota utilization every 5 minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+```
+
+`systemctl --user enable --now quota-drain-snapshot.timer`. The macOS
+equivalent is a launchd agent in `~/Library/LaunchAgents` with
+`StartInterval` set to `300` and `ProgramArguments` of the script path plus
+`snapshot` and `--oauth`.
+
+### `--stdin`
+
+Reads the Claude statusline JSON on stdin, extracts
+`rate_limits.*.used_percentage` and `resets_at`, and passes stdin through to
+stdout byte for byte so it can sit inside the statusline pipeline:
+
+```sh
+... | quota-drain snapshot --stdin | bash ~/.claude/statusline-command.sh
+```
+
+It never fails the pipeline: the passthrough happens before any parsing and
+every error after it is swallowed.
+
+### no flag
+
+Reads `cachedUsageUtilization` from every `~/.claude*/.claude.json` and appends
+when `fetchedAtMs` is newer than the last logged value for that config dir.
+`accountUuid` is never stored. This source is stale by design — it is whatever
+the CLI last cached.
+
+## Weights
+
+`~/.config/quota-drain/weights.json` overrides any built-in weight, per model,
+merged over the defaults:
+
+```json
+{
+  "version": 1,
+  "codex": {
+    "unit": "credit_units_per_mtok",
+    "models": {
+      "gpt-6-astra": { "input": 250, "cached_input": 25, "output": 1250 }
+    }
+  },
+  "claude": {
+    "unit": "usd_per_mtok",
+    "models": {
+      "claude-opus-5": {
+        "input": 5.0, "cache_read": 0.5,
+        "cache_write_5m": 6.25, "cache_write_1h": 10.0, "output": 25.0
+      }
+    }
+  }
+}
+```
+
+Built-in Codex weights come from the OpenAI credit rate card
+(learn.chatgpt.com/docs/pricing), per million tokens:
+
+| model | input | cached | output |
+| --- | --- | --- | --- |
+| gpt-6-astra | 250 | 25 | 1250 |
+| gpt-5.6-sol | 100 | 10 | 500 |
+| gpt-5.6-terra | 50 | 5 | 300 |
+| gpt-5.6-luna | 5 | 0.5 | 30 |
+
+`gpt-5.5`, `gpt-5.4`, `gpt-5.4-mini`, `gpt-5.3-codex` and
+`gpt-5.3-codex-spark` have no published rate. They are guessed at the sol rate
+and carry `"guessed": true`, which the report header names. Model strings are
+lowercased, and `luna` / `gpt-luna` map to `gpt-5.6-luna`; anything else
+unrecognised is left unweighted.
+
+## Performance and state
+
+Roughly 10 GB of rollouts. Files stream line by line with a byte-offset cache
+of one JSON shard per transcript under `~/.cache/quota-drain/`, keyed by path
+with `size`, `mtime` and `offset`. A grown file resumes from its stored
+offset; a file that shrank or whose mtime moved backwards is reparsed whole; a
+partial trailing line is left for the next run. `--since` prunes by Codex
+directory date and by file mtime before anything is opened, so a narrow query
+never touches the shards of files outside the window.
+
+Sharding rather than a single index is deliberate: one index of this corpus
+reaches nine figures of JSON and has to be parsed in full on every
+invocation, which dominates the runtime of a narrow query.
+
+Measured on `nas` over 2614 Claude transcripts (1.2 GB) and 3373 Codex
+rollouts (9.1 GB):
+
+| run | wall |
+| --- | --- |
+| full history, cold cache | ~41 s |
+| full history, warm cache | ~4 s |
+| `--since 3d`, cold cache | ~5 s |
+| `--since 3d`, warm cache | ~0.3 s |
+
+Only the structural fields are read: `type`, `message.usage`, `message.id`,
+`message.model`, timestamps, ids, `cwd`, and the Codex `rate_limits` and
+`turn_id`. Prompt text, tool results and message content are never parsed or
+printed. Claude user lines carrying tool results are screened out on the raw
+bytes before `json.loads` ever sees them.
+
+State lives in `~/.local/state/quota-drain/` (`snapshots.jsonl`,
+`codex-weights.json`, `oauth-poll.json`), config in
+`~/.config/quota-drain/weights.json`, cache in `~/.cache/quota-drain/`. The
+`QUOTA_DRAIN_HOME_DIR`, `QUOTA_DRAIN_CACHE_DIR`, `QUOTA_DRAIN_STATE_DIR` and
+`QUOTA_DRAIN_CONFIG_DIR` environment variables relocate all four for tests.
+
+## What is known
+
+**OFFICIAL.** Claude has a 5-hour rolling window and a weekly window; Max 5x
+and 20x are multipliers on Pro; usage depends on model, length, effort and
+features; extra-usage overflow bills at API rates. Codex has 5-hour primary
+and weekly windows; usage depends on model, context, reasoning, tool use and
+caching; the per-model credit rate card is above; Fast mode costs 2.5x on
+Astra.
+
+**COMMUNITY.** Claude quota approximates API cost. Cache reads are reported to
+count against Claude Code quota by more than the API's 10%
+(anthropics/claude-code issue #24147); the default here is the list price and
+`--claude-cache-read-weight` overrides it, with `calibrate --harness claude`
+reporting the measured ratio once snapshots exist. Opus and Sonnet weekly caps
+are separate.
+
+**UNKNOWN.** The exact Claude formula, and the dollar ceiling per tier — every
+account seen so far reports `limit_dollars` and `used_dollars` as null. Any
+long-context multiplier for either vendor on subscription plans: Anthropic
+removed the API 1M premium on 2026-03-13 and OpenAI publishes none, so none is
+implemented; `--long-context-multiplier` exists as a no-op-by-default knob
+applied above 200K tokens so it can be tested later.
+
+## Limits
+
+- Fast mode is not detectable from transcripts, so Astra's 2.5x is not applied.
+- Codex `used_percent` arrives in whole percent, which caps how finely drain
+  can be attributed; calibration needs multi-day ranges and time bucketing
+  before it means anything.
+- Attribution assumes one Codex account per `(limit_id, plan_type)`. Separate
+  accounts under different roots are separated by `plan_type` and by their
+  distinct `resets_at`, but two accounts on the same plan would be merged.
+- `unmarked` reductions are heuristic until the Codex fork writes a shake
+  marker.
+- A green parse is not proof of a correct model: `quota-drain verify` compares
+  the parse against the harnesses' own totals, and `calibrate` compares the
+  weights against measured drain. Use both before trusting a number.
+
+## Verification
+
+```sh
+scripts/test-quota-drain                                  # 57 synthetic-fixture tests
+python3 -m py_compile scripts/quota-drain
+uv run --python 3.9 --no-project scripts/test-quota-drain # 3.9 floor
+```
+
+Fixtures are synthetic and must stay that way. Real transcripts hold prompts
+and customer data and are never copied into this repository.

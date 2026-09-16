@@ -731,7 +731,11 @@ class Calibration(Harness):
 
     def test_calibrate_recovers_known_weights(self) -> None:
         self.build_rollouts()
-        payload = self.run_json("calibrate", "--harness", "codex", "--json")
+        # One bucket per interval: this exercises the fit itself, not the
+        # time bucketing that real whole-percent data needs.
+        payload = self.run_json(
+            "calibrate", "--harness", "codex", "--json", "--calibrate-bucket-hours", "0.01"
+        )
         self.assertGreater(payload["samples"], 6)
         self.assertGreater(payload["r_squared"], 0.99)
         fitted = payload["codex"]["models"]
@@ -745,7 +749,9 @@ class Calibration(Harness):
 
     def test_calibrate_persists_and_use_calibrated_reads_it(self) -> None:
         self.build_rollouts()
-        self.run_json("calibrate", "--harness", "codex", "--json")
+        self.run_json(
+            "calibrate", "--harness", "codex", "--json", "--calibrate-bucket-hours", "0.01"
+        )
         fit_file = self.root / "state" / "codex-weights.json"
         self.assertTrue(fit_file.is_file())
         stored = json.loads(fit_file.read_text(encoding="utf-8"))
@@ -755,6 +761,32 @@ class Calibration(Harness):
         )
         self.assertEqual(result.returncode, 0, result.stderr.decode("utf-8", "replace"))
         self.assertIn("calibrated", result.stdout.decode("utf-8"))
+
+    def test_time_buckets_merge_nearby_intervals(self) -> None:
+        self.build_rollouts()
+        fine = self.run_json(
+            "calibrate", "--harness", "codex", "--json", "--calibrate-bucket-hours", "0.01"
+        )
+        coarse = self.run_json(
+            "calibrate", "--harness", "codex", "--json", "--calibrate-bucket-hours", "24"
+        )
+        self.assertGreater(fine["samples"], coarse["samples"])
+        self.assertEqual(fine["intervals"], coarse["intervals"])
+        self.assertEqual(coarse["samples"], 1)
+
+    def test_unusable_fit_is_flagged_and_not_applied(self) -> None:
+        self.build_rollouts()
+        self.run_json(
+            "calibrate", "--harness", "codex", "--json", "--calibrate-bucket-hours", "0.01"
+        )
+        fit_file = self.root / "state" / "codex-weights.json"
+        stored = json.loads(fit_file.read_text(encoding="utf-8"))
+        stored["usable"] = False
+        fit_file.write_text(json.dumps(stored), encoding="utf-8")
+        result = self.run_tool("sessions", "--harness", "codex", "--use-calibrated", "--json")
+        self.assertEqual(result.returncode, 0)
+        self.assertIn(b"worse than the mean", result.stderr)
+        self.assertNotIn("calibrated", json.loads(result.stdout)["weight_source"])
 
     def test_nnls_stays_non_negative(self) -> None:
         matrix = [[1.0, 0.0], [0.0, 1.0], [1.0, 1.0]]
@@ -1556,7 +1588,9 @@ class ClaudeCalibration(Harness):
             samples.append((stamp, used))
         self.write_claude("calib.jsonl", lines)
         self.write_snapshots(samples)
-        payload = self.run_json("calibrate", "--harness", "claude", "--json")
+        payload = self.run_json(
+            "calibrate", "--harness", "claude", "--json", "--calibrate-bucket-hours", "0.01"
+        )
         fitted = payload["windows"]["five_hour"]["models"]["claude-opus-5"]
         self.assertLess(abs(fitted["input"] - input_rate) / input_rate, 0.05)
         self.assertLess(abs(fitted["cache_read"] - cache_rate) / cache_rate, 0.05)

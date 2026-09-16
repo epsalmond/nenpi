@@ -37,6 +37,7 @@ LONG_CONTEXT_THRESHOLD = 200_000
 CONTEXT_REDUCTION_FRACTION = 0.30
 MIN_REDUCTION_CONTEXT = 20_000
 REDUCTION_PERSISTENCE_TURNS = 3
+DEFAULT_CALIBRATION_BUCKET_HOURS = 2.0
 BOUNDARY_DEDUP_SECONDS = 5.0
 MAX_CONFIG_JSON_BYTES = 128 * 1024 * 1024
 OAUTH_USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
@@ -368,7 +369,9 @@ def load_weights(use_calibrated: bool) -> Weights:
             except (OSError, ValueError) as error:
                 warn("ignoring %s: %s" % (fit_file, error))
             else:
-                if isinstance(fit, Mapping):
+                if isinstance(fit, Mapping) and fit.get("usable") is False:
+                    warn("--use-calibrated: stored fit is worse than the mean; ignoring it")
+                elif isinstance(fit, Mapping):
                     merge_weights(table, {"codex": fit.get("codex", fit)})
                     sources.append("calibrated")
         else:
@@ -1866,6 +1869,55 @@ def nnls(matrix: Sequence[Sequence[float]], target: Sequence[float], iterations:
     return [weights[column] / scale[column] for column in range(columns)]
 
 
+def aggregate_intervals(
+    intervals: Sequence[Interval], bucket_hours: float
+) -> List[Tuple[float, Dict[Tuple[str, str], float]]]:
+    """Sum measured drain and token features into fixed time buckets.
+
+    Both vendors report utilisation in whole percent, so a single interval's
+    target is almost always exactly 1.0 while its token features vary by orders
+    of magnitude; fitting that directly is dominated by quantisation noise.
+    Buckets are fixed in *time*, not in drain: bucketing by drain would make
+    every target equal by construction and destroy the variance the fit needs.
+    """
+    span = max(60.0, bucket_hours * 3600.0)
+    buckets = {}  # type: Dict[int, Tuple[float, Dict[Tuple[str, str], float]]]
+    for interval in intervals:
+        slot = int(interval.end // span)
+        drain, features = buckets.get(slot, (0.0, {}))
+        drain += interval.drain
+        for key, value in interval.features.items():
+            features[key] = features.get(key, 0.0) + value
+        buckets[slot] = (drain, features)
+    return [buckets[slot] for slot in sorted(buckets) if buckets[slot][1]]
+
+
+def fit_percent_weights(
+    intervals: Sequence[Interval], bucket_hours: float
+) -> Optional[Dict[str, Any]]:
+    """Non-negative least squares of measured drain against token features."""
+    buckets = aggregate_intervals(intervals, bucket_hours)
+    if not buckets:
+        return None
+    features = sorted(set(key for _, values in buckets for key in values))
+    if not features:
+        return None
+    matrix = [[values.get(key, 0.0) for key in features] for _, values in buckets]
+    target = [drain for drain, _ in buckets]
+    coefficients = nnls(matrix, target)
+    score = r_squared(matrix, target, coefficients)
+    fitted = {}  # type: Dict[str, Dict[str, float]]
+    for (model, kind), value in zip(features, coefficients):
+        fitted.setdefault(model, {})[kind] = value
+    return {
+        "samples": len(buckets),
+        "intervals": len(intervals),
+        "r_squared": score,
+        "usable": score > 0.0,
+        "models": fitted,
+    }
+
+
 def r_squared(matrix: Sequence[Sequence[float]], target: Sequence[float],
               coefficients: Sequence[float]) -> float:
     if not target:
@@ -2598,27 +2650,29 @@ def command_calibrate(args: argparse.Namespace) -> int:
         return calibrate_claude(args, analysis)
     window, intervals = analysis.window, analysis.intervals
     usable = [interval for interval in intervals if not interval.rollover and interval.features]
-    features = sorted(set(key for interval in usable for key in interval.features))
-    if len(usable) < len(features) or not features:
-        warn("not enough snapshot intervals (%d) for %d coefficients" % (len(usable), len(features)))
-        if not usable:
-            return 1
-    matrix = [[interval.features.get(feature, 0.0) for feature in features]
-              for interval in usable]
-    target = [interval.drain for interval in usable]
-    coefficients = nnls(matrix, target)
-    score = r_squared(matrix, target, coefficients)
-    fitted = {}  # type: Dict[str, Dict[str, float]]
-    for (model, kind), value in zip(features, coefficients):
-        fitted.setdefault(model, {})[kind] = value
+    fit = fit_percent_weights(usable, args.calibrate_bucket_hours)
+    if fit is None:
+        warn("no snapshot intervals with token activity in range")
+        return 1
+    if not fit["usable"]:
+        warn(
+            "fit is worse than the mean (R^2 %.4f); the window reports whole "
+            "percents, so a longer range or a larger --calibrate-bucket-hours "
+            "is needed before these weights mean anything" % fit["r_squared"]
+        )
     payload = {
         "version": 1,
         "fitted_at": time.time(),
-        "samples": len(usable),
-        "r_squared": score,
+        "samples": fit["samples"],
+        "intervals": fit["intervals"],
+        "r_squared": fit["r_squared"],
+        "usable": fit["usable"],
         "unit": "percent_per_mtok",
-        "codex": {"unit": "percent_per_mtok", "models": fitted},
+        "bucket_hours": args.calibrate_bucket_hours,
+        "codex": {"unit": "percent_per_mtok", "models": fit["models"]},
     }
+    fitted = fit["models"]
+    score = fit["r_squared"]
     destination = state_dir() / "codex-weights.json"
     destination.parent.mkdir(parents=True, exist_ok=True)
     destination.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
@@ -2626,7 +2680,14 @@ def command_calibrate(args: argparse.Namespace) -> int:
         print(json.dumps(payload, indent=2, sort_keys=True))
         return 0
     paint = make_painter(args)
-    print(paint("codex calibration: %d intervals, R^2 %.4f" % (len(usable), score), "bold"))
+    print(
+        paint(
+            "codex calibration: %d intervals in %d buckets of %.1fh, R^2 %.4f%s"
+            % (fit["intervals"], fit["samples"], args.calibrate_bucket_hours, score,
+               "" if fit["usable"] else "  (NOT USABLE)"),
+            "bold",
+        )
+    )
     print("%-22s %-14s %14s %14s" % ("model", "kind", "fit %/Mtok", "default units"))
     for model in sorted(fitted):
         entry = weights.model_entry("codex", model) or {}
@@ -2720,21 +2781,11 @@ def calibrate_claude(args: argparse.Namespace, analysis: "Analysis") -> int:
         usable = [
             interval for interval in intervals if not interval.rollover and interval.features
         ]
-        if not usable:
+        fit = fit_percent_weights(usable, args.calibrate_bucket_hours)
+        if fit is None:
             continue
-        features = sorted(set(key for interval in usable for key in interval.features))
-        matrix = [[interval.features.get(key, 0.0) for key in features] for interval in usable]
-        target = [interval.drain for interval in usable]
-        coefficients = nnls(matrix, target)
-        fitted = {}  # type: Dict[str, Dict[str, float]]
-        for (model, kind), value in zip(features, coefficients):
-            fitted.setdefault(model, {})[kind] = value
-        results[window] = {
-            "samples": len(usable),
-            "r_squared": r_squared(matrix, target, coefficients),
-            "models": fitted,
-            "dollars_per_percent": claude_dollars_per_percent(),
-        }
+        fit["dollars_per_percent"] = claude_dollars_per_percent()
+        results[window] = fit
     if not results:
         warn(
             "no usable Claude snapshot intervals; sample utilisation with "
@@ -2755,8 +2806,9 @@ def calibrate_claude(args: argparse.Namespace, analysis: "Analysis") -> int:
     for window, result in sorted(results.items()):
         print(
             paint(
-                "claude %s: %d intervals, R^2 %.4f"
-                % (window, result["samples"], result["r_squared"]),
+                "claude %s: %d intervals in %d buckets, R^2 %.4f%s"
+                % (window, result["intervals"], result["samples"], result["r_squared"],
+                   "" if result["usable"] else "  (NOT USABLE)"),
                 "bold",
             )
         )
@@ -3507,6 +3559,8 @@ def add_common(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--use-calibrated", action="store_true")
     parser.add_argument("--window", choices=("auto", "five_hour", "weekly"), default="auto")
     parser.add_argument("--top", type=int, default=25, metavar="N")
+    parser.add_argument("--calibrate-bucket-hours", type=float,
+                        default=DEFAULT_CALIBRATION_BUCKET_HOURS, metavar="HOURS")
 
 
 def build_parser() -> argparse.ArgumentParser:
