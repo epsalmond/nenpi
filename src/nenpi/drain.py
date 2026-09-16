@@ -31,7 +31,7 @@ from typing import Any, Dict, Iterable, Iterator, List, Mapping, Optional, Seque
 
 
 PREFIX = "QUOTA_DRAIN_"
-CACHE_SCHEMA = 2
+CACHE_SCHEMA = 3
 JSON_SCHEMA = 1
 LONG_CONTEXT_THRESHOLD = 200_000
 CONTEXT_REDUCTION_FRACTION = 0.30
@@ -150,19 +150,31 @@ def config_dir() -> Path:
 _TS_CACHE: Dict[str, float] = {}
 
 
+FRACTIONAL_SECONDS = re.compile(r"\.(\d+)")
+
+
 def parse_timestamp(value: Any) -> Optional[float]:
-    """Parse an ISO-8601 transcript timestamp into a UTC epoch float."""
+    """Parse an ISO-8601 transcript timestamp into a UTC epoch float.
+
+    Python 3.9's `fromisoformat` accepts only 3- or 6-digit fractional
+    seconds, and harnesses emit other widths, so the fraction is normalised
+    to microseconds first.
+    """
     if not isinstance(value, str) or not value:
         return None
     cached = _TS_CACHE.get(value)
     if cached is not None:
         return cached
-    text = value
-    if text.endswith("Z"):
+    text = value.strip()
+    if text.endswith("Z") or text.endswith("z"):
         text = text[:-1] + "+00:00"
+    text = FRACTIONAL_SECONDS.sub(
+        lambda match: "." + match.group(1)[:6].ljust(6, "0"), text, count=1
+    )
     try:
         parsed = datetime.fromisoformat(text)
     except ValueError:
+        warn_once("unparseable timestamp %r; those records are skipped" % value[:40])
         return None
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=timezone.utc)
@@ -189,7 +201,9 @@ def parse_since(value: Optional[str], now: float) -> Optional[float]:
     except ValueError:
         raise SystemExit("quota-drain: cannot parse time %r (use 7d, 12h, or 2026-09-10)" % value)
     if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=datetime.now().astimezone().tzinfo)
+        # astimezone() on a naive datetime reads it as local time and applies
+        # the offset in force on that date, not today's.
+        parsed = parsed.astimezone()
     return parsed.timestamp()
 
 
@@ -230,17 +244,6 @@ def format_tokens(count: float) -> str:
 
 def empty_tokens(kinds: Sequence[str]) -> Dict[str, int]:
     return dict((kind, 0) for kind in kinds)
-
-
-def copy_token_map(payload: Any) -> Dict[str, Dict[str, int]]:
-    """Deep-copy a model->tokens map so scan totals never alias cache entries."""
-    if not isinstance(payload, Mapping):
-        return {}
-    copied = {}
-    for model, tokens in payload.items():
-        if isinstance(tokens, Mapping):
-            copied[str(model)] = dict((str(k), int(v)) for k, v in tokens.items())
-    return copied
 
 
 def normalize_claude_model(model: Any) -> str:
@@ -379,8 +382,18 @@ def load_weights(use_calibrated: bool) -> Weights:
     return Weights(table, sources)
 
 
+_WARNED = set()  # type: set
+
+
 def warn(message: str) -> None:
     sys.stderr.write("quota-drain: %s\n" % message)
+
+
+def warn_once(message: str) -> None:
+    if message in _WARNED:
+        return
+    _WARNED.add(message)
+    warn(message)
 
 
 # --------------------------------------------------------------------------
@@ -454,23 +467,32 @@ def read_lines_from(path: Path, offset: int) -> Iterator[Tuple[int, bytes]]:
 
 
 class SessionSummary:
-    """Per-session token totals, kept small enough to cache as JSON."""
+    """Per-session metadata. Token totals are derived from deduped events.
+
+    Totals cannot be accumulated while parsing: a forked or resumed session
+    replays the original's assistant lines into a new file under a new
+    session id, so the same API call is seen more than once and can only be
+    dropped once every file has been read.
+    """
 
     def __init__(self, harness: str, session_id: str):
         self.harness = harness
         self.session_id = session_id
         self.cwd = ""
+        self.cwd_hash = ""
         self.version = ""
         self.start = None  # type: Optional[float]
         self.end = None  # type: Optional[float]
-        self.models = {}  # type: Dict[str, Dict[str, int]]
-        self.models_lc = {}  # type: Dict[str, Dict[str, int]]
-        self.sub_models = {}  # type: Dict[str, Dict[str, int]]
-        self.requests = 0
-        self.sub_requests = 0
         self.cost_state = None  # type: Optional[Dict[str, Any]]
         self.thread_usage = None  # type: Optional[Dict[str, int]]
         self.originator = ""
+        # Filled by rebuild_totals from the surviving events.
+        self.models = {}  # type: Dict[str, Dict[str, int]]
+        self.sub_models = {}  # type: Dict[str, Dict[str, int]]
+        self.requests = 0
+        self.sub_requests = 0
+        self.duplicate_turns = 0
+        self.fork_of = ""
 
     @property
     def kinds(self) -> Sequence[str]:
@@ -484,45 +506,23 @@ class SessionSummary:
         if self.end is None or epoch > self.end:
             self.end = epoch
 
-    def add(
-        self,
-        model: str,
-        tokens: Mapping[str, int],
-        *,
-        sidechain: bool = False,
-        long_context: bool = False,
-    ) -> None:
-        bucket = self.sub_models if sidechain else self.models
-        target = bucket.setdefault(model, empty_tokens(self.kinds))
-        for kind, value in tokens.items():
-            target[kind] = target.get(kind, 0) + int(value)
-        if not sidechain:
-            self.requests += 1
-        else:
-            self.sub_requests += 1
-        # Subagent usage is also part of the parent session's totals.
-        if sidechain:
-            rollup = self.models.setdefault(model, empty_tokens(self.kinds))
-            for kind, value in tokens.items():
-                rollup[kind] = rollup.get(kind, 0) + int(value)
-        if long_context:
-            lc = self.models_lc.setdefault(model, empty_tokens(self.kinds))
-            for kind, value in tokens.items():
-                lc[kind] = lc.get(kind, 0) + int(value)
+    def set_cwd(self, cwd: Any) -> None:
+        """Keep the basename only; the full path is customer-identifying."""
+        if not isinstance(cwd, str) or not cwd:
+            return
+        if not self.cwd:
+            self.cwd = Path(cwd).name or cwd
+            self.cwd_hash = hashlib.sha1(cwd.encode("utf-8")).hexdigest()[:12]
 
     def to_json(self) -> Dict[str, Any]:
         payload = {
             "harness": self.harness,
             "session_id": self.session_id,
             "cwd": self.cwd,
+            "cwd_hash": self.cwd_hash,
             "version": self.version,
             "start": self.start,
             "end": self.end,
-            "models": self.models,
-            "models_lc": self.models_lc,
-            "sub_models": self.sub_models,
-            "requests": self.requests,
-            "sub_requests": self.sub_requests,
         }
         if self.cost_state is not None:
             payload["cost_state"] = self.cost_state
@@ -536,14 +536,10 @@ class SessionSummary:
     def from_json(cls, payload: Mapping[str, Any]) -> "SessionSummary":
         summary = cls(str(payload.get("harness", "claude")), str(payload.get("session_id", "")))
         summary.cwd = str(payload.get("cwd", ""))
+        summary.cwd_hash = str(payload.get("cwd_hash", ""))
         summary.version = str(payload.get("version", ""))
         summary.start = payload.get("start")
         summary.end = payload.get("end")
-        summary.models = copy_token_map(payload.get("models"))
-        summary.models_lc = copy_token_map(payload.get("models_lc"))
-        summary.sub_models = copy_token_map(payload.get("sub_models"))
-        summary.requests = int(payload.get("requests") or 0)
-        summary.sub_requests = int(payload.get("sub_requests") or 0)
         summary.cost_state = payload.get("cost_state")
         summary.thread_usage = payload.get("thread_usage")
         summary.originator = str(payload.get("originator", ""))
@@ -551,19 +547,11 @@ class SessionSummary:
 
     def merge(self, other: "SessionSummary") -> None:
         self.cwd = self.cwd or other.cwd
+        self.cwd_hash = self.cwd_hash or other.cwd_hash
         self.version = other.version or self.version
         self.originator = self.originator or other.originator
         self.touch(other.start)
         self.touch(other.end)
-        for attribute in ("models", "models_lc", "sub_models"):
-            source = getattr(other, attribute)
-            target = getattr(self, attribute)
-            for model, tokens in source.items():
-                slot = target.setdefault(model, empty_tokens(self.kinds))
-                for kind, value in tokens.items():
-                    slot[kind] = slot.get(kind, 0) + int(value)
-        self.requests += other.requests
-        self.sub_requests += other.sub_requests
         if other.cost_state is not None:
             self.cost_state = other.cost_state
         if other.thread_usage is not None:
@@ -590,6 +578,8 @@ class FileIndex:
         self.compactions = []  # type: List[List[Any]]
         self.thread_id = ""
         self.is_subagent = False
+        self.head_hash = ""
+        self.tail_hash = ""
 
     def to_json(self) -> Dict[str, Any]:
         return {
@@ -609,6 +599,8 @@ class FileIndex:
             "compactions": self.compactions,
             "thread_id": self.thread_id,
             "is_subagent": self.is_subagent,
+            "head_hash": self.head_hash,
+            "tail_hash": self.tail_hash,
         }
 
     @classmethod
@@ -630,20 +622,58 @@ class FileIndex:
         index.compactions = list(payload.get("compactions") or [])
         index.thread_id = str(payload.get("thread_id", ""))
         index.is_subagent = bool(payload.get("is_subagent"))
+        index.head_hash = str(payload.get("head_hash", ""))
+        index.tail_hash = str(payload.get("tail_hash", ""))
         return index
+
+    def stamp(self, path: Path, stat: os.stat_result) -> None:
+        self.size = stat.st_size
+        self.mtime = stat.st_mtime
+        self.head_hash, self.tail_hash = content_fingerprint(path, self.offset)
+
+
+CACHE_HEAD_BYTES = 4096
+CACHE_TAIL_BYTES = 256
+
+
+def content_fingerprint(path: Path, offset: int) -> Tuple[str, str]:
+    """Hash the head of a file and the bytes just before the resume offset.
+
+    Size and mtime alone miss an in-place rewrite that happens to grow the
+    file: resuming from the stored offset would then land mid-record and the
+    rest of the file would be silently skipped.
+    """
+    try:
+        with open(path, "rb") as handle:
+            head = handle.read(CACHE_HEAD_BYTES)
+            tail = b""
+            if offset > 0:
+                handle.seek(max(0, offset - CACHE_TAIL_BYTES))
+                tail = handle.read(min(CACHE_TAIL_BYTES, offset))
+    except OSError:
+        return "", ""
+    return (
+        hashlib.sha1(head).hexdigest()[:16],
+        hashlib.sha1(tail).hexdigest()[:16],
+    )
 
 
 # Event layout, one row per deduped API call:
-# [session_id, model, timestamp, k0, k1, k2, k3, long_context, subagent, turn_id]
+# [session_id, model, timestamp, k0..k4, long_context, subagent,
+#  turn_id, thread_id, call_id]
 # assemble_prompts appends the owning prompt index as EVENT_PROMPT.
+# The token area is a fixed five slots so one set of indices serves both
+# harnesses; Codex uses four kinds and leaves the fifth zero.
 EVENT_SESSION, EVENT_MODEL, EVENT_TS = 0, 1, 2
 EVENT_KINDS = 3
-EVENT_LONG = 7
-EVENT_SUB = 8
-EVENT_TURN = 9
-EVENT_THREAD = 10
-EVENT_PROMPT = 11
-EVENT_STORED_WIDTH = 11
+EVENT_KIND_SLOTS = 5
+EVENT_LONG = 8
+EVENT_SUB = 9
+EVENT_TURN = 10
+EVENT_THREAD = 11
+EVENT_ID = 12
+EVENT_PROMPT = 13
+EVENT_STORED_WIDTH = 13
 
 
 def event_tokens(event: Sequence[Any], kinds: Sequence[str]) -> Dict[str, int]:
@@ -748,9 +778,7 @@ def parse_claude_file(path: Path, index: FileIndex) -> FileIndex:
                 recent = recent[-DEDUP_CARRY_IDS:]
         model = normalize_claude_model(message.get("model"))
         epoch = parse_timestamp(record.get("timestamp"))
-        cwd = record.get("cwd")
-        if isinstance(cwd, str) and cwd and not summary.cwd:
-            summary.cwd = cwd
+        summary.set_cwd(record.get("cwd"))
         version = record.get("version")
         if isinstance(version, str) and version:
             summary.version = version
@@ -775,7 +803,6 @@ def parse_claude_file(path: Path, index: FileIndex) -> FileIndex:
         sidechain = bool(record.get("isSidechain")) or is_subagent_file
         context_size = tokens["input"] + tokens["cache_read"] + write_5m + write_1h
         long_context = context_size > LONG_CONTEXT_THRESHOLD
-        summary.add(model, tokens, sidechain=sidechain, long_context=long_context)
         if epoch is not None:
             index.events.append(
                 [
@@ -786,10 +813,12 @@ def parse_claude_file(path: Path, index: FileIndex) -> FileIndex:
                     tokens["cache_read"],
                     write_5m,
                     write_1h,
+                    tokens["output"],
                     1 if long_context else 0,
                     1 if sidechain else 0,
                     "",
                     "",
+                    message_id if isinstance(message_id, str) else "",
                 ]
             )
     index.offset = offset
@@ -885,9 +914,7 @@ def parse_codex_file(path: Path, index: FileIndex) -> FileIndex:
                 session_id = path.stem
             index.is_subagent = is_codex_subagent(payload)
             summary = index.sessions.setdefault(session_id, SessionSummary("codex", session_id))
-            cwd = payload.get("cwd")
-            if isinstance(cwd, str) and cwd:
-                summary.cwd = cwd
+            summary.set_cwd(payload.get("cwd"))
             originator = payload.get("originator")
             if isinstance(originator, str):
                 summary.originator = originator
@@ -926,6 +953,7 @@ def parse_codex_file(path: Path, index: FileIndex) -> FileIndex:
             if isinstance(thread_usage, dict):
                 summary.thread_usage = codex_usage_tokens(thread_usage)
             turn_id = payload.get("turn_id")
+            response_id = payload.get("response_id")
             record_event(
                 index.events,
                 summary,
@@ -937,6 +965,7 @@ def parse_codex_file(path: Path, index: FileIndex) -> FileIndex:
                 turn=turn_id if isinstance(turn_id, str) else "",
                 thread=index.thread_id or path.stem,
                 sidechain=index.is_subagent,
+                call_id=response_id if isinstance(response_id, str) else "",
             )
             continue
 
@@ -1020,19 +1049,21 @@ def record_event(
     turn: str = "",
     thread: str = "",
     sidechain: bool = False,
+    call_id: str = "",
 ) -> None:
     context_size = tokens.get("input", 0) + tokens.get("cached_input", 0)
     long_context = context_size > LONG_CONTEXT_THRESHOLD
     summary.touch(epoch)
-    summary.add(model, tokens, sidechain=sidechain, long_context=long_context)
     if epoch is None:
         return
     row = [session_id, model, epoch]
     row.extend(int(tokens.get(kind, 0)) for kind in kinds)
+    row.extend([0] * (EVENT_KIND_SLOTS - len(kinds)))
     row.append(1 if long_context else 0)
     row.append(1 if sidechain else 0)
     row.append(turn)
     row.append(thread)
+    row.append(call_id)
     events.append(row)
 
 
@@ -1117,9 +1148,43 @@ class Cache:
             entry = FileIndex(harness)
             self.entries[key] = entry
             return entry, True
+        head_hash, tail_hash = content_fingerprint(path, entry.offset)
+        if entry.head_hash and (head_hash, tail_hash) != (entry.head_hash, entry.tail_hash):
+            # Rewritten in place; the stored offset no longer names a record
+            # boundary, so the file is read again from the start.
+            entry = FileIndex(harness)
+            self.entries[key] = entry
+            return entry, True
         if stat.st_size == entry.size and abs(stat.st_mtime - entry.mtime) <= 1:
             return entry, False
         return entry, True
+
+    def drop_old_schemas(self) -> None:
+        current = "v%d" % CACHE_SCHEMA
+        try:
+            children = list(self.root.iterdir())
+        except OSError:
+            return
+        for child in children:
+            if child.is_dir() and child.name.startswith("v") and child.name != current:
+                shutil.rmtree(str(child), ignore_errors=True)
+
+    def prune(self, live: Iterable[str]) -> None:
+        """Delete shards for transcripts that no longer exist."""
+        alive = set(live)
+        root = self.root / ("v%d" % CACHE_SCHEMA)
+        if not root.is_dir():
+            return
+        for shard in root.rglob("*.json"):
+            try:
+                stored = json.loads(shard.read_text(encoding="utf-8")).get("path")
+            except (OSError, ValueError, AttributeError):
+                continue
+            if isinstance(stored, str) and stored not in alive:
+                try:
+                    shard.unlink()
+                except OSError:
+                    continue
 
     def mark(self, path: Path) -> None:
         self.dirty.add(str(path))
@@ -1181,6 +1246,8 @@ class Scan:
         self.snapshots = []  # type: List[Dict[str, Any]]
         self.boundaries = {}  # type: Dict[Tuple[str, str], List[float]]
         self.compactions = {}  # type: Dict[Tuple[str, str], List[float]]
+        self.claimed = {}  # type: Dict[str, str]
+        self.forks = {}  # type: Dict[Tuple[str, str], Dict[str, int]]
         self.files_read = 0
         self.files_seen = 0
         self.bytes_read = 0
@@ -1190,6 +1257,7 @@ def collect(args: argparse.Namespace, since: Optional[float]) -> Scan:
     home = home_dir()
     harness = args.harness
     cache = Cache(cache_dir(), args.rebuild_cache)
+    cache.drop_old_schemas()
 
     targets = []  # type: List[Tuple[Path, str]]
     if harness in ("claude", "all"):
@@ -1203,19 +1271,29 @@ def collect(args: argparse.Namespace, since: Optional[float]) -> Scan:
         for path in codex_transcripts(roots, since):
             targets.append((path, "codex"))
 
-    scan = Scan()
-    scan.files_seen = len(targets)
-    progress = Progress(sys.stderr.isatty(), len(targets), "scanning")
+    stamped = []  # type: List[Tuple[float, str, Path, str, os.stat_result]]
+    live = set()
     for path, kind in targets:
-        progress.step()
         try:
             stat = path.stat()
         except OSError:
             continue
-        # A transcript last written before the window cannot hold events
-        # inside it, so its shard is never opened.
+        live.add(str(path))
         if since is not None and stat.st_mtime < since:
+            # A transcript last written before the window cannot hold events
+            # inside it, so its shard is never opened.
             continue
+        stamped.append((stat.st_mtime, str(path), path, kind, stat))
+    # Oldest file first, so the session that recorded an API call originally
+    # keeps it and a later fork that replays it is the one that loses.
+    stamped.sort(key=lambda item: (item[0], item[1]))
+
+    scan = Scan()
+    scan.files_seen = len(targets)
+    progress = Progress(sys.stderr.isatty() and not getattr(args, "no_color", False),
+                        len(stamped), "scanning")
+    for _, _, path, kind, stat in stamped:
+        progress.step()
         entry, stale = cache.entry_for(path, kind, stat)
         if stale:
             try:
@@ -1227,8 +1305,7 @@ def collect(args: argparse.Namespace, since: Optional[float]) -> Scan:
                 warn("skipping %s: %s" % (path.name, error))
                 continue
             scan.bytes_read += max(0, stat.st_size - entry.size)
-            entry.size = stat.st_size
-            entry.mtime = stat.st_mtime
+            entry.stamp(path, stat)
             cache.mark(path)
             scan.files_read += 1
         absorb(scan, entry, kind)
@@ -1238,6 +1315,9 @@ def collect(args: argparse.Namespace, since: Optional[float]) -> Scan:
             warn("cache not written: %s" % error)
         cache.forget(path)
     progress.finish()
+    if since is None or args.rebuild_cache:
+        # Only a full sweep knows every path that still exists.
+        cache.prune(live)
     return scan
 
 
@@ -1249,7 +1329,21 @@ def absorb(scan: Scan, entry: FileIndex, harness: str) -> None:
             scan.sessions[key] = SessionSummary.from_json(summary.to_json())
         else:
             existing.merge(summary)
-    scan.events[harness].extend(entry.events)
+    claimed = scan.claimed
+    kept = scan.events[harness]
+    for row in entry.events:
+        call_id = row[EVENT_ID]
+        if call_id:
+            owner = claimed.get(call_id)
+            if owner is not None:
+                # Same API call seen again: a resumed or forked transcript
+                # replaying it. Count it once, against whoever recorded it first.
+                if owner != row[EVENT_SESSION]:
+                    forks = scan.forks.setdefault((harness, row[EVENT_SESSION]), {})
+                    forks[owner] = forks.get(owner, 0) + 1
+                continue
+            claimed[call_id] = row[EVENT_SESSION]
+        kept.append(row)
     scan.snapshots.extend(entry.snapshots)
     for row in entry.boundaries:
         scan.boundaries.setdefault((harness, str(row[0])), []).append(float(row[1]))
@@ -1257,8 +1351,55 @@ def absorb(scan: Scan, entry: FileIndex, harness: str) -> None:
         scan.compactions.setdefault((harness, str(row[0])), []).append(float(row[1]))
 
 
-# --------------------------------------------------------------------------
-# Codex measured attribution
+def window_events(scan: Scan, since: Optional[float], until: Optional[float]) -> None:
+    """Drop every event outside the reporting range.
+
+    Without this a session selected by its end time still reported the tokens
+    of its whole life, which overstates a narrow `--since` by orders of
+    magnitude.
+    """
+    if since is None and until is None:
+        return
+    for harness, events in scan.events.items():
+        scan.events[harness] = [
+            row
+            for row in events
+            if (since is None or row[EVENT_TS] >= since)
+            and (until is None or row[EVENT_TS] <= until)
+        ]
+
+
+def rebuild_totals(scan: Scan, weights: Weights, args: argparse.Namespace) -> None:
+    """Derive per-session token totals and weighted units from surviving events."""
+    for summary in scan.sessions.values():
+        summary.models = {}
+        summary.sub_models = {}
+        summary.requests = 0
+        summary.sub_requests = 0
+    for harness, events in scan.events.items():
+        kinds = CLAUDE_KINDS if harness == "claude" else CODEX_KINDS
+        for row in events:
+            summary = scan.sessions.get((harness, row[EVENT_SESSION]))
+            if summary is None:
+                continue
+            tokens = event_tokens(row, kinds)
+            bucket = summary.sub_models if row[EVENT_SUB] else summary.models
+            slot = bucket.setdefault(row[EVENT_MODEL], empty_tokens(kinds))
+            for kind in kinds:
+                slot[kind] += tokens[kind]
+            if row[EVENT_SUB]:
+                summary.sub_requests += 1
+                rollup = summary.models.setdefault(row[EVENT_MODEL], empty_tokens(kinds))
+                for kind in kinds:
+                    rollup[kind] += tokens[kind]
+            else:
+                summary.requests += 1
+    for (harness, session_id), forks in scan.forks.items():
+        summary = scan.sessions.get((harness, session_id))
+        if summary is None:
+            continue
+        summary.duplicate_turns = sum(forks.values())
+        summary.fork_of = max(forks, key=lambda key: forks[key])
 
 
 class Interval:
@@ -1275,6 +1416,13 @@ class Interval:
         self.features = {}  # type: Dict[Tuple[str, str], float]
 
 
+UNSET = object()
+NO_WINDOW = object()
+ANY_WINDOW = object()
+WINDOW_ALIASES = {"five_hour": 300, "weekly": 10080}
+WINDOW_NAMES = {300: "five_hour", 10080: "weekly"}
+
+
 def resets_bucket(value: Any) -> Any:
     """Collapse the jitter both vendors put in `resets_at`.
 
@@ -1283,13 +1431,23 @@ def resets_bucket(value: Any) -> Any:
     raw equality test reads either as a fresh window rollover on every line,
     which inflates measured drain by more than an order of magnitude.
     """
+    epoch = resets_epoch(value)
+    if epoch is not None:
+        return int(round(epoch / 60.0))
+    return NO_RESET if value is None else value
+
+
+NO_RESET = "<no-reset>"
+
+
+def resets_epoch(value: Any) -> Optional[float]:
+    if isinstance(value, bool):
+        return None
     if isinstance(value, (int, float)):
-        return int(round(float(value) / 60.0))
+        return float(value)
     if isinstance(value, str):
-        epoch = parse_timestamp(value)
-        if epoch is not None:
-            return int(round(epoch / 60.0))
-    return value
+        return parse_timestamp(value)
+    return None
 
 
 def snapshot_windows(
@@ -1305,46 +1463,65 @@ def snapshot_windows(
     return grouped
 
 
-def choose_window(snapshots: Sequence[Mapping[str, Any]], wanted: Optional[str]) -> Optional[str]:
-    """Pick one window size so drains are never summed across two denominators."""
+def choose_window(snapshots: Sequence[Mapping[str, Any]], wanted: Optional[str]) -> Any:
+    """Pick exactly one window so drains are never summed across denominators.
+
+    Returns the `window_minutes` value to keep, whatever it is - including a
+    value this tool has no name for. Summing a five-hour and a weekly window
+    together doubles every session's drain.
+    """
     if wanted and wanted != "auto":
-        return wanted
-    counts = {}  # type: Dict[int, int]
+        return WINDOW_ALIASES.get(wanted, wanted)
+    counts = {}  # type: Dict[Any, int]
     for row in snapshots:
         minutes = row.get("window_minutes")
-        if isinstance(minutes, (int, float)):
-            counts[int(minutes)] = counts.get(int(minutes), 0) + 1
+        key = minutes if isinstance(minutes, (int, float)) else NO_RESET
+        counts[key] = counts.get(key, 0) + 1
     if not counts:
-        return None
-    best = max(counts, key=lambda key: counts[key])
-    return {300: "five_hour", 10080: "weekly"}.get(best)
+        return NO_WINDOW
+    # Ties go to the shorter window: it is the tighter constraint, and an
+    # arbitrary winner would make the same corpus report two different drains.
+    ordered = sorted(counts, key=lambda key: (key if isinstance(key, (int, float)) else 1e18,
+                                              repr(key)))
+    return max(ordered, key=lambda key: counts[key])
 
 
-def window_matches(window_minutes: Any, wanted: str) -> bool:
-    if not isinstance(window_minutes, (int, float)):
+def window_label(window: Any) -> str:
+    if window is NO_WINDOW:
+        return "none"
+    if window is ANY_WINDOW:
+        return "all"
+    if isinstance(window, (int, float)):
+        name = WINDOW_NAMES.get(int(window))
+        return "%d min (%s)" % (int(window), name) if name else "%d min" % int(window)
+    return str(window)
+
+
+def window_matches(window_minutes: Any, wanted: Any) -> bool:
+    if wanted is ANY_WINDOW:
+        return True
+    if wanted is NO_WINDOW:
         return False
-    if wanted == "five_hour":
-        return int(window_minutes) == 300
-    if wanted == "weekly":
-        return int(window_minutes) == 10080
-    return True
+    left = window_minutes if isinstance(window_minutes, (int, float)) else NO_RESET
+    if isinstance(left, (int, float)) and isinstance(wanted, (int, float)):
+        return int(left) == int(wanted)
+    return left == wanted
 
 
-def build_intervals(
-    snapshots: Sequence[Mapping[str, Any]], window_filter: Optional[str]
-) -> List[Interval]:
+def build_intervals(snapshots: Sequence[Mapping[str, Any]], window: Any) -> List[Interval]:
     intervals = []
-    for key, rows in snapshot_windows(snapshots).items():
-        if window_filter and not window_matches(key[2], window_filter):
+    groups = snapshot_windows(snapshots)
+    for key, rows in groups.items():
+        if not window_matches(key[2], window):
             continue
-        current = None  # type: Any
+        current = UNSET  # type: Any
         running = 0.0
         anchor_ts = None  # type: Optional[float]
         for row in rows:
             bucket = resets_bucket(row.get("resets_at"))
             used = row["used_percent"]
             if (
-                current is not None
+                current is not UNSET
                 and isinstance(bucket, int)
                 and isinstance(current, int)
                 and bucket < current
@@ -1352,14 +1529,15 @@ def build_intervals(
                 # A reading from a window that has already rolled over; two
                 # sessions polling concurrently can interleave them.
                 continue
-            if current is None:
+            if current is UNSET:
                 current, running, anchor_ts = bucket, used, row["ts"]
                 continue
             if bucket != current:
                 drain = min(100.0, max(0.0, used))
-                if drain > 0 and anchor_ts is not None and row["ts"] > anchor_ts:
+                start = window_start(row, anchor_ts)
+                if drain > 0 and start is not None and row["ts"] > start:
                     intervals.append(
-                        Interval(key, anchor_ts, row["ts"], drain, row.get("resets_at"), True)
+                        Interval(key, start, row["ts"], drain, row.get("resets_at"), True)
                     )
                 current, running, anchor_ts = bucket, used, row["ts"]
                 continue
@@ -1374,11 +1552,34 @@ def build_intervals(
                 )
             running, anchor_ts = used, row["ts"]
     intervals.sort(key=lambda item: item.start)
+    if groups and not intervals:
+        warn(
+            "snapshots exist but none produced a measurable interval "
+            "(window %s); Codex drain is unattributed" % window_label(window)
+        )
     return intervals
 
 
+def window_start(row: Mapping[str, Any], anchor_ts: Optional[float]) -> Optional[float]:
+    """Where a rolled-over window's drain can have started.
+
+    A new window's `used_percent` was accumulated inside that window, so the
+    interval must not reach back past the reset into the previous one and
+    charge sessions that had already finished.
+    """
+    reset = resets_epoch(row.get("resets_at"))
+    minutes = row.get("window_minutes")
+    if reset is not None and isinstance(minutes, (int, float)) and minutes > 0:
+        opened = reset - float(minutes) * 60.0
+        if anchor_ts is None:
+            return opened
+        return max(anchor_ts, opened)
+    return anchor_ts
+
+
 def attribute(
-    intervals: Sequence[Interval], events: Sequence[Sequence[Any]], weights: Weights
+    intervals: Sequence[Interval], events: Sequence[Sequence[Any]], weights: Weights,
+    args: argparse.Namespace
 ) -> None:
     """Split each interval's measured drain across the sessions active in it."""
     ordered = sorted((event for event in events if event[EVENT_TS] is not None),
@@ -1394,7 +1595,14 @@ def attribute(
         prompt_shares = {}  # type: Dict[Tuple[str, Any], float]
         for event in ordered[low:high]:
             tokens = event_tokens(event, CODEX_KINDS)
-            units = weights.codex_units(event[EVENT_MODEL], tokens)
+            units = weighted_units(
+                "codex", event[EVENT_MODEL], tokens, weights, args, bool(event[EVENT_LONG])
+            )
+            if units <= 0:
+                # A model with no weight, or one whose fitted coefficient is
+                # zero, still ran inside this interval; fall back to raw
+                # tokens so it is never treated as free.
+                units = float(sum(tokens.get(kind, 0) for kind in CODEX_FIT_KINDS)) * 1e-9
             if units <= 0:
                 continue
             total += units
@@ -1471,6 +1679,38 @@ class Prompt:
             "model": self.model,
             "reduction": self.reduction,
         }
+
+
+def weighted_units(
+    harness: str,
+    model: str,
+    tokens: Mapping[str, int],
+    weights: Weights,
+    args: argparse.Namespace,
+    long_context: bool = False,
+) -> float:
+    """The one place tokens turn into weighted units.
+
+    Every view weighs the same way, so the long-context knob and the
+    cache-read override cannot apply in one report and not another.
+    """
+    if harness == "claude":
+        units = weights.claude_units(model, tokens, args.claude_cache_read_weight)
+    else:
+        units = weights.codex_units(model, tokens)
+    if long_context:
+        units *= args.long_context_multiplier
+    return units
+
+
+def event_units(
+    harness: str, row: Sequence[Any], kinds: Sequence[str], weights: Weights,
+    args: argparse.Namespace
+) -> float:
+    return weighted_units(
+        harness, row[EVENT_MODEL], event_tokens(row, kinds), weights, args,
+        bool(row[EVENT_LONG]),
+    )
 
 
 def input_side_units(harness: str, model: str, tokens: Mapping[str, int], weights: Weights,
@@ -1564,12 +1804,9 @@ def build_prompt(
         for kind in kinds:
             prompt.tokens[kind] += tokens[kind]
         prompt.input_tokens += context
-        if harness == "claude":
-            prompt.units += weights.claude_units(
-                row[EVENT_MODEL], tokens, args.claude_cache_read_weight
-            )
-        else:
-            prompt.units += weights.codex_units(row[EVENT_MODEL], tokens)
+        prompt.units += weighted_units(
+            harness, row[EVENT_MODEL], tokens, weights, args, bool(row[EVENT_LONG])
+        )
         prompt.resent_units += input_side_units(
             harness, row[EVENT_MODEL], tokens, weights, args.claude_cache_read_weight
         )
@@ -1973,6 +2210,18 @@ def session_rows(
     since: Optional[float],
     until: Optional[float],
 ) -> List[Row]:
+    """Build one row per session from the events that survived windowing."""
+    long_context = {}  # type: Dict[Tuple[str, str, str], Dict[str, int]]
+    for harness, events in scan.events.items():
+        kinds = CLAUDE_KINDS if harness == "claude" else CODEX_KINDS
+        for event in events:
+            if not event[EVENT_LONG]:
+                continue
+            slot = long_context.setdefault(
+                (harness, event[EVENT_SESSION], event[EVENT_MODEL]), empty_tokens(kinds)
+            )
+            for kind, value in event_tokens(event, kinds).items():
+                slot[kind] += value
     rows = []
     for (harness, session_id), summary in scan.sessions.items():
         if summary.end is None:
@@ -1980,6 +2229,8 @@ def session_rows(
         if since is not None and summary.end < since:
             continue
         if until is not None and summary.start is not None and summary.start > until:
+            continue
+        if not summary.models and not summary.sub_models:
             continue
         row = Row(summary)
         kinds = CLAUDE_KINDS if harness == "claude" else CODEX_KINDS
@@ -1989,16 +2240,11 @@ def session_rows(
         for model, tokens in summary.models.items():
             for kind in kinds:
                 row.tokens[kind] += int(tokens.get(kind, 0))
-            long_tokens = summary.models_lc.get(model) or {}
-            if harness == "claude":
-                units = weights.claude_units(model, tokens, args.claude_cache_read_weight)
-                long_units = weights.claude_units(
-                    model, long_tokens, args.claude_cache_read_weight
-                )
-            else:
-                units = weights.codex_units(model, tokens)
-                long_units = weights.codex_units(model, long_tokens)
-            units += long_units * (args.long_context_multiplier - 1.0)
+            stretched = long_context.get((harness, session_id, model)) or {}
+            units = weighted_units(harness, model, tokens, weights, args)
+            units += weighted_units(harness, model, stretched, weights, args) * (
+                args.long_context_multiplier - 1.0
+            )
             if weights.model_entry(harness, model) is None:
                 row.unweighted_tokens += sum(int(tokens.get(kind, 0)) for kind in kinds)
             row.units += units
@@ -2010,12 +2256,7 @@ def session_rows(
         for model, tokens in summary.sub_models.items():
             for kind in kinds:
                 row.sub_tokens[kind] += int(tokens.get(kind, 0))
-            if harness == "claude":
-                row.sub_units += weights.claude_units(
-                    model, tokens, args.claude_cache_read_weight
-                )
-            else:
-                row.sub_units += weights.codex_units(model, tokens)
+            row.sub_units += weighted_units(harness, model, tokens, weights, args)
         rows.append(row)
     return rows
 
@@ -2183,7 +2424,7 @@ def header_lines(
         tiers.append("codex=%s" % codex_plan)
     lines.append(
         "plan: %s | weights: %s | codex window: %s | zone: %s"
-        % (", ".join(tiers) or "unknown", weights.source_label, window or "none",
+        % (", ".join(tiers) or "unknown", weights.source_label, window_label(window),
            local_zone_name())
     )
     used_codex = set()
@@ -2387,6 +2628,9 @@ def row_json(row: Row) -> Dict[str, Any]:
         "drain_percent": row.drain_percent,
         "drain_is_estimate": row.estimated,
         "relative_to_harness_peak": row.relative,
+        "cwd_hash": summary.cwd_hash,
+        "fork_of": short_id(summary.fork_of) if summary.fork_of else "",
+        "duplicate_turns": summary.duplicate_turns,
         "prompts": row.prompt_count,
         "api_turns": row.api_turns,
         "turns_per_prompt_p90": row.turns_p90,
@@ -2433,13 +2677,24 @@ def prepare(args: argparse.Namespace) -> Analysis:
     until = parse_since(args.until, now) if getattr(args, "until", None) else None
     weights = load_weights(getattr(args, "use_calibrated", False))
     scan = collect(args, since)
+    if not getattr(args, "whole_session", False):
+        window_events(scan, since, until)
+    rebuild_totals(scan, weights, args)
     analysis = Analysis(scan, weights, since, until, args)
     # Prompt keys must exist before attribution so measured drain can be split
     # down to the prompt as well as the session.
     analysis.prompts = assemble_prompts(scan, weights, args)
     analysis.window = choose_window(scan.snapshots, args.window)
-    analysis.intervals = build_intervals(scan.snapshots, analysis.window)
-    attribute(analysis.intervals, scan.events["codex"], weights)
+    analysis.intervals = [
+        interval
+        for interval in build_intervals(scan.snapshots, analysis.window)
+        if (since is None or interval.end >= since)
+        and (until is None or interval.start <= until)
+    ]
+    for interval in analysis.intervals:
+        if since is not None and interval.start < since:
+            interval.start = since
+    attribute(analysis.intervals, scan.events["codex"], weights, args)
     apply_prompt_drain(analysis)
     return analysis
 
@@ -2477,7 +2732,7 @@ def command_sessions(args: argparse.Namespace) -> int:
             "generated_at": time.time(),
             "weight_source": weights.source_label,
             "claude_dollars_per_percent": dollars_per_percent,
-            "codex_window": window,
+            "codex_window": window_label(window),
             "files_scanned": scan.files_seen,
             "files_parsed": scan.files_read,
             "sessions": [row_json(row) for row in rows],
@@ -2510,13 +2765,7 @@ def command_timeline(args: argparse.Namespace) -> int:
                 continue
             if until is not None and epoch > until:
                 continue
-            tokens = event_tokens(event, kinds)
-            if harness == "claude":
-                units = weights.claude_units(
-                    event[EVENT_MODEL], tokens, args.claude_cache_read_weight
-                )
-            else:
-                units = weights.codex_units(event[EVENT_MODEL], tokens)
+            units = event_units(harness, event, kinds, weights, args)
             slot = int(epoch // bucket_seconds) * bucket_seconds
             entry = buckets.setdefault(slot, {"claude": 0.0, "codex": 0.0, "used_percent": 0.0})
             entry[harness] += units
@@ -2527,7 +2776,7 @@ def command_timeline(args: argparse.Namespace) -> int:
             continue
         if until is not None and epoch > until:
             continue
-        if timeline_window and not window_matches(row.get("window_minutes"), timeline_window):
+        if not window_matches(row.get("window_minutes"), timeline_window):
             continue
         slot = int(epoch // bucket_seconds) * bucket_seconds
         entry = buckets.setdefault(slot, {"claude": 0.0, "codex": 0.0, "used_percent": 0.0})
@@ -2579,7 +2828,7 @@ def command_windows(args: argparse.Namespace) -> int:
     for row in scan.snapshots:
         if since is not None and row["ts"] < since:
             continue
-        if window and not window_matches(row.get("window_minutes"), window):
+        if not window_matches(row.get("window_minutes"), window):
             continue
         key = (row.get("window_minutes"), resets_bucket(row.get("resets_at")))
         entry = windows.setdefault(
@@ -2783,7 +3032,7 @@ def calibrate_claude(args: argparse.Namespace, analysis: "Analysis") -> int:
         ]
         if len(rows) < 2:
             continue
-        intervals = build_intervals(rows, None)
+        intervals = build_intervals(rows, ANY_WINDOW)
         collect_claude_features(intervals, analysis.scan.events["claude"])
         usable = [
             interval for interval in intervals if not interval.rollover and interval.features
@@ -3566,6 +3815,8 @@ def add_common(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--use-calibrated", action="store_true")
     parser.add_argument("--window", choices=("auto", "five_hour", "weekly"), default="auto")
     parser.add_argument("--top", type=int, default=25, metavar="N")
+    parser.add_argument("--whole-session", action="store_true",
+                        help="report each selected session's whole life, not just the range")
     parser.add_argument("--calibrate-bucket-hours", type=float,
                         default=DEFAULT_CALIBRATION_BUCKET_HOURS, metavar="HOURS")
 

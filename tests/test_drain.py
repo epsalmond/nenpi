@@ -641,7 +641,7 @@ class MeasuredAttribution(Harness):
         resets_at = int(time.time()) + 7200
         self.write_two_concurrent_sessions(resets_at, resets_at)
         payload = self.run_json("sessions", "--harness", "codex", "--json")
-        rows = dict((row["cwd"].rsplit("/", 1)[-1], row) for row in payload["sessions"])
+        rows = dict((row["cwd"], row) for row in payload["sessions"])
         self.assertAlmostEqual(rows["alpha"]["drain_percent"], 3.0, places=6)
         self.assertAlmostEqual(rows["beta"]["drain_percent"], 1.0, places=6)
         self.assertFalse(rows["alpha"]["drain_is_estimate"])
@@ -649,14 +649,25 @@ class MeasuredAttribution(Harness):
 
     def test_rollover_when_resets_at_changes(self) -> None:
         resets_at = int(time.time()) + 7200
-        self.write_two_concurrent_sessions(resets_at, resets_at + 18000)
+        # The new five-hour window opened just before the calls ran, so both
+        # sessions are inside it.
+        self.write_two_concurrent_sessions(resets_at, int(time.time() - 3600) + 18005)
         payload = self.run_json("sessions", "--harness", "codex", "--json")
-        rows = dict((row["cwd"].rsplit("/", 1)[-1], row) for row in payload["sessions"])
+        rows = dict((row["cwd"], row) for row in payload["sessions"])
         # A new window means the second reading is the whole drain so far, not a
         # difference, so the interval carries 14% rather than 4%.
         total = rows["alpha"]["drain_percent"] + rows["beta"]["drain_percent"]
         self.assertAlmostEqual(total, 14.0, places=6)
         self.assertAlmostEqual(rows["alpha"]["drain_percent"], 10.5, places=6)
+
+    def test_rollover_does_not_reach_back_past_the_reset(self) -> None:
+        # The new window opened after both sessions had finished, so none of
+        # its drain can belong to them.
+        resets_at = int(time.time()) + 7200
+        self.write_two_concurrent_sessions(resets_at, int(time.time()) + 18000 + 3600)
+        payload = self.run_json("sessions", "--harness", "codex", "--json")
+        for row in payload["sessions"]:
+            self.assertIsNone(row["drain_percent"])
 
     def test_windows_subcommand_lists_peak_and_top_sessions(self) -> None:
         resets_at = int(time.time()) + 7200
@@ -932,8 +943,19 @@ class OutputContracts(Harness):
             "share_of_window_percent",
             "window_resets_at",
             "relative_to_harness_peak",
+            "cwd_hash",
+            "fork_of",
+            "duplicate_turns",
         ):
             self.assertIn(key, row)
+        # The full working directory is customer-identifying and must not
+        # reach the report or the cache.
+        self.assertEqual(row["cwd"], "project")
+        self.assertNotIn("/", row["cwd"])
+        cached = ""
+        for path in (self.root / "cache").rglob("*.json"):
+            cached += path.read_text(encoding="utf-8")
+        self.assertNotIn("/home/agent/project", cached)
 
     def test_no_color_output_has_no_escapes(self) -> None:
         now = time.time() - 600
@@ -1642,7 +1664,7 @@ class ClaudeCalibration(Harness):
                 )
         with self.env_applied():
             rows = QD.load_claude_snapshots("five_hour")
-        intervals = QD.build_intervals(rows, None)
+        intervals = QD.build_intervals(rows, QD.ANY_WINDOW)
         self.assertEqual(len(intervals), 2)
         self.assertEqual([interval.rollover for interval in intervals], [False, False])
         self.assertEqual([interval.drain for interval in intervals], [2.0, 3.0])
@@ -1651,6 +1673,244 @@ class ClaudeCalibration(Harness):
         result = self.run_tool("calibrate", "--harness", "claude")
         self.assertEqual(result.returncode, 1)
         self.assertIn(b"snapshot --oauth", result.stderr)
+
+
+class CorpusDedup(Harness):
+    def test_same_message_id_under_two_sessions_counts_once(self) -> None:
+        now = time.time() - 3600
+        original = "aaaa0001-1111-2222-3333-444444444444"
+        fork = "bbbb0002-1111-2222-3333-444444444444"
+        shared = [
+            claude_assistant_line(now + index, original, "msg_shared%d" % index,
+                                  output_tokens=100)
+            for index in range(3)
+        ]
+        first = self.write_claude("original.jsonl", shared)
+        # A forked session replays the original's assistant lines verbatim
+        # under a new sessionId, then continues with its own.
+        replay = [line.replace(original, fork) for line in shared]
+        replay.append(claude_assistant_line(now + 10, fork, "msg_own", output_tokens=70))
+        second = self.write_claude("fork.jsonl", replay)
+        os.utime(first, (now, now))
+        os.utime(second, (now + 60, now + 60))
+
+        payload = self.run_json("sessions", "--harness", "claude", "--json")
+        rows = dict((row["short_id"], row) for row in payload["sessions"])
+        self.assertEqual(rows["aaaa0001"]["tokens"]["output"], 300)
+        self.assertEqual(rows["bbbb0002"]["tokens"]["output"], 70)
+        self.assertEqual(rows["bbbb0002"]["fork_of"], "aaaa0001")
+        self.assertEqual(rows["bbbb0002"]["duplicate_turns"], 3)
+        self.assertEqual(rows["aaaa0001"]["fork_of"], "")
+
+    def test_claude_share_uses_the_deduped_total(self) -> None:
+        now = time.time() - 3600
+        original = "aaaa0003-1111-2222-3333-444444444444"
+        fork = "bbbb0004-1111-2222-3333-444444444444"
+        shared = [
+            claude_assistant_line(now, original, "msg_s1", output_tokens=1000)
+        ]
+        first = self.write_claude("orig2.jsonl", shared)
+        second = self.write_claude(
+            "fork2.jsonl", [line.replace(original, fork) for line in shared]
+        )
+        os.utime(first, (now, now))
+        os.utime(second, (now + 60, now + 60))
+        payload = self.run_json("sessions", "--harness", "claude", "--json")
+        # The replay contributes nothing, so the original holds the whole share.
+        rows = dict((row["short_id"], row) for row in payload["sessions"])
+        self.assertEqual(rows["aaaa0003"]["share_of_window_percent"], 100.0)
+        self.assertNotIn("bbbb0004", rows)
+
+    def test_codex_replayed_response_ids_count_once(self) -> None:
+        now = time.time() - 3600
+        session = "codex-dedup-0001"
+        calls = [
+            codex_usage_record_line(
+                now + 10, session, input_tokens=50_000, cached_input_tokens=0,
+                output_tokens=100, turn_id="t0"
+            )
+        ]
+        first = self.write_codex(
+            "rollout-orig.jsonl",
+            [codex_session_meta_line(now, session, "/home/agent/dd")] + calls,
+        )
+        second = self.write_codex(
+            "rollout-resume.jsonl",
+            [codex_session_meta_line(now + 1, session, "/home/agent/dd")] + calls,
+        )
+        os.utime(first, (now, now))
+        os.utime(second, (now + 60, now + 60))
+        payload = self.run_json("sessions", "--harness", "codex", "--json")
+        self.assertEqual(len(payload["sessions"]), 1)
+        self.assertEqual(payload["sessions"][0]["tokens"]["input"], 50_000)
+
+
+class RangeWindowing(Harness):
+    def build_two_event_session(self) -> str:
+        session = "cccc0001-1111-2222-3333-444444444444"
+        old = time.time() - 30 * 86400
+        recent = time.time() - 600
+        self.write_claude(
+            "span.jsonl",
+            [
+                claude_user_prompt_line(old, session),
+                claude_assistant_line(old, session, "msg_old", output_tokens=1_000_000),
+                claude_user_prompt_line(recent, session),
+                claude_assistant_line(recent, session, "msg_new", output_tokens=1_000),
+            ],
+        )
+        return session
+
+    def test_sessions_totals_are_windowed(self) -> None:
+        self.build_two_event_session()
+        payload = self.run_json("sessions", "--json", "--since", "3d")
+        row = payload["sessions"][0]
+        self.assertEqual(row["tokens"]["output"], 1_000)
+        self.assertEqual(row["requests"], 1)
+
+    def test_whole_session_opts_back_in(self) -> None:
+        self.build_two_event_session()
+        payload = self.run_json("sessions", "--json", "--since", "3d", "--whole-session")
+        row = payload["sessions"][0]
+        self.assertEqual(row["tokens"]["output"], 1_001_000)
+
+    def test_prompts_and_fanout_are_windowed(self) -> None:
+        self.build_two_event_session()
+        prompts = self.run_json("prompts", "--session", "cccc0001", "--json", "--since", "3d")
+        self.assertEqual(len(prompts["prompts"]), 1)
+        fanout = self.run_json("fanout", "--json", "--since", "3d")
+        self.assertEqual(fanout["prompts"], 1)
+
+    def test_timeline_and_sessions_agree_on_the_range(self) -> None:
+        self.build_two_event_session()
+        sessions = self.run_json("sessions", "--json", "--since", "3d")
+        timeline = self.run_json("timeline", "--json", "--since", "3d")
+        session_units = sum(row["weighted_units"] for row in sessions["sessions"])
+        timeline_units = sum(
+            bucket["claude"] + bucket["codex"] for bucket in timeline["buckets"]
+        )
+        self.assertAlmostEqual(session_units, timeline_units, places=6)
+
+
+class CacheIntegrity(Harness):
+    def test_in_place_rewrite_that_grows_is_reparsed(self) -> None:
+        now = time.time() - 600
+        session = "dddd0001-1111-2222-3333-444444444444"
+        path = self.claude_projects / "proj" / "rewrite.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            claude_assistant_line(now, session, "msg_v1", output_tokens=100) + "\n",
+            encoding="utf-8",
+        )
+        first = self.run_json("sessions", "--harness", "claude", "--json")
+        self.assertEqual(first["sessions"][0]["tokens"]["output"], 100)
+        # Rewritten in place and longer: size and mtime both move, but the
+        # stored offset no longer names a record boundary.
+        other = "dddd0002-1111-2222-3333-444444444444"
+        path.write_text(
+            claude_assistant_line(now + 1, other, "msg_v2_longer_id", output_tokens=250)
+            + "\n"
+            + claude_assistant_line(now + 2, other, "msg_v3", output_tokens=250)
+            + "\n",
+            encoding="utf-8",
+        )
+        os.utime(path, (time.time(), time.time()))
+        second = self.run_json("sessions", "--harness", "claude", "--json")
+        rows = dict((row["short_id"], row) for row in second["sessions"])
+        self.assertEqual(rows["dddd0002"]["tokens"]["output"], 500)
+        self.assertNotIn("dddd0001", rows)
+
+    def test_shard_for_a_deleted_transcript_is_pruned(self) -> None:
+        now = time.time() - 600
+        session = "dddd0003-1111-2222-3333-444444444444"
+        path = self.write_claude(
+            "gone.jsonl", [claude_assistant_line(now, session, "msg_g", output_tokens=10)]
+        )
+        self.run_json("sessions", "--harness", "claude", "--json")
+        shards = list((self.root / "cache").rglob("*.json"))
+        self.assertEqual(len(shards), 1)
+        path.unlink()
+        self.run_json("sessions", "--harness", "claude", "--json")
+        self.assertEqual(list((self.root / "cache").rglob("*.json")), [])
+
+    def test_superseded_schema_directory_is_removed(self) -> None:
+        stale = self.root / "cache" / "v1" / "ab"
+        stale.mkdir(parents=True)
+        (stale / "old.json").write_text("{}", encoding="utf-8")
+        now = time.time() - 600
+        self.write_claude(
+            "fresh.jsonl",
+            [
+                claude_assistant_line(
+                    now, "dddd0004-1111-2222-3333-444444444444", "msg_f", output_tokens=10
+                )
+            ],
+        )
+        self.run_json("sessions", "--harness", "claude", "--json")
+        self.assertFalse((self.root / "cache" / "v1").exists())
+
+
+class WindowSelection(Harness):
+    def write_snapshots(self, session: str, readings: Sequence[Tuple[float, float, int, int]]
+                        ) -> None:
+        now = time.time() - 3600
+        lines = [codex_session_meta_line(now, session, "/home/agent/win"),
+                 codex_turn_context_line(now, "gpt-5.6-sol")]
+        for offset, percent, resets_at, minutes in readings:
+            lines.append(
+                codex_token_count_line(
+                    now + offset, rate_limits=rate_limits(percent, resets_at, minutes)
+                )
+            )
+        lines.insert(
+            3,
+            codex_usage_record_line(
+                now + 12, session, input_tokens=100_000, cached_input_tokens=0,
+                output_tokens=0
+            ),
+        )
+        self.write_codex("rollout-win.jsonl", lines)
+
+    def test_drain_is_never_summed_across_two_windows(self) -> None:
+        resets_at = int(time.time()) + 7200
+        self.write_snapshots(
+            "codex-win-0001",
+            [
+                (5, 10.0, resets_at, 300),
+                (6, 2.0, resets_at + 500_000, 10080),
+                (30, 13.0, resets_at, 300),
+                (31, 8.0, resets_at + 500_000, 10080),
+            ],
+        )
+        payload = self.run_json("sessions", "--harness", "codex", "--json")
+        # 3% on the five-hour window and 6% on the weekly one; reporting 9%
+        # would be adding two different denominators together.
+        self.assertAlmostEqual(payload["sessions"][0]["drain_percent"], 3.0, places=6)
+        self.assertIn("300 min", payload["codex_window"])
+
+    def test_unknown_window_minutes_still_picks_one_window(self) -> None:
+        resets_at = int(time.time()) + 7200
+        self.write_snapshots(
+            "codex-win-0002",
+            [(5, 10.0, resets_at, 4321), (30, 14.0, resets_at, 4321)],
+        )
+        payload = self.run_json("sessions", "--harness", "codex", "--json")
+        self.assertAlmostEqual(payload["sessions"][0]["drain_percent"], 4.0, places=6)
+        self.assertIn("4321", payload["codex_window"])
+
+    def test_null_resets_at_still_yields_intervals(self) -> None:
+        self.write_snapshots(
+            "codex-win-0003",
+            [(5, 10.0, None, 300), (30, 15.0, None, 300)],
+        )
+        payload = self.run_json("sessions", "--harness", "codex", "--json")
+        self.assertAlmostEqual(payload["sessions"][0]["drain_percent"], 5.0, places=6)
+
+    def test_snapshots_without_intervals_warn(self) -> None:
+        self.write_snapshots("codex-win-0004", [(5, 10.0, int(time.time()) + 7200, 300)])
+        result = self.run_tool("sessions", "--harness", "codex", "--no-color")
+        self.assertEqual(result.returncode, 0)
+        self.assertIn(b"none produced a measurable interval", result.stderr)
 
 
 if __name__ == "__main__":
