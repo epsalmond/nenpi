@@ -147,8 +147,9 @@ and not by drain matters: equal-drain buckets would make every target the same
 by construction and leave the fit no variance to explain. On 14 days of real
 Codex rollouts this is the difference between R² of -1.9 and R² of 0.93.
 
-A fit is `usable` only with R² of at least 0.5, at least one identified
-coefficient, and a fitted global scale; otherwise it is stored with
+A fit is `usable` only with R² of at least 0.5 and at least one identified
+coefficient; a Codex fit additionally needs the global fallback scale, which
+Claude has no rate card for and does not require. Otherwise it is stored with
 `"usable": false`, reported as `NOT USABLE`, and refused by
 `--use-calibrated`.
 
@@ -541,6 +542,27 @@ long-context multiplier for either vendor on subscription plans: Anthropic
 removed the API 1M premium on 2026-03-13 and OpenAI publishes none, so none is
 implemented; `--long-context-multiplier` exists as a no-op-by-default knob
 applied above 200K tokens so it can be tested later.
+
+## Known limitations
+
+Three known-wrong behaviours, none of them blocking, each with the fix it
+wants:
+
+- **An interval that straddles `--since` keeps its whole drain, but only the
+  in-range events share it.** The interval's start is clamped to the range
+  while its measured percent is not, so at most one interval per window group
+  is over-attributed to the range. The fix is to attribute against unwindowed
+  events and then report only the in-range sessions' shares.
+- **Fork dedup picks the winner by file mtime.** A transcript restored from
+  backup, or otherwise touched after its fork was written, loses its own API
+  calls to the fork. The fix is to order by earliest line timestamp and fall
+  back to mtime only on a tie.
+- **The Codex cumulative fallback path has no dedup key.** Rollouts too old to
+  carry `token_usage_record` are read by diffing
+  `event_msg token_count info.total_token_usage`, which yields no
+  `response_id`, so those events cannot be deduped corpus-wide. A resumed old
+  rollout double-counts. The fix is a synthetic key from thread id and
+  cumulative totals.
 
 ## Limits
 
