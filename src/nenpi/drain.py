@@ -681,9 +681,12 @@ def content_fingerprint(path: Path, offset: int) -> Tuple[str, str]:
     file: resuming from the stored offset would then land mid-record and the
     rest of the file would be silently skipped.
     """
+    # Only bytes already parsed are hashed. Covering more would change the
+    # fingerprint on every append to a file shorter than the head window.
+    head_bytes = min(CACHE_HEAD_BYTES, offset)
     try:
         with open(path, "rb") as handle:
-            head = handle.read(CACHE_HEAD_BYTES)
+            head = handle.read(head_bytes) if head_bytes else b""
             tail = b""
             if offset > 0:
                 handle.seek(max(0, offset - CACHE_TAIL_BYTES))
@@ -711,7 +714,6 @@ EVENT_TURN = 10
 EVENT_THREAD = 11
 EVENT_ID = 12
 EVENT_PROMPT = 13
-EVENT_STORED_WIDTH = 13
 
 
 def event_tokens(event: Sequence[Any], kinds: Sequence[str]) -> Dict[str, int]:
@@ -1346,7 +1348,7 @@ def collect(args: argparse.Namespace, since: Optional[float]) -> Scan:
                 else:
                     parse_codex_file(path, entry)
             except OSError as error:
-                warn("skipping %s: %s" % (path.name, error))
+                warn("skipping %s: %s" % (path.name, error.strerror or error.__class__.__name__))
                 continue
             scan.bytes_read += max(0, stat.st_size - entry.size)
             entry.stamp(path, stat)
@@ -1359,8 +1361,9 @@ def collect(args: argparse.Namespace, since: Optional[float]) -> Scan:
             warn("cache not written: %s" % error)
         cache.forget(path)
     progress.finish()
-    if since is None or args.rebuild_cache:
-        # Only a full sweep knows every path that still exists.
+    if since is None and harness == "all":
+        # `live` holds only what this run looked at, so a harness-scoped or
+        # range-limited sweep would delete every shard it never visited.
         cache.prune(live)
     return scan
 
@@ -1515,7 +1518,12 @@ def choose_window(snapshots: Sequence[Mapping[str, Any]], wanted: Optional[str])
     together doubles every session's drain.
     """
     if wanted and wanted != "auto":
-        return WINDOW_ALIASES.get(wanted, wanted)
+        if wanted in WINDOW_ALIASES:
+            return WINDOW_ALIASES[wanted]
+        try:
+            return int(wanted)
+        except (TypeError, ValueError):
+            return wanted
     counts = {}  # type: Dict[Any, int]
     for row in snapshots:
         minutes = row.get("window_minutes")
@@ -2257,12 +2265,13 @@ def fit_percent_weights(
             identified += 1
 
     scale = fit_fallback_scale(buckets, features, target, rate_card)
+    scaled = scale > 0.0 if rate_card else True
     return {
         "samples": len(buckets),
         "intervals": len(intervals),
         "r_squared": score,
         "identified": identified,
-        "usable": score >= 0.5 and identified > 0 and scale > 0.0,
+        "usable": score >= 0.5 and identified > 0 and scaled,
         "fallback_scale": scale,
         "models": fitted,
         "diagnostics": diagnostics,
@@ -2401,11 +2410,12 @@ def session_rows(
 
 def attach_fanout(rows: Sequence[Row], analysis: "Analysis") -> None:
     """Summarise each session's prompt fan-out onto its report row."""
+    whole = getattr(analysis.args, "whole_session", False)
     for row in rows:
         prompts = [
             prompt
             for prompt in analysis.prompts_for(row.summary.harness, row.summary.session_id)
-            if analysis.in_range(prompt.start) or analysis.in_range(prompt.end)
+            if whole or analysis.in_range(prompt.start) or analysis.in_range(prompt.end)
         ]
         if not prompts:
             continue
@@ -3541,7 +3551,7 @@ def render_histogram(paint: "Painter", title: str, buckets: Sequence[Mapping[str
             else "+"
         )
         cells = int(round(bucket["count"] / peak * bar_width)) if peak else 0
-        print("%9s - %-9s %7d %s" % (lower, upper, bucket["count"], "█" * cells))
+        print("%9s - %-9s %7d %s" % (lower, upper, bucket["count"], paint("█" * cells)))
 
 
 def command_reductions(args: argparse.Namespace) -> int:
@@ -4130,7 +4140,8 @@ def add_common(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--claude-cache-read-weight", type=float, default=None, metavar="FLOAT")
     parser.add_argument("--long-context-multiplier", type=float, default=1.0, metavar="FLOAT")
     parser.add_argument("--use-calibrated", action="store_true")
-    parser.add_argument("--window", choices=("auto", "five_hour", "weekly"), default="auto")
+    parser.add_argument("--window", default="auto", metavar="auto|five_hour|weekly|MINUTES",
+                        help="which quota window to measure; an integer is window_minutes")
     parser.add_argument("--top", type=int, default=25, metavar="N")
     parser.add_argument("--whole-session", action="store_true",
                         help="report each selected session's whole life, not just the range")

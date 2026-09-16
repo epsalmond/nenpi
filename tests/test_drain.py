@@ -1069,6 +1069,12 @@ class OutputContracts(Harness):
         self.assertEqual(result.returncode, 0)
         self.assertNotIn("\u2588", text)
         self.assertIn("#", text)
+        # fanout draws its own histograms; they go through the painter too.
+        fanout = self.run_tool("fanout", "--no-color", "--ascii", "--width", "150")
+        self.assertEqual(fanout.returncode, 0, fanout.stderr.decode("utf-8", "replace"))
+        drawn = fanout.stdout.decode("utf-8")
+        self.assertNotIn("\u2588", drawn)
+        self.assertIn("#", drawn)
 
     def test_timeline_buckets(self) -> None:
         now = time.time() - 7200
@@ -1830,6 +1836,7 @@ class ClaudeCalibration(Harness):
         payload = self.run_json(
             "calibrate", "--harness", "claude", "--json", "--calibrate-bucket-hours", "0.01"
         )
+        self.assertTrue(payload["windows"]["five_hour"]["usable"])
         fitted = payload["windows"]["five_hour"]["models"]["claude-opus-5"]
         self.assertLess(abs(fitted["input"] - input_rate) / input_rate, 0.05)
         self.assertLess(abs(fitted["cache_read"] - cache_rate) / cache_rate, 0.05)
@@ -2010,6 +2017,9 @@ class RangeWindowing(Harness):
         payload = self.run_json("sessions", "--json", "--since", "3d", "--whole-session")
         row = payload["sessions"][0]
         self.assertEqual(row["tokens"]["output"], 1_001_000)
+        # The fan-out columns must describe the same span as the tokens.
+        self.assertEqual(row["prompts"], 2)
+        self.assertEqual(row["api_turns"], 2)
 
     def test_prompts_and_fanout_are_windowed(self) -> None:
         self.build_two_event_session()
@@ -2063,12 +2073,63 @@ class CacheIntegrity(Harness):
         path = self.write_claude(
             "gone.jsonl", [claude_assistant_line(now, session, "msg_g", output_tokens=10)]
         )
-        self.run_json("sessions", "--harness", "claude", "--json")
+        self.run_json("sessions", "--json")
         shards = list((self.root / "cache").rglob("*.json"))
         self.assertEqual(len(shards), 1)
         path.unlink()
-        self.run_json("sessions", "--harness", "claude", "--json")
+        self.run_json("sessions", "--json")
         self.assertEqual(list((self.root / "cache").rglob("*.json")), [])
+
+    def test_single_harness_run_keeps_the_other_harness_shards(self) -> None:
+        now = time.time() - 600
+        self.write_claude(
+            "keep.jsonl",
+            [
+                claude_assistant_line(
+                    now, "dddd0005-1111-2222-3333-444444444444", "msg_k", output_tokens=10
+                )
+            ],
+        )
+        self.write_codex(
+            "rollout-keep.jsonl",
+            [
+                codex_session_meta_line(now, "codex-keep-0001", "/home/agent/keep"),
+                codex_turn_context_line(now, "gpt-5.6-sol"),
+                codex_usage_record_line(
+                    now + 1, "codex-keep-0001", input_tokens=1000, cached_input_tokens=0,
+                    output_tokens=10
+                ),
+            ],
+        )
+        self.run_json("sessions", "--json")
+        self.assertEqual(len(list((self.root / "cache").rglob("*.json"))), 2)
+        # A harness-scoped run never looks at the other harness's transcripts,
+        # so it must not conclude they are gone.
+        self.run_json("sessions", "--harness", "claude", "--json")
+        self.assertEqual(len(list((self.root / "cache").rglob("*.json"))), 2)
+        self.run_json("sessions", "--json", "--since", "3d", "--rebuild-cache")
+        self.assertEqual(len(list((self.root / "cache").rglob("*.json"))), 2)
+
+    def test_small_file_resumes_across_an_append(self) -> None:
+        now = time.time() - 600
+        session = "dddd0006-1111-2222-3333-444444444444"
+        path = self.write_claude(
+            "small.jsonl",
+            [claude_assistant_line(now, session, "msg_s1", output_tokens=100)],
+        )
+        self.assertLess(path.stat().st_size, 4096)
+        first = self.run_json("sessions", "--harness", "claude", "--json")
+        self.assertEqual(first["files_parsed"], 1)
+        with open(path, "a", encoding="utf-8") as handle:
+            handle.write(
+                claude_assistant_line(now + 1, session, "msg_s2", output_tokens=200) + "\n"
+            )
+        os.utime(path, (time.time(), time.time()))
+        second = self.run_json("sessions", "--harness", "claude", "--json")
+        # Resumed from the stored offset rather than reparsed: the fingerprint
+        # must cover only the bytes already read.
+        self.assertEqual(second["sessions"][0]["tokens"]["output"], 300)
+        self.assertEqual(second["sessions"][0]["requests"], 2)
 
     def test_superseded_schema_directory_is_removed(self) -> None:
         stale = self.root / "cache" / "v1" / "ab"
@@ -2134,6 +2195,23 @@ class WindowSelection(Harness):
         payload = self.run_json("sessions", "--harness", "codex", "--json")
         self.assertAlmostEqual(payload["sessions"][0]["drain_percent"], 4.0, places=6)
         self.assertIn("4321", payload["codex_window"])
+
+    def test_window_accepts_an_integer_minute_count(self) -> None:
+        resets_at = int(time.time()) + 7200
+        self.write_snapshots(
+            "codex-win-0005",
+            [
+                (5, 10.0, resets_at, 300),
+                (6, 2.0, resets_at + 500_000, 10080),
+                (30, 13.0, resets_at, 300),
+                (31, 8.0, resets_at + 500_000, 10080),
+            ],
+        )
+        payload = self.run_json(
+            "sessions", "--harness", "codex", "--json", "--window", "10080"
+        )
+        self.assertAlmostEqual(payload["sessions"][0]["drain_percent"], 6.0, places=6)
+        self.assertIn("10080", payload["codex_window"])
 
     def test_null_resets_at_still_yields_intervals(self) -> None:
         self.write_snapshots(
