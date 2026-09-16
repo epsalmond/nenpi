@@ -358,7 +358,7 @@ class Planning(Harness):
         result = self.bench("plan", "--models", "claude-haiku-4-5", "--contexts", "10k",
                             "--cache", "warm", "--max-calls", "10")
         self.assertEqual(result.returncode, 0)
-        self.assertIn(b"needs more calls", result.stdout)
+        self.assertIn(b"but --max-calls stops it at 10", result.stdout)
 
     def test_the_first_call_of_a_warm_scenario_is_priced_as_cache_creation(self) -> None:
         payload = self.bench_json("plan", "--models", "claude-haiku-4-5", "--contexts", "150k",
@@ -544,9 +544,8 @@ class SamplerGuard(Harness):
         self.environment["BENCH_SAMPLER_STALE_AFTER"] = "3"
         result = self.bench(
             "run", "--yes", "--quota-drain", str(self.fake_drain), "--sample-interval", "0",
-            "--max-sample-age", "1", "--ticks", "9", "--max-percent", "50",
-            "--max-percent-weekly", "50", "--models", "claude-haiku-4-5",
-            "--contexts", "10k", "--cache", "warm",
+            "--ticks", "9", "--max-percent", "50", "--max-percent-weekly", "50",
+            "--models", "claude-haiku-4-5", "--contexts", "10k", "--cache", "warm",
         )
         self.assertEqual(result.returncode, QB.EXIT_GUARD)
         self.assertIn(b"no new observation", result.stderr)
@@ -756,6 +755,46 @@ class Fitting(Harness):
         )
         self.assertAlmostEqual(units, 0.5)
 
+    def test_a_fit_without_a_scale_is_not_used_for_planning(self) -> None:
+        state = self.root / "state"
+        state.mkdir(parents=True, exist_ok=True)
+        (state / "claude-weights.json").write_text(
+            json.dumps({
+                "usable": True,
+                "fallback_scale": 0.0,
+                "claude": {"unit": "percent_per_mtok",
+                           "models": {"claude-haiku-4-5": {"input": 0.9}}},
+            }),
+            encoding="utf-8",
+        )
+        result = self.bench("plan", "--models", "claude-haiku-4-5", "--contexts", "10k",
+                            "--cache", "warm")
+        self.assertEqual(result.returncode, 0, result.stderr.decode("utf-8", "replace"))
+        self.assertIn(b"no list-price scale", result.stderr)
+        self.assertIn(b"weights: list price", result.stdout)
+
+    def test_max_sample_age_cannot_go_below_the_polling_floor(self) -> None:
+        result = self.bench(
+            "run", "--yes", "--quota-drain", str(self.fake_drain), "--sample-interval", "0",
+            "--max-sample-age", "5", "--ticks", "3", "--max-percent", "50",
+            "--max-percent-weekly", "50", "--models", "claude-haiku-4-5",
+            "--contexts", "10k", "--cache", "warm",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr.decode("utf-8", "replace"))
+        self.assertIn(b"below the 60s the usage endpoint allows", result.stderr)
+        runs = sorted((self.root / "state" / "bench").iterdir())
+        meta = json.loads((runs[-1] / "meta.json").read_text(encoding="utf-8"))
+        self.assertEqual(meta["max_sample_age_s"], 60.0)
+
+    def test_an_unusable_fit_is_named_in_one_sentence(self) -> None:
+        result = self.run_scenarios("--models", "claude-haiku-4-5", "--contexts", "10k",
+                                    "--cache", "warm")
+        message = [line for line in result.stderr.decode("utf-8").splitlines()
+                   if "not usable" in line]
+        self.assertEqual(len(message), 1)
+        self.assertIn("claude-weights.unusable.json", message[0])
+        self.assertIn("claude-weights.json was left alone", message[0])
+
     def test_an_unusable_fit_does_not_become_the_weights_file(self) -> None:
         self.run_scenarios("--models", "claude-haiku-4-5", "--contexts", "10k",
                            "--cache", "warm")
@@ -909,6 +948,55 @@ class Hygiene(Harness):
                                     "--cache", "warm")
         self.assertEqual(result.returncode, QB.EXIT_DEPENDENCY)
         self.assertEqual(self.scenario_records()[0]["stop_reason"], "call-failed")
+
+    def test_an_ignored_signal_stays_ignored(self) -> None:
+        # A nohup'd run ignores SIGHUP on purpose; installing a handler over
+        # SIG_IGN would kill it when the terminal closes.
+        import signal as signal_module
+
+        previous = signal_module.signal(signal_module.SIGHUP, signal_module.SIG_IGN)
+        self.addCleanup(signal_module.signal, signal_module.SIGHUP, previous)
+        workdir = self.root / "scratch"
+        workdir.mkdir()
+        QB.install_workdir_cleanup(workdir)
+        self.assertEqual(signal_module.getsignal(signal_module.SIGHUP),
+                         signal_module.SIG_IGN)
+        # The other signals still get the handler.
+        self.assertTrue(callable(signal_module.getsignal(signal_module.SIGTERM)))
+        signal_module.signal(signal_module.SIGTERM, signal_module.SIG_DFL)
+
+    def test_a_warm_call_past_the_ttl_is_flagged_while_running(self) -> None:
+        # The gap check is driven by the module constant, so the driver patches
+        # it to zero: every call then counts as past the cache TTL.
+        driver = self.root / "drive-quota-bench.py"
+        driver.write_text(
+            "import importlib.machinery, importlib.util, sys\n"
+            "loader = importlib.machinery.SourceFileLoader('qb', %r)\n"
+            "spec = importlib.util.spec_from_loader(loader.name, loader)\n"
+            "module = importlib.util.module_from_spec(spec)\n"
+            "sys.modules['qb'] = module\n"
+            "spec.loader.exec_module(module)\n"
+            "module.WARM_MAX_GAP_SECONDS = 0.0\n"
+            "sys.exit(module.main(sys.argv[1:]))\n" % str(QUOTA_BENCH),
+            encoding="utf-8",
+        )
+        result = subprocess.run(
+            [sys.executable, str(driver), "run", "--yes", "--quota-drain",
+             str(self.fake_drain), "--sample-interval", "0", "--ticks", "3",
+             "--max-percent", "50", "--max-percent-weekly", "50",
+             "--models", "claude-haiku-4-5", "--contexts", "10k", "--cache", "warm"],
+            check=False, capture_output=True, env=self.environment, timeout=300,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr.decode("utf-8", "replace"))
+        record = self.scenario_records()[0]
+        self.assertTrue(record["warm_drift"])
+        runs = sorted((self.root / "state" / "bench").iterdir())
+        lines = [json.loads(line) for line in
+                 (runs[-1] / "calls.jsonl").read_text(encoding="utf-8").splitlines()]
+        # The first call has no predecessor to drift from; the rest do.
+        self.assertFalse(lines[0]["cache_ttl_risk"])
+        self.assertTrue(all(line["cache_ttl_risk"] for line in lines[1:]))
+        self.assertIn(b"warm_drift", result.stderr)
 
     def test_missing_quota_drain_is_named(self) -> None:
         result = self.bench("plan", "--quota-drain", str(self.root / "absent"))

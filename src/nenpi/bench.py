@@ -45,6 +45,9 @@ DEFAULT_SAMPLE_INTERVAL = 60.0
 # A call may only be launched while the newest utilisation sample is younger
 # than this; older than it, the budget check is reading a stale number.
 MIN_SAMPLE_AGE = 90.0
+# quota-drain will not poll the usage endpoint more than once a minute, so a
+# shorter limit than this can only ever fire against its own floor.
+SAMPLE_AGE_FLOOR = 60.0
 DEFAULT_CALL_TIMEOUT = 900.0
 DEFAULT_CONTAMINATION_WINDOW = "6h"
 
@@ -282,9 +285,6 @@ class Sampler:
         self.last_attempt = 0.0
         self.latest = None  # type: Optional[Sample]
         self.failure = None  # type: Optional[str]
-        # The snapshot log holds two months of observations; a run only ever
-        # wants the newest, so every read is bounded to the recent tail.
-        self.since = time.time() - 3600.0
 
     def due(self, now: Optional[float] = None) -> bool:
         return (now or time.time()) - self.last_attempt >= self.interval
@@ -341,10 +341,14 @@ class Sampler:
         return "newest utilisation sample is %.0fs old (limit %.0fs)" % (age, self.max_age)
 
     def read_latest(self) -> Optional[Sample]:
+        # The snapshot log holds two months of observations and a run only ever
+        # wants the newest, so each read is bounded to the last hour. The bound
+        # is computed per read: a long run would outlive one fixed at startup.
+        since = time.time() - 3600.0
         windows = {}
         stamp = None
         for window in ("five_hour", "seven_day"):
-            rows = self.qd.load_claude_snapshots(window, since=self.since)
+            rows = self.qd.load_claude_snapshots(window, since=since)
             if not rows:
                 continue
             row = rows[-1]
@@ -1116,7 +1120,14 @@ def planning_weights(args: argparse.Namespace) -> Tuple[Dict[str, Dict[str, floa
                 models = None
             if isinstance(models, Mapping) and models:
                 scale = float(payload.get("fallback_scale") or 0.0)
-                scaled = list_price_weights(1.0 / scale) if scale > 0 else {}
+                if scale <= 0:
+                    # Without a scale there is no way to price the kinds the fit
+                    # left out, and pricing them at zero would make them free.
+                    warn("ignoring %s: the stored fit carries no list-price scale"
+                         % fit_file)
+                    models = None
+            if isinstance(models, Mapping) and models:
+                scaled = list_price_weights(1.0 / scale)
                 table = {}
                 for name, entry in models.items():
                     priced = dict(scaled.get(str(name)) or {})
@@ -1183,12 +1194,14 @@ def render_plan(projections: Sequence[Mapping[str, Any]], source: str,
                                                   "tokens/call", "%/call", "% total"))
     total = 0.0
     capped = []
+    needed_calls = {}
     for item in projections:
         scenario = item["scenario"]
         tokens = sum(item["tokens_per_call"].values())
         total += item["percent"]
         if item["capped"]:
             capped.append(scenario.key)
+            needed_calls[scenario.key] = item["calls_needed"]
         lines.append(
             "%-40s %7d %7d %12s %10.4f %9.3f"
             % (scenario.key, item["calls"], item["calls_needed"], _QD.format_tokens(tokens),
@@ -1196,8 +1209,10 @@ def render_plan(projections: Sequence[Mapping[str, Any]], source: str,
         )
     lines.append("")
     for key in capped:
-        lines.append("%s needs more calls than --max-percent allows in --max-calls; "
-                     "raise --max-calls, use a larger context, or lower --ticks" % key)
+        lines.append("%s needs %d calls to reach %d tick(s) but --max-calls stops it at "
+                     "%d; raise --max-calls, use a larger context or a cache mode that "
+                     "spends faster, or lower --ticks"
+                     % (key, needed_calls[key], args.ticks, args.max_calls))
     if capped:
         lines.append("")
     lines.append("projected five_hour spend %.2f%% against --max-percent %.2f%%"
@@ -1377,9 +1392,11 @@ def write_report(run_id: str, meta: Mapping[str, Any], records: Sequence[Mapping
         )
         payload["weights_file"] = str(destination)
         if not fit["usable"]:
-            warn("fit is not usable (%d of %d columns identified, %d degrees of freedom); "
-                 "wrote %s and left claude-weights.json alone"
-                 % (fit["identified"], fit["columns"], fit["degrees_of_freedom"], destination))
+            warn("the fit is not usable (%d of %d columns identified, %d degrees of "
+                 "freedom), so it was written to %s and the calibration file "
+                 "claude-weights.json was left alone."
+                 % (fit["identified"], fit["columns"], fit["degrees_of_freedom"],
+                    destination))
     if args.json:
         print(json.dumps(payload, indent=2, sort_keys=True))
         return EXIT_OK
@@ -1444,6 +1461,10 @@ def install_workdir_cleanup(workdir: Path) -> None:
         if number is None:
             continue
         previous = signal.getsignal(number)
+        if previous == signal.SIG_IGN:
+            # A nohup'd run ignores SIGHUP on purpose and must survive the
+            # terminal closing; atexit still removes the directory.
+            continue
 
         def handler(signum: int, frame: Any, previous=previous) -> None:
             remove()
@@ -1481,6 +1502,13 @@ def command_run(args: argparse.Namespace) -> int:
     max_sample_age = args.max_sample_age
     if max_sample_age is None:
         max_sample_age = max(MIN_SAMPLE_AGE, 2.0 * args.sample_interval)
+    elif max_sample_age < SAMPLE_AGE_FLOOR:
+        # The endpoint refuses more than one poll a minute, so anything under a
+        # minute would stop every run on its own sampling floor.
+        warn("--max-sample-age %.0fs is below the %.0fs the usage endpoint allows "
+             "between polls; using %.0fs"
+             % (max_sample_age, SAMPLE_AGE_FLOOR, SAMPLE_AGE_FLOOR))
+        max_sample_age = SAMPLE_AGE_FLOOR
     sampler = Sampler(_QD, args.quota_drain, args.config_dir, args.sample_interval,
                       max_sample_age)
     baseline = sampler.sample(force=True)
