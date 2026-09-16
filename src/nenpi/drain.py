@@ -23,6 +23,8 @@ import re
 import shutil
 import sys
 import time
+import urllib.error
+import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, List, Mapping, Optional, Sequence, Tuple
@@ -37,6 +39,14 @@ MIN_REDUCTION_CONTEXT = 20_000
 REDUCTION_PERSISTENCE_TURNS = 3
 BOUNDARY_DEDUP_SECONDS = 5.0
 MAX_CONFIG_JSON_BYTES = 128 * 1024 * 1024
+OAUTH_USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
+OAUTH_BETA = "oauth-2025-04-20"
+OAUTH_MIN_INTERVAL_SECONDS = 60.0
+OAUTH_BACKOFF_SECONDS = 600.0
+OAUTH_TIMEOUT_SECONDS = 15.0
+OAUTH_WINDOWS = ("five_hour", "seven_day", "seven_day_opus", "seven_day_sonnet")
+FALLBACK_CLAUDE_VERSION = "2.1.273"
+VERSION_IN_LINE = re.compile(r'"version"\s*:\s*"([0-9][^"]{0,31})"')
 DEDUP_CARRY_IDS = 64
 PROGRESS_INTERVAL_SECONDS = 0.5
 
@@ -2585,7 +2595,7 @@ def command_calibrate(args: argparse.Namespace) -> int:
     scan, weights = analysis.scan, analysis.weights
     since, until = analysis.since, analysis.until
     if args.harness == "claude":
-        return calibrate_claude(args)
+        return calibrate_claude(args, analysis)
     window, intervals = analysis.window, analysis.intervals
     usable = [interval for interval in intervals if not interval.rollover and interval.features]
     features = sorted(set(key for interval in usable for key in interval.features))
@@ -2631,25 +2641,142 @@ def command_calibrate(args: argparse.Namespace) -> int:
     return 0
 
 
-def calibrate_claude(args: argparse.Namespace) -> int:
-    dollars_per_percent = claude_dollars_per_percent()
-    if dollars_per_percent is None:
+CLAUDE_WINDOW_MINUTES = {"five_hour": 300, "seven_day": 10080,
+                         "seven_day_opus": 10080, "seven_day_sonnet": 10080}
+
+
+def load_claude_snapshots(window: str) -> List[Dict[str, Any]]:
+    """Read logged Claude utilisation observations as snapshot rows.
+
+    Shaped like the Codex `rate_limits` rows so the same interval builder and
+    NNLS fit apply to both harnesses.
+    """
+    path = state_dir() / "snapshots.jsonl"
+    rows = []
+    if not path.is_file():
+        return rows
+    try:
+        with open(path, encoding="utf-8") as handle:
+            for line in handle:
+                try:
+                    record = json.loads(line)
+                except ValueError:
+                    continue
+                entry = (record.get("windows") or {}).get(window)
+                if not isinstance(entry, dict):
+                    continue
+                used = entry.get("utilization_percent")
+                epoch = record.get("ts")
+                if not isinstance(used, (int, float)) or not isinstance(epoch, (int, float)):
+                    continue
+                rows.append(
+                    {
+                        "ts": float(epoch),
+                        "limit_id": "claude",
+                        "plan_type": str(record.get("config_dir") or "default"),
+                        "window_minutes": CLAUDE_WINDOW_MINUTES.get(window, 300),
+                        "used_percent": float(used),
+                        "resets_at": entry.get("resets_at"),
+                        "limit_dollars": entry.get("limit_dollars"),
+                        "used_dollars": entry.get("used_dollars"),
+                    }
+                )
+    except OSError:
+        return []
+    rows.sort(key=lambda row: row["ts"])
+    return rows
+
+
+def collect_claude_features(intervals: Sequence[Interval], events: Sequence[Sequence[Any]]
+                            ) -> None:
+    ordered = sorted(events, key=lambda event: event[EVENT_TS])
+    stamps = [event[EVENT_TS] for event in ordered]
+    for interval in intervals:
+        low = bisect.bisect_right(stamps, interval.start)
+        high = bisect.bisect_right(stamps, interval.end)
+        for event in ordered[low:high]:
+            tokens = event_tokens(event, CLAUDE_KINDS)
+            for kind in CLAUDE_KINDS:
+                if not tokens[kind]:
+                    continue
+                feature = (event[EVENT_MODEL], kind)
+                interval.features[feature] = (
+                    interval.features.get(feature, 0.0) + tokens[kind] / 1_000_000.0
+                )
+
+
+def calibrate_claude(args: argparse.Namespace, analysis: "Analysis") -> int:
+    results = {}
+    for window in ("five_hour", "seven_day"):
+        rows = [
+            row
+            for row in load_claude_snapshots(window)
+            if analysis.since is None or row["ts"] >= analysis.since
+        ]
+        if len(rows) < 2:
+            continue
+        intervals = build_intervals(rows, None)
+        collect_claude_features(intervals, analysis.scan.events["claude"])
+        usable = [
+            interval for interval in intervals if not interval.rollover and interval.features
+        ]
+        if not usable:
+            continue
+        features = sorted(set(key for interval in usable for key in interval.features))
+        matrix = [[interval.features.get(key, 0.0) for key in features] for interval in usable]
+        target = [interval.drain for interval in usable]
+        coefficients = nnls(matrix, target)
+        fitted = {}  # type: Dict[str, Dict[str, float]]
+        for (model, kind), value in zip(features, coefficients):
+            fitted.setdefault(model, {})[kind] = value
+        results[window] = {
+            "samples": len(usable),
+            "r_squared": r_squared(matrix, target, coefficients),
+            "models": fitted,
+            "dollars_per_percent": claude_dollars_per_percent(),
+        }
+    if not results:
         warn(
-            "no Claude snapshots yet; run `quota-drain snapshot` or wire "
-            "`quota-drain snapshot --stdin` into the statusline"
+            "no usable Claude snapshot intervals; sample utilisation with "
+            "`quota-drain snapshot --oauth` (see docs/quota-drain.md) and retry"
         )
         return 1
     payload = {
         "schema": JSON_SCHEMA,
         "command": "calibrate",
         "harness": "claude",
-        "dollars_per_percent": dollars_per_percent,
+        "unit": "percent_per_mtok",
+        "windows": results,
     }
     if args.json:
         print(json.dumps(payload, indent=2, sort_keys=True))
-    else:
-        print("claude five_hour window: %.4f USD per percent (from logged snapshots)"
-              % dollars_per_percent)
+        return 0
+    paint = make_painter(args)
+    for window, result in sorted(results.items()):
+        print(
+            paint(
+                "claude %s: %d intervals, R^2 %.4f"
+                % (window, result["samples"], result["r_squared"]),
+                "bold",
+            )
+        )
+        if result["dollars_per_percent"]:
+            print("  %.4f USD per percent (from dollar fields)" % result["dollars_per_percent"])
+        print("  %-22s %14s %14s %10s" % ("model", "input %/Mtok", "cache read %/Mtok",
+                                          "implied x"))
+        for model in sorted(result["models"]):
+            entry = result["models"][model]
+            uncached = entry.get("input", 0.0)
+            cached = entry.get("cache_read", 0.0)
+            implied = (cached / uncached) if uncached > 0 else float("nan")
+            print(
+                "  %-22s %14.6f %14.6f %10.3f"
+                % (model, uncached, cached, implied)
+            )
+        print(
+            "  list price puts cache reads at 0.1x input (0.025x on Fable 5.1); "
+            "the implied column is the measured ratio"
+        )
     return 0
 
 
@@ -3048,10 +3175,208 @@ def command_verify(args: argparse.Namespace) -> int:
     return 0
 
 
+def detect_claude_version() -> str:
+    """Read the CLI version off the newest transcript, for the User-Agent."""
+    newest = None
+    newest_mtime = 0.0
+    for root in discover_roots(home_dir(), "claude"):
+        for path in root.rglob("*.jsonl"):
+            try:
+                mtime = path.stat().st_mtime
+            except OSError:
+                continue
+            if mtime > newest_mtime:
+                newest, newest_mtime = path, mtime
+    if newest is None:
+        return FALLBACK_CLAUDE_VERSION
+    try:
+        with open(newest, "rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            size = handle.tell()
+            handle.seek(max(0, size - 65536))
+            tail = handle.read().decode("utf-8", "replace")
+    except OSError:
+        return FALLBACK_CLAUDE_VERSION
+    found = VERSION_IN_LINE.findall(tail)
+    return found[-1] if found else FALLBACK_CLAUDE_VERSION
+
+
+def oauth_config_dirs(requested: Sequence[str]) -> List[Path]:
+    if requested:
+        return [Path(item).expanduser() for item in requested]
+    found = []
+    for candidate in sorted(home_dir().glob(".claude*")):
+        if (candidate / ".credentials.json").is_file():
+            found.append(candidate)
+    return found
+
+
+def read_oauth_token(config: Path) -> Tuple[Optional[str], Optional[float]]:
+    """Return (access token, expiry epoch). The token is never logged or stored."""
+    try:
+        payload = json.loads((config / ".credentials.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None, None
+    block = payload.get("claudeAiOauth") if isinstance(payload, dict) else None
+    if not isinstance(block, dict):
+        return None, None
+    token = block.get("accessToken")
+    expires = block.get("expiresAt")
+    if not isinstance(token, str) or not token:
+        return None, None
+    expiry = float(expires) / 1000.0 if isinstance(expires, (int, float)) else None
+    return token, expiry
+
+
+def load_poll_state() -> Dict[str, Dict[str, float]]:
+    path = state_dir() / "oauth-poll.json"
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def save_poll_state(state: Mapping[str, Mapping[str, float]]) -> None:
+    path = state_dir() / "oauth-poll.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def fetch_oauth_usage(token: str, version: str) -> Dict[str, Any]:
+    request = urllib.request.Request(
+        OAUTH_USAGE_URL,
+        headers={
+            "Authorization": "Bearer " + token,
+            "anthropic-beta": OAUTH_BETA,
+            "Content-Type": "application/json",
+            "User-Agent": "claude-code/" + version,
+        },
+        method="GET",
+    )
+    with urllib.request.urlopen(request, timeout=OAUTH_TIMEOUT_SECONDS) as response:
+        body = response.read().decode("utf-8")
+    payload = json.loads(body)
+    return payload if isinstance(payload, dict) else {}
+
+
+def oauth_snapshot_record(config: Path, payload: Mapping[str, Any], now: float
+                          ) -> Optional[Dict[str, Any]]:
+    """Keep only the quota shape; organization and account identifiers are dropped."""
+    windows = {}
+    for name in OAUTH_WINDOWS:
+        window = payload.get(name)
+        if not isinstance(window, Mapping):
+            continue
+        utilization = window.get("utilization")
+        if not isinstance(utilization, (int, float)):
+            continue
+        entry = {"utilization_percent": float(utilization)}
+        for field in ("resets_at", "limit_dollars", "used_dollars", "remaining_dollars"):
+            value = window.get(field)
+            if value is not None:
+                entry[field] = value
+        windows[name] = entry
+    if not windows:
+        return None
+    limits = []
+    raw_limits = payload.get("limits")
+    if isinstance(raw_limits, list):
+        for item in raw_limits:
+            if not isinstance(item, Mapping):
+                continue
+            scope = item.get("scope")
+            model = None
+            if isinstance(scope, Mapping):
+                scoped = scope.get("model")
+                if isinstance(scoped, Mapping):
+                    model = scoped.get("id") or scoped.get("display_name")
+            limits.append(
+                {
+                    "kind": item.get("kind"),
+                    "group": item.get("group"),
+                    "percent": item.get("percent"),
+                    "severity": item.get("severity"),
+                    "is_active": item.get("is_active"),
+                    "resets_at": item.get("resets_at"),
+                    "scope_model": model,
+                }
+            )
+    record = {
+        "source": "oauth",
+        "config_dir": config.name,
+        "ts": now,
+        "windows": windows,
+    }
+    if limits:
+        record["limits"] = limits
+    spend = payload.get("spend")
+    if isinstance(spend, Mapping) and isinstance(spend.get("percent"), (int, float)):
+        record["spend_percent"] = float(spend["percent"])
+    return record
+
+
+def snapshot_from_oauth(destination: Path, args: argparse.Namespace) -> int:
+    configs = oauth_config_dirs(args.config_dir)
+    if not configs:
+        warn("no config dir with a .credentials.json claudeAiOauth block")
+        return 1
+    state = load_poll_state()
+    version = detect_claude_version()
+    now = time.time()
+    written = 0
+    for config in configs:
+        label = config.name
+        entry = dict(state.get(label) or {})
+        if now < float(entry.get("blocked_until") or 0.0):
+            warn("%s: backing off until %s" % (label, local_label(entry["blocked_until"])))
+            continue
+        if now - float(entry.get("last_attempt") or 0.0) < OAUTH_MIN_INTERVAL_SECONDS:
+            warn("%s: polled less than %ds ago" % (label, int(OAUTH_MIN_INTERVAL_SECONDS)))
+            continue
+        token, expiry = read_oauth_token(config)
+        if token is None:
+            warn("%s: no usable claudeAiOauth token" % label)
+            continue
+        if expiry is not None and expiry <= now:
+            warn("%s: oauth token expired; refresh is not attempted here" % label)
+            entry["last_attempt"] = now
+            state[label] = entry
+            continue
+        entry["last_attempt"] = now
+        state[label] = entry
+        try:
+            payload = fetch_oauth_usage(token, version)
+        except urllib.error.HTTPError as error:
+            if error.code == 429:
+                entry["blocked_until"] = now + OAUTH_BACKOFF_SECONDS
+                state[label] = entry
+                warn("%s: rate limited; backing off %ds" % (label, int(OAUTH_BACKOFF_SECONDS)))
+            else:
+                warn("%s: usage request failed with HTTP %d" % (label, error.code))
+            continue
+        except Exception as error:  # network, timeout, malformed body
+            warn("%s: usage request failed (%s)" % (label, type(error).__name__))
+            continue
+        finally:
+            token = None
+        record = oauth_snapshot_record(config, payload, now)
+        if record is None:
+            warn("%s: usage response carried no window utilisation" % label)
+            continue
+        append_snapshot(destination, record)
+        written += 1
+    save_poll_state(state)
+    print("appended %d snapshot(s) to %s" % (written, destination))
+    return 0
+
+
 def command_snapshot(args: argparse.Namespace) -> int:
     destination = state_dir() / "snapshots.jsonl"
     if args.stdin:
         return snapshot_from_stdin(destination)
+    if args.oauth:
+        return snapshot_from_oauth(destination, args)
     return snapshot_from_configs(destination)
 
 
@@ -3226,6 +3551,9 @@ def build_parser() -> argparse.ArgumentParser:
     snapshot = sub.add_parser("snapshot", help="log a Claude quota utilisation observation")
     snapshot.add_argument("--stdin", action="store_true",
                           help="read statusline JSON on stdin and pass it through unchanged")
+    snapshot.add_argument("--oauth", action="store_true",
+                          help="sample live utilisation from the Claude oauth usage endpoint")
+    snapshot.add_argument("--config-dir", action="append", default=[], metavar="PATH")
     snapshot.set_defaults(handler=command_snapshot)
 
     return parser

@@ -103,11 +103,13 @@ def codex_session_meta_line(epoch: float, session_id: str, cwd: str) -> str:
             "timestamp": iso(epoch),
             "payload": {
                 "id": session_id,
+                "session_id": session_id,
                 "timestamp": iso(epoch),
                 "cwd": cwd,
                 "originator": "codex-tui",
                 "cli_version": "0.51.0",
                 "model_provider": "openai",
+                "source": "cli",
             },
         }
     )
@@ -128,6 +130,7 @@ def codex_usage_record_line(
     output_tokens: int,
     cache_write_input_tokens: int = 0,
     thread_total: Optional[Dict[str, int]] = None,
+    turn_id: Optional[str] = None,
 ) -> str:
     usage = {
         "input_tokens": input_tokens,
@@ -137,19 +140,96 @@ def codex_usage_record_line(
         "reasoning_output_tokens": 0,
         "total_tokens": input_tokens + output_tokens,
     }
+    payload = {
+        "thread_id": session_id,
+        "session_id": session_id,
+        "response_id": "resp-%f" % epoch,
+        "usage": usage,
+        "turn_token_usage": usage,
+        "thread_token_usage": thread_total or usage,
+    }
+    if turn_id is not None:
+        payload["turn_id"] = turn_id
+        payload["root_turn_id"] = turn_id
+    return json.dumps({"type": "token_usage_record", "timestamp": iso(epoch),
+                       "payload": payload})
+
+
+def claude_user_prompt_line(
+    epoch: float,
+    session_id: str,
+    *,
+    cwd: str = "/home/agent/project",
+    text: str = "do the thing",
+) -> str:
     return json.dumps(
         {
-            "type": "token_usage_record",
+            "type": "user",
+            "sessionId": session_id,
+            "cwd": cwd,
+            "timestamp": iso(epoch),
+            "isSidechain": False,
+            "message": {"role": "user", "content": text},
+        }
+    )
+
+
+def claude_tool_result_line(epoch: float, session_id: str) -> str:
+    """A fan-out step, not a prompt: same `type: user`, different shape."""
+    return json.dumps(
+        {
+            "type": "user",
+            "sessionId": session_id,
+            "timestamp": iso(epoch),
+            "isSidechain": False,
+            "toolUseResult": {"stdout": "ok"},
+            "message": {
+                "role": "user",
+                "content": [{"type": "tool_result", "tool_use_id": "t1", "content": "ok"}],
+            },
+        }
+    )
+
+
+def codex_task_started_line(epoch: float) -> str:
+    return json.dumps(
+        {"type": "event_msg", "timestamp": iso(epoch), "payload": {"type": "task_started"}}
+    )
+
+
+def codex_compacted_line(epoch: float, window_number: int = 2) -> str:
+    """Top-level fields, no payload wrapper; history fields are never read."""
+    return json.dumps(
+        {
+            "type": "compacted",
+            "timestamp": iso(epoch),
+            "window_number": window_number,
+            "window_id": "win-%d" % window_number,
+            "previous_window_id": "win-%d" % (window_number - 1),
+            "compaction_response_id": "resp-compact",
+            "message": "SENSITIVE PROMPT TEXT",
+            "replacement_history": ["SENSITIVE"],
+            "guardian_history": ["SENSITIVE"],
+            "retained_context": "SENSITIVE",
+        }
+    )
+
+
+def codex_subagent_meta_line(epoch: float, thread_id: str, session_id: str, cwd: str) -> str:
+    return json.dumps(
+        {
+            "type": "session_meta",
             "timestamp": iso(epoch),
             "payload": {
-                "thread_id": session_id,
+                "id": thread_id,
                 "session_id": session_id,
-                "turn_id": "turn-1",
-                "root_turn_id": "turn-1",
-                "response_id": "resp-%d" % int(epoch),
-                "usage": usage,
-                "turn_token_usage": usage,
-                "thread_token_usage": thread_total or usage,
+                "parent_thread_id": session_id,
+                "timestamp": iso(epoch),
+                "cwd": cwd,
+                "originator": "codex-tui",
+                "cli_version": "0.51.0",
+                "source": {"subagent": {"thread_spawn": {"parent_thread_id": session_id,
+                                                         "depth": 1}}},
             },
         }
     )
@@ -986,6 +1066,506 @@ class ConfigWeights(Harness):
         payload = self.run_json("sessions", "--harness", "codex", "--json")
         self.assertAlmostEqual(payload["sessions"][0]["weighted_units"], 2.0, places=6)
         self.assertIn("config", payload["weight_source"])
+
+
+class PromptGrouping(Harness):
+    def test_claude_tool_results_do_not_start_a_prompt(self) -> None:
+        now = time.time() - 1800
+        session = "abcd1111-aaaa-2222-3333-444444444444"
+        lines = [claude_user_prompt_line(now, session)]
+        for step in range(4):
+            lines.append(
+                claude_assistant_line(
+                    now + 1 + step, session, "msg_p%d" % step, input_tokens=100,
+                    cache_read=1000 * (step + 1), output_tokens=50
+                )
+            )
+            lines.append(claude_tool_result_line(now + 1.5 + step, session))
+        lines.append(claude_user_prompt_line(now + 100, session, text="second prompt"))
+        lines.append(
+            claude_assistant_line(now + 101, session, "msg_q0", output_tokens=10)
+        )
+        self.write_claude("prompts.jsonl", lines)
+        payload = self.run_json("prompts", "--session", "abcd1111", "--json")
+        self.assertEqual(len(payload["prompts"]), 2)
+        self.assertEqual(payload["prompts"][0]["api_turns"], 4)
+        self.assertEqual(payload["prompts"][1]["api_turns"], 1)
+        self.assertEqual(payload["prompts"][0]["index"], 1)
+
+    def test_claude_subagent_calls_join_the_running_prompt(self) -> None:
+        now = time.time() - 1800
+        session = "abcd2222-aaaa-2222-3333-444444444444"
+        self.write_claude(
+            "parent.jsonl",
+            [
+                claude_user_prompt_line(now, session),
+                claude_assistant_line(now + 1, session, "msg_main", output_tokens=100),
+            ],
+        )
+        self.write_claude(
+            "subagents/agent-9.jsonl",
+            [
+                claude_assistant_line(
+                    now + 2, session, "msg_sub", output_tokens=400, sidechain=True
+                )
+            ],
+        )
+        payload = self.run_json("prompts", "--session", "abcd2222", "--json")
+        self.assertEqual(len(payload["prompts"]), 1)
+        self.assertEqual(payload["prompts"][0]["api_turns"], 2)
+        self.assertEqual(payload["prompts"][0]["subagent_turns"], 1)
+
+    def test_codex_groups_by_turn_id(self) -> None:
+        now = time.time() - 1800
+        session = "codex-prompt-0001"
+        lines = [codex_session_meta_line(now, session, "/home/agent/repo")]
+        for turn, calls in enumerate((3, 5)):
+            # No task_started line: turn_id alone must carry the grouping.
+            lines.append(codex_turn_context_line(now + turn * 100 + 1, "gpt-5.6-sol"))
+            for call in range(calls):
+                lines.append(
+                    codex_usage_record_line(
+                        now + turn * 100 + 2 + call,
+                        session,
+                        input_tokens=50_000,
+                        cached_input_tokens=1_000,
+                        output_tokens=100,
+                        turn_id="turn-%d" % turn,
+                    )
+                )
+        self.write_codex("rollout-prompts.jsonl", lines)
+        payload = self.run_json("prompts", "--session", "codex-prompt", "--json")
+        self.assertEqual(len(payload["prompts"]), 2)
+        self.assertEqual([prompt["api_turns"] for prompt in payload["prompts"]], [3, 5])
+
+    def test_codex_subagent_thread_rolls_into_parent_session(self) -> None:
+        now = time.time() - 1800
+        session = "codex-parent-0001"
+        self.write_codex(
+            "rollout-root.jsonl",
+            [
+                codex_session_meta_line(now, session, "/home/agent/root"),
+                codex_task_started_line(now + 1),
+                codex_turn_context_line(now + 2, "gpt-5.6-sol"),
+                codex_usage_record_line(
+                    now + 3, session, input_tokens=100_000, cached_input_tokens=0,
+                    output_tokens=1_000
+                ),
+            ],
+        )
+        self.write_codex(
+            "rollout-child.jsonl",
+            [
+                codex_subagent_meta_line(now + 4, "codex-child-0001", session,
+                                         "/home/agent/root"),
+                codex_turn_context_line(now + 5, "gpt-5.6-sol"),
+                codex_usage_record_line(
+                    now + 6, "codex-child-0001", input_tokens=20_000,
+                    cached_input_tokens=0, output_tokens=500
+                ),
+            ],
+        )
+        payload = self.run_json("sessions", "--harness", "codex", "--json")
+        self.assertEqual(len(payload["sessions"]), 1)
+        row = payload["sessions"][0]
+        self.assertEqual(row["tokens"]["input"], 120_000)
+        self.assertEqual(row["subagent_tokens"]["input"], 20_000)
+        self.assertEqual(row["api_turns"], 2)
+        self.assertEqual(row["prompts"], 1)
+
+    def test_resent_share_counts_context_beyond_the_first_turn(self) -> None:
+        now = time.time() - 1800
+        session = "codex-resent-0001"
+        lines = [
+            codex_session_meta_line(now, session, "/home/agent/resent"),
+            codex_task_started_line(now + 1),
+            codex_turn_context_line(now + 2, "gpt-5.6-sol"),
+        ]
+        for call in range(4):
+            lines.append(
+                codex_usage_record_line(
+                    now + 3 + call, session, input_tokens=1_000_000,
+                    cached_input_tokens=0, output_tokens=0
+                )
+            )
+        self.write_codex("rollout-resent.jsonl", lines)
+        payload = self.run_json("sessions", "--harness", "codex", "--json")
+        row = payload["sessions"][0]
+        # Four identical calls: one is the real context, three are re-sends.
+        self.assertAlmostEqual(row["resent_share"], 0.75, places=6)
+
+
+class QuadraticGrowth(Harness):
+    def test_quadratic_session_is_recognised(self) -> None:
+        now = time.time() - 4 * 3600
+        session = "codex-quad-0001"
+        lines = [codex_session_meta_line(now, session, "/home/agent/quad")]
+        # Prompt k sends k turns of a k-sized context: cost grows as k^2.
+        for index in range(1, 13):
+            stamp = now + index * 100
+            lines.append(codex_task_started_line(stamp))
+            lines.append(codex_turn_context_line(stamp + 1, "gpt-5.6-sol"))
+            for call in range(index):
+                lines.append(
+                    codex_usage_record_line(
+                        stamp + 2 + call,
+                        session,
+                        input_tokens=100_000 * index,
+                        cached_input_tokens=0,
+                        output_tokens=0,
+                    )
+                )
+        self.write_codex("rollout-quad.jsonl", lines)
+        payload = self.run_json("prompts", "--session", "codex-quad", "--json")
+        growth = payload["growth"]
+        self.assertEqual(growth["better"], "quadratic")
+        self.assertGreater(growth["quadratic"]["r_squared"], 0.99)
+        # units = index^2 * 0.1 Mtok * 100 units/Mtok = 10 * index^2
+        self.assertAlmostEqual(growth["quadratic"]["square_term"], 10.0, places=3)
+        self.assertGreater(growth["last_20_percent_share"], 0.3)
+
+    def test_flat_session_prefers_linear(self) -> None:
+        now = time.time() - 4 * 3600
+        session = "codex-flat-0001"
+        lines = [codex_session_meta_line(now, session, "/home/agent/flat")]
+        for index in range(1, 13):
+            stamp = now + index * 100
+            lines.append(codex_task_started_line(stamp))
+            lines.append(codex_turn_context_line(stamp + 1, "gpt-5.6-sol"))
+            lines.append(
+                codex_usage_record_line(
+                    stamp + 2, session, input_tokens=100_000, cached_input_tokens=0,
+                    output_tokens=0
+                )
+            )
+        self.write_codex("rollout-flat.jsonl", lines)
+        payload = self.run_json("prompts", "--session", "codex-flat", "--json")
+        self.assertEqual(payload["growth"]["better"], "linear")
+
+    def test_fanout_reports_distribution_and_top_prompts(self) -> None:
+        now = time.time() - 4 * 3600
+        session = "codex-fan-0001"
+        lines = [codex_session_meta_line(now, session, "/home/agent/fan")]
+        for index, calls in enumerate((1, 2, 8, 30), start=1):
+            stamp = now + index * 100
+            lines.append(codex_task_started_line(stamp))
+            lines.append(codex_turn_context_line(stamp + 1, "gpt-5.6-sol"))
+            for call in range(calls):
+                lines.append(
+                    codex_usage_record_line(
+                        stamp + 2 + call, session, input_tokens=60_000,
+                        cached_input_tokens=0, output_tokens=0
+                    )
+                )
+        self.write_codex("rollout-fan.jsonl", lines)
+        payload = self.run_json("fanout", "--harness", "codex", "--json")
+        self.assertEqual(payload["prompts"], 4)
+        self.assertEqual(payload["turns_per_prompt"]["max"], 30)
+        self.assertEqual(payload["top_prompts"][0]["api_turns"], 30)
+        self.assertEqual(payload["top_prompts"][0]["cwd"], "fan")
+        self.assertEqual(sum(b["count"] for b in payload["turns_histogram"]), 4)
+
+
+class ContextReductions(Harness):
+    def codex_run(self, session: str, contexts: Sequence[int],
+                  compact_after: Optional[int] = None) -> None:
+        now = time.time() - 4 * 3600
+        lines = [
+            codex_session_meta_line(now, session, "/home/agent/red"),
+            codex_task_started_line(now + 1),
+            codex_turn_context_line(now + 2, "gpt-5.6-sol"),
+        ]
+        for index, context in enumerate(contexts):
+            if compact_after is not None and index == compact_after:
+                lines.append(codex_compacted_line(now + 3 + index - 0.5))
+            lines.append(
+                codex_usage_record_line(
+                    now + 3 + index, session, input_tokens=context,
+                    cached_input_tokens=0, output_tokens=100
+                )
+            )
+        self.write_codex("rollout-%s.jsonl" % session, lines)
+
+    def test_compacted_record_is_labelled_compact(self) -> None:
+        self.codex_run(
+            "codex-red-0001",
+            [100_000, 200_000, 300_000, 40_000, 45_000, 50_000, 55_000],
+            compact_after=3,
+        )
+        payload = self.run_json("reductions", "--harness", "codex", "--json")
+        rows = payload["reductions"]
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["kind"], "compact")
+        self.assertEqual(rows[0]["before"], 300_000)
+        self.assertEqual(rows[0]["after"], 40_000)
+        self.assertEqual(rows[0]["removed_tokens"], 260_000)
+        self.assertEqual(rows[0]["turns_after"], 3)
+        self.assertGreater(rows[0]["saved_units"], 0.0)
+        self.assertGreater(rows[0]["saved_units_upper_bound"], rows[0]["saved_units"])
+
+    def test_unmarked_drop_is_reported(self) -> None:
+        self.codex_run(
+            "codex-red-0002", [100_000, 200_000, 300_000, 40_000, 45_000, 50_000, 55_000]
+        )
+        payload = self.run_json("reductions", "--harness", "codex", "--json")
+        self.assertEqual(len(payload["reductions"]), 1)
+        self.assertEqual(payload["reductions"][0]["kind"], "unmarked")
+
+    def test_compacted_history_fields_are_never_stored(self) -> None:
+        self.codex_run(
+            "codex-red-0003",
+            [100_000, 200_000, 300_000, 40_000, 45_000, 50_000, 55_000],
+            compact_after=3,
+        )
+        self.run_json("reductions", "--harness", "codex", "--json")
+        cached = ""
+        for path in (self.root / "cache").rglob("*.json"):
+            cached += path.read_text(encoding="utf-8")
+        self.assertNotIn("SENSITIVE", cached)
+
+    def test_growing_session_is_not_a_reduction(self) -> None:
+        self.codex_run(
+            "codex-red-0004", [20_000, 40_000, 80_000, 160_000, 320_000, 400_000, 450_000]
+        )
+        payload = self.run_json("reductions", "--harness", "codex", "--json")
+        self.assertEqual(payload["reductions"], [])
+
+    def test_a_small_new_session_is_not_a_reduction(self) -> None:
+        self.codex_run("codex-red-0005", [300_000, 320_000, 340_000, 360_000, 380_000])
+        self.codex_run("codex-red-0006", [9_000, 10_000, 11_000, 12_000, 13_000])
+        payload = self.run_json("reductions", "--harness", "codex", "--json")
+        self.assertEqual(payload["reductions"], [])
+
+    def test_a_single_small_call_that_bounces_back_is_not_a_reduction(self) -> None:
+        # Codex interleaves a second, smaller-context call stream into one
+        # thread; those dips must not read as context reductions.
+        self.codex_run(
+            "codex-red-0007",
+            [200_000, 40_000, 210_000, 45_000, 220_000, 50_000, 230_000, 55_000],
+        )
+        payload = self.run_json("reductions", "--harness", "codex", "--json")
+        self.assertEqual(payload["reductions"], [])
+
+    def test_claude_drop_is_detected(self) -> None:
+        now = time.time() - 4 * 3600
+        session = "abcd3333-aaaa-2222-3333-444444444444"
+        lines = [claude_user_prompt_line(now, session)]
+        for index, context in enumerate(
+            [100_000, 200_000, 300_000, 40_000, 45_000, 50_000, 55_000]
+        ):
+            lines.append(
+                claude_assistant_line(
+                    now + 1 + index, session, "msg_r%d" % index,
+                    cache_read=context, output_tokens=100
+                )
+            )
+        self.write_claude("reduce.jsonl", lines)
+        payload = self.run_json("reductions", "--harness", "claude", "--json")
+        self.assertEqual(len(payload["reductions"]), 1)
+        self.assertEqual(payload["reductions"][0]["kind"], "unmarked")
+        self.assertEqual(payload["reductions"][0]["before"], 300_000)
+
+
+class OauthSampler(Harness):
+    RESPONSE = {
+        "five_hour": {"utilization": 15.0, "resets_at": "2026-09-16T21:30:00+00:00",
+                      "limit_dollars": None, "used_dollars": None},
+        "seven_day": {"utilization": 3.0, "resets_at": "2026-09-23T14:00:00+00:00"},
+        "seven_day_opus": None,
+        "seven_day_sonnet": None,
+        "limits": [
+            {"kind": "session", "group": "session", "percent": 15, "severity": "normal",
+             "is_active": True, "resets_at": "2026-09-16T21:30:00+00:00",
+             "scope": {"model": {"id": None, "display_name": "Fable"}}}
+        ],
+        "spend": {"percent": 0, "used": {"amount_minor": 0}},
+        "extra_usage": {"is_enabled": False},
+        "organization": {"uuid": "must-not-be-stored"},
+        "account": {"uuid": "must-not-be-stored"},
+    }
+
+    def write_credentials(self, name: str = ".claude", expires_in: float = 3600.0) -> Path:
+        config = self.home / name
+        config.mkdir(parents=True, exist_ok=True)
+        (config / ".credentials.json").write_text(
+            json.dumps(
+                {
+                    "claudeAiOauth": {
+                        "accessToken": "sk-ant-oat-TESTTOKEN",
+                        "expiresAt": int((time.time() + expires_in) * 1000),
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        return config
+
+    def sample(self, args_list: Sequence[str], response: Any = None,
+               status: Optional[int] = None) -> List[Dict[str, Any]]:
+        import io
+        import urllib.error
+        import urllib.request
+
+        captured = {}
+
+        class FakeResponse(io.BytesIO):
+            def __enter__(self_inner):
+                return self_inner
+
+            def __exit__(self_inner, *exc):
+                return False
+
+        def fake_urlopen(request, timeout=None):
+            captured["url"] = request.full_url
+            captured["headers"] = dict(request.header_items())
+            captured["timeout"] = timeout
+            if status is not None:
+                raise urllib.error.HTTPError(
+                    request.full_url, status, "rate limited", {}, None
+                )
+            body = json.dumps(response if response is not None else self.RESPONSE)
+            return FakeResponse(body.encode("utf-8"))
+
+        original = urllib.request.urlopen
+        environment = dict(os.environ)
+        os.environ.update(
+            {
+                key: value
+                for key, value in self.environment.items()
+                if key.startswith("QUOTA_DRAIN_")
+            }
+        )
+        urllib.request.urlopen = fake_urlopen
+        try:
+            QD.main(list(args_list))
+        finally:
+            urllib.request.urlopen = original
+            os.environ.clear()
+            os.environ.update(environment)
+        self.captured = captured
+        path = self.root / "state" / "snapshots.jsonl"
+        if not path.is_file():
+            return []
+        return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+
+    def test_sampler_writes_a_snapshot_without_identifiers(self) -> None:
+        self.write_credentials()
+        rows = self.sample(["snapshot", "--oauth"])
+        self.assertEqual(len(rows), 1)
+        record = rows[0]
+        self.assertEqual(record["source"], "oauth")
+        self.assertEqual(record["config_dir"], ".claude")
+        self.assertEqual(record["windows"]["five_hour"]["utilization_percent"], 15.0)
+        self.assertEqual(record["windows"]["seven_day"]["utilization_percent"], 3.0)
+        self.assertNotIn("seven_day_opus", record["windows"])
+        self.assertEqual(record["limits"][0]["scope_model"], "Fable")
+        self.assertEqual(record["spend_percent"], 0.0)
+        serialized = json.dumps(record)
+        self.assertNotIn("must-not-be-stored", serialized)
+        self.assertNotIn("TESTTOKEN", serialized)
+
+    def test_request_shape(self) -> None:
+        self.write_credentials()
+        self.sample(["snapshot", "--oauth"])
+        self.assertEqual(self.captured["url"], QD.OAUTH_USAGE_URL)
+        headers = dict((key.lower(), value) for key, value in self.captured["headers"].items())
+        self.assertEqual(headers["authorization"], "Bearer sk-ant-oat-TESTTOKEN")
+        self.assertEqual(headers["anthropic-beta"], "oauth-2025-04-20")
+        self.assertEqual(headers["content-type"], "application/json")
+        self.assertTrue(headers["user-agent"].startswith("claude-code/"))
+        self.assertEqual(self.captured["timeout"], QD.OAUTH_TIMEOUT_SECONDS)
+
+    def test_token_never_reaches_disk(self) -> None:
+        self.write_credentials()
+        self.sample(["snapshot", "--oauth"])
+        written = ""
+        for path in (self.root / "state").rglob("*"):
+            if path.is_file():
+                written += path.read_text(encoding="utf-8")
+        self.assertNotIn("TESTTOKEN", written)
+
+    def test_minimum_interval_blocks_a_second_call(self) -> None:
+        self.write_credentials()
+        first = self.sample(["snapshot", "--oauth"])
+        second = self.sample(["snapshot", "--oauth"])
+        self.assertEqual(len(first), 1)
+        self.assertEqual(len(second), 1)
+        state = json.loads((self.root / "state" / "oauth-poll.json").read_text(encoding="utf-8"))
+        self.assertIn(".claude", state)
+        self.assertIn("last_attempt", state[".claude"])
+
+    def test_rate_limit_sets_a_backoff(self) -> None:
+        self.write_credentials()
+        rows = self.sample(["snapshot", "--oauth"], status=429)
+        self.assertEqual(rows, [])
+        state = json.loads((self.root / "state" / "oauth-poll.json").read_text(encoding="utf-8"))
+        self.assertGreater(state[".claude"]["blocked_until"], time.time())
+
+    def test_expired_token_is_skipped(self) -> None:
+        self.write_credentials(expires_in=-10.0)
+        rows = self.sample(["snapshot", "--oauth"])
+        self.assertEqual(rows, [])
+        self.assertNotIn("url", self.captured)
+
+
+class ClaudeCalibration(Harness):
+    def write_snapshots(self, samples: Sequence[Tuple[float, float]]) -> None:
+        path = self.root / "state" / "snapshots.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as handle:
+            for epoch, percent in samples:
+                handle.write(
+                    json.dumps(
+                        {
+                            "source": "oauth",
+                            "config_dir": ".claude",
+                            "ts": epoch,
+                            "windows": {
+                                "five_hour": {
+                                    "utilization_percent": percent,
+                                    "resets_at": "2026-09-16T21:30:00+00:00",
+                                }
+                            },
+                        }
+                    )
+                    + "\n"
+                )
+
+    def test_fit_recovers_the_cache_read_ratio(self) -> None:
+        now = time.time() - 6 * 3600
+        session = "abcd4444-aaaa-2222-3333-444444444444"
+        input_rate, cache_rate = 6.0, 0.6
+        lines = [claude_user_prompt_line(now, session)]
+        samples = [(now, 0.0)]
+        used = 0.0
+        mixes = [
+            (900_000, 100_000), (200_000, 900_000), (500_000, 400_000),
+            (100_000, 800_000), (800_000, 200_000), (300_000, 700_000),
+            (700_000, 300_000), (400_000, 600_000), (600_000, 150_000),
+            (250_000, 750_000), (950_000, 50_000), (150_000, 950_000),
+        ]
+        for index, (fresh, cached) in enumerate(mixes):
+            stamp = now + (index + 1) * 120
+            lines.append(
+                claude_assistant_line(
+                    stamp - 60, session, "msg_c%d" % index,
+                    input_tokens=fresh, cache_read=cached, output_tokens=0
+                )
+            )
+            used += (fresh * input_rate + cached * cache_rate) / 1_000_000.0
+            samples.append((stamp, used))
+        self.write_claude("calib.jsonl", lines)
+        self.write_snapshots(samples)
+        payload = self.run_json("calibrate", "--harness", "claude", "--json")
+        fitted = payload["windows"]["five_hour"]["models"]["claude-opus-5"]
+        self.assertLess(abs(fitted["input"] - input_rate) / input_rate, 0.05)
+        self.assertLess(abs(fitted["cache_read"] - cache_rate) / cache_rate, 0.05)
+        self.assertGreater(payload["windows"]["five_hour"]["r_squared"], 0.99)
+
+    def test_calibrate_without_snapshots_explains_itself(self) -> None:
+        result = self.run_tool("calibrate", "--harness", "claude")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn(b"snapshot --oauth", result.stderr)
 
 
 if __name__ == "__main__":
