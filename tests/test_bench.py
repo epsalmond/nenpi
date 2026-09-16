@@ -388,9 +388,18 @@ class Bracketing(Harness):
             "--models", "claude-haiku-4-5", "--contexts", "10k", "--cache", "warm",
         )
         self.assertEqual(result.returncode, 0, result.stderr.decode("utf-8", "replace"))
-        scenario = self.latest_report()["scenarios"][0]
+        report = self.latest_report()
+        scenario = report["scenarios"][0]
         self.assertFalse(scenario["bracketed"])
+        self.assertTrue(scenario["upper_bound"])
         self.assertEqual(scenario["ticks"], 1)
+        # An upper bound is not a measurement, so it stays out of the design
+        # matrix unless the caller asks for it.
+        self.assertIsNone(report["fit"])
+        self.assertIn(b"fit excludes", result.stderr)
+        opted_in = self.bench_json("report", "--ticks", "1", "--include-unbracketed",
+                                   "--quota-drain", str(self.fake_drain), "--json")
+        self.assertIsNotNone(opted_in["fit"])
 
     def test_estimate_needs_two_ticks(self) -> None:
         record = {
@@ -423,6 +432,19 @@ class Budgets(Harness):
         self.assertEqual(record["stop_reason"], "budget:five_hour")
         # Four calls is two percent; the fifth would have overrun the budget.
         self.assertEqual(record["calls"], 4)
+
+    def test_the_five_hour_cap_applies_when_measuring_the_weekly_window(self) -> None:
+        result = self.bench(
+            "run", "--yes", "--quota-drain", str(self.fake_drain), "--sample-interval", "0",
+            "--window", "seven_day", "--ticks", "9", "--max-percent", "2",
+            "--max-percent-weekly", "50", "--models", "claude-haiku-4-5",
+            "--contexts", "10k", "--cache", "warm",
+        )
+        self.assertEqual(result.returncode, QB.EXIT_BUDGET)
+        self.assertEqual(self.scenario_records()[0]["stop_reason"], "budget:five_hour")
+        runs = sorted((self.root / "state" / "bench").iterdir())
+        meta = json.loads((runs[-1] / "meta.json").read_text(encoding="utf-8"))
+        self.assertEqual(sorted(meta["budget"]["limits"]), ["five_hour", "seven_day"])
 
     def test_max_calls_stops_a_scenario(self) -> None:
         result = self.run_scenarios("--models", "claude-haiku-4-5", "--contexts", "10k",

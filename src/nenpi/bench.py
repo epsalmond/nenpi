@@ -823,14 +823,22 @@ def estimate_scenario(record: Mapping[str, Any], required_ticks: int) -> Optiona
         "tokens": tokens,
         "models": models,
         "tokens_per_percent": dict((kind, value / percent) for kind, value in tokens.items()),
+        "upper_bound": not bracketed,
+        "warm_drift": bool(record.get("warm_drift")),
         "contaminated": bool(record.get("contaminated")),
         "window_rollover": bool(record.get("window_rollover")),
         "measured_context_tokens": record.get("measured_context_tokens"),
     }
 
 
-def fit_weights(estimates: Sequence[Mapping[str, Any]]) -> Optional[Dict[str, Any]]:
+def fit_weights(estimates: Sequence[Mapping[str, Any]], include_unbracketed: bool = False,
+                include_drifted: bool = False) -> Optional[Dict[str, Any]]:
     """Non-negative least squares of measured percent against token features.
+
+    Only fully bracketed rows are fitted. An unbracketed row divides everything
+    spent since the scenario started by an assumed single percent, including
+    the partial percent that was already burnt before the first tick, so it is
+    an upper bound rather than a measurement.
 
     Coefficients the scenarios cannot separate are stored as null rather than
     as a confident zero, the same way `quota-drain calibrate` does, because a
@@ -839,7 +847,21 @@ def fit_weights(estimates: Sequence[Mapping[str, Any]]) -> Optional[Dict[str, An
     these rows are designed scenarios, so a kind that appears in one scenario
     is still identified as long as the system is not underdetermined.
     """
-    rows = [item for item in estimates if not item["contaminated"] and item["percent"] > 0]
+    rows = []
+    excluded = []
+    for item in estimates:
+        if item["contaminated"] or item["percent"] <= 0:
+            excluded.append((item["key"], "contaminated"))
+            continue
+        if not item.get("bracketed", True) and not include_unbracketed:
+            excluded.append((item["key"], "unbracketed"))
+            continue
+        if item.get("warm_drift") and not include_drifted:
+            excluded.append((item["key"], "warm_drift"))
+            continue
+        rows.append(item)
+    for key, reason in excluded:
+        warn("fit excludes %s (%s)" % (key, reason))
     if not rows:
         return None
     features = set()
@@ -936,6 +958,7 @@ def fit_weights(estimates: Sequence[Mapping[str, Any]]) -> Optional[Dict[str, An
         "models": fitted,
         "diagnostics": diagnostics,
         "residuals": residuals,
+        "excluded": [{"key": key, "reason": reason} for key, reason in excluded],
     }
 
 
@@ -1251,7 +1274,8 @@ def write_report(run_id: str, meta: Mapping[str, Any], records: Sequence[Mapping
     if not estimates:
         warn("no scenario reached its tick target; nothing to report")
         return EXIT_USAGE
-    fit = fit_weights(estimates)
+    fit = fit_weights(estimates, include_unbracketed=args.include_unbracketed,
+                      include_drifted=args.include_drifted)
     window = str(meta.get("window") or "five_hour")
     payload = {
         "schema": _QD.JSON_SCHEMA,
@@ -1356,7 +1380,10 @@ def command_run(args: argparse.Namespace) -> int:
         warn("no utilisation sample (%s); check `quota-drain snapshot --oauth`"
              % (sampler.failure or "no observation logged"))
         return EXIT_DEPENDENCY
-    budget = Budget({args.window: args.max_percent, "seven_day": args.max_percent_weekly})
+    # Both caps always apply: --window only selects which window the ticks are
+    # read from, and collapsing the two would drop the five-hour cap whenever
+    # the run measured against the weekly window.
+    budget = Budget({"five_hour": args.max_percent, "seven_day": args.max_percent_weekly})
     budget.observe(baseline)
 
     own_sessions = []  # type: List[str]
@@ -1495,6 +1522,14 @@ def add_scenario_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--json", action="store_true")
 
 
+def add_fit_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--include-unbracketed", action="store_true",
+                        help="fit rows with fewer than two ticks; their percent is an "
+                             "upper bound, not a measurement")
+    parser.add_argument("--include-drifted", action="store_true",
+                        help="fit warm scenarios whose calls fell outside the cache TTL")
+
+
 def add_common_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--quota-drain", type=Path, default=SCRIPT_DIR / "quota-drain",
                         metavar="PATH",
@@ -1537,12 +1572,14 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--contamination-since", default=DEFAULT_CONTAMINATION_WINDOW,
                      metavar="DURATION")
     run.add_argument("--no-write-weights", action="store_true")
+    add_fit_arguments(run)
     run.set_defaults(handler=command_run)
 
     report = sub.add_parser("report", help="table and fit from stored run logs")
     report.add_argument("--run-id", default=None, metavar="ID")
     report.add_argument("--ticks", type=int, default=DEFAULT_TICKS, metavar="N")
     report.add_argument("--no-write-weights", action="store_true")
+    add_fit_arguments(report)
     report.add_argument("--json", action="store_true")
     add_common_arguments(report)
     report.set_defaults(handler=command_report)
