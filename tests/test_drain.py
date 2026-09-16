@@ -819,8 +819,75 @@ class Calibration(Harness):
         fit_file.write_text(json.dumps(stored), encoding="utf-8")
         result = self.run_tool("sessions", "--harness", "codex", "--use-calibrated", "--json")
         self.assertEqual(result.returncode, 0)
-        self.assertIn(b"worse than the mean", result.stderr)
+        self.assertIn(b"stored fit is not usable", result.stderr)
         self.assertNotIn("calibrated", json.loads(result.stdout)["weight_source"])
+
+    def test_calibrated_table_is_all_one_unit(self) -> None:
+        self.build_rollouts()
+        self.run_json(
+            "calibrate", "--harness", "codex", "--json", "--calibrate-bucket-hours", "0.01"
+        )
+        fit_file = self.root / "state" / "codex-weights.json"
+        stored = json.loads(fit_file.read_text(encoding="utf-8"))
+        self.assertGreater(stored["fallback_scale"], 0.0)
+        self.assertTrue(stored["usable"])
+        with self.env_applied():
+            calibrated = QD.load_weights(True)
+            default = QD.load_weights(False)
+        self.assertIn("calibrated", calibrated.source_label)
+        self.assertEqual(calibrated.table["codex"]["unit"], "percent_per_mtok")
+        # gpt-6-astra never ran in the fixture, so it has no fitted
+        # coefficient; it must still be priced on the fitted scale, not left
+        # in rate-card credit units.
+        astra = calibrated.model_entry("codex", "gpt-6-astra")
+        rate_card = default.model_entry("codex", "gpt-6-astra")
+        self.assertIsNotNone(astra)
+        self.assertLess(astra["input"], rate_card["input"])
+        self.assertAlmostEqual(
+            astra["input"] / rate_card["input"], stored["fallback_scale"], places=9
+        )
+        fitted_sol = calibrated.model_entry("codex", "gpt-5.6-sol")["input"]
+        # Both models now sit within a couple of orders of magnitude of each
+        # other instead of differing by the unit mismatch.
+        self.assertLess(max(fitted_sol, astra["input"]) / min(fitted_sol, astra["input"]), 1000.0)
+
+    def test_zero_weighted_model_still_receives_attribution(self) -> None:
+        config = self.root / "config" / "weights.json"
+        config.parent.mkdir(parents=True, exist_ok=True)
+        config.write_text(
+            json.dumps(
+                {
+                    "codex": {
+                        "unit": "credit_units_per_mtok",
+                        "models": {
+                            "gpt-5.6-terra": {"input": 0.0, "cached_input": 0.0,
+                                              "output": 0.0}
+                        },
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        now = time.time() - 3600
+        resets_at = int(time.time()) + 7200
+        self.write_codex(
+            "rollout-zero.jsonl",
+            [
+                codex_session_meta_line(now, "codex-zero-0001", "/home/agent/zero"),
+                codex_turn_context_line(now, "gpt-5.6-terra"),
+                codex_token_count_line(now + 5, rate_limits=rate_limits(10.0, resets_at)),
+                codex_usage_record_line(
+                    now + 10, "codex-zero-0001", input_tokens=200_000,
+                    cached_input_tokens=0, output_tokens=0
+                ),
+                codex_token_count_line(now + 30, rate_limits=rate_limits(14.0, resets_at)),
+            ],
+        )
+        payload = self.run_json("sessions", "--harness", "codex", "--json")
+        row = payload["sessions"][0]
+        self.assertEqual(row["weighted_units"], 0.0)
+        # A model priced at zero is not a model that drained nothing.
+        self.assertAlmostEqual(row["drain_percent"], 4.0, places=6)
 
     def test_nnls_stays_non_negative(self) -> None:
         matrix = [[1.0, 0.0], [0.0, 1.0], [1.0, 1.0]]
@@ -1609,11 +1676,13 @@ class ClaudeCalibration(Harness):
         lines = [claude_user_prompt_line(now, session)]
         samples = [(now, 0.0)]
         used = 0.0
+        # Fresh and cached input vary independently; a fixture where they
+        # always sum to the same total is collinear and correctly refused.
         mixes = [
-            (900_000, 100_000), (200_000, 900_000), (500_000, 400_000),
-            (100_000, 800_000), (800_000, 200_000), (300_000, 700_000),
-            (700_000, 300_000), (400_000, 600_000), (600_000, 150_000),
-            (250_000, 750_000), (950_000, 50_000), (150_000, 950_000),
+            (900_000, 100_000), (900_000, 900_000), (100_000, 100_000),
+            (100_000, 900_000), (500_000, 200_000), (200_000, 500_000),
+            (800_000, 400_000), (400_000, 800_000), (600_000, 600_000),
+            (300_000, 100_000), (100_000, 300_000), (700_000, 900_000),
         ]
         for index, (fresh, cached) in enumerate(mixes):
             stamp = now + (index + 1) * 120
@@ -1668,6 +1737,43 @@ class ClaudeCalibration(Harness):
         self.assertEqual(len(intervals), 2)
         self.assertEqual([interval.rollover for interval in intervals], [False, False])
         self.assertEqual([interval.drain for interval in intervals], [2.0, 3.0])
+
+    def test_collinear_models_are_flagged_unidentified(self) -> None:
+        # Two models that only ever run together cannot be told apart, and a
+        # confident zero for either would price it as free.
+        now = time.time() - 6 * 3600
+        session = "abcd5555-aaaa-2222-3333-444444444444"
+        lines = [claude_user_prompt_line(now, session)]
+        samples = [(now, 0.0)]
+        used = 0.0
+        for index in range(12):
+            stamp = now + (index + 1) * 120
+            volume = 100_000 * (index + 1)
+            lines.append(
+                claude_assistant_line(
+                    stamp - 70, session, "msg_a%d" % index, model="claude-opus-5",
+                    input_tokens=volume, output_tokens=0
+                )
+            )
+            lines.append(
+                claude_assistant_line(
+                    stamp - 60, session, "msg_b%d" % index, model="claude-sonnet-5",
+                    input_tokens=volume, output_tokens=0
+                )
+            )
+            used += volume * 8.0 / 1_000_000.0
+            samples.append((stamp, used))
+        self.write_claude("collinear.jsonl", lines)
+        self.write_snapshots(samples)
+        payload = self.run_json(
+            "calibrate", "--harness", "claude", "--json", "--calibrate-bucket-hours", "0.01"
+        )
+        result = payload["windows"]["five_hour"]
+        for model in ("claude-opus-5", "claude-sonnet-5"):
+            note = result["diagnostics"][model]["input"]
+            self.assertTrue(note["unidentified"], note)
+            self.assertIn("collinear", note["reasons"])
+            self.assertIsNone(result["models"][model]["input"])
 
     def test_calibrate_without_snapshots_explains_itself(self) -> None:
         result = self.run_tool("calibrate", "--harness", "claude")

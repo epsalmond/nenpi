@@ -366,20 +366,53 @@ def load_weights(use_calibrated: bool) -> Weights:
                 sources.append("config")
     if use_calibrated:
         fit_file = state_dir() / "codex-weights.json"
-        if fit_file.is_file():
-            try:
-                fit = json.loads(fit_file.read_text(encoding="utf-8"))
-            except (OSError, ValueError) as error:
-                warn("ignoring %s: %s" % (fit_file, error))
-            else:
-                if isinstance(fit, Mapping) and fit.get("usable") is False:
-                    warn("--use-calibrated: stored fit is worse than the mean; ignoring it")
-                elif isinstance(fit, Mapping):
-                    merge_weights(table, {"codex": fit.get("codex", fit)})
-                    sources.append("calibrated")
-        else:
+        if not fit_file.is_file():
             warn("--use-calibrated: no fit at %s; run `quota-drain calibrate`" % fit_file)
+            return Weights(table, sources)
+        try:
+            fit = json.loads(fit_file.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as error:
+            warn("ignoring %s: %s" % (fit_file, error))
+            return Weights(table, sources)
+        if not isinstance(fit, Mapping) or not fit.get("usable"):
+            warn("--use-calibrated: stored fit is not usable; keeping the rate card")
+            return Weights(table, sources)
+        table["codex"] = calibrated_codex_table(table.get("codex") or {}, fit)
+        sources.append("calibrated")
     return Weights(table, sources)
+
+
+def calibrated_codex_table(rate_card: Mapping[str, Any], fit: Mapping[str, Any]
+                           ) -> Dict[str, Any]:
+    """Express every Codex model in percent per Mtok, fitted or scaled.
+
+    Half a table in fitted percents and half in rate-card credit units is not
+    a scale: the two differ by orders of magnitude, so one model's event would
+    absorb an interval and the rest would round to nothing.
+    """
+    scale = float(fit.get("fallback_scale") or 0.0)
+    fitted = (fit.get("codex") or {}).get("models") or fit.get("models") or {}
+    models = {}  # type: Dict[str, Dict[str, Any]]
+    for name, entry in (rate_card.get("models") or {}).items():
+        converted = {}  # type: Dict[str, Any]
+        for kind in CODEX_FIT_KINDS:
+            value = (fitted.get(name) or {}).get(kind)
+            if isinstance(value, (int, float)):
+                converted[kind] = float(value)
+            else:
+                converted[kind] = float(entry.get(kind, 0.0) or 0.0) * scale
+        if entry.get("guessed"):
+            converted["guessed"] = True
+        models[name] = converted
+    for name, entry in fitted.items():
+        if name in models or not isinstance(entry, Mapping):
+            continue
+        models[name] = dict(
+            (kind, float(value))
+            for kind, value in entry.items()
+            if isinstance(value, (int, float))
+        )
+    return {"unit": "percent_per_mtok", "models": models}
 
 
 _WARNED = set()  # type: set
@@ -2135,10 +2168,35 @@ def aggregate_intervals(
     return [buckets[slot] for slot in sorted(buckets) if buckets[slot][1]]
 
 
+def column_correlation(matrix: Sequence[Sequence[float]], left: int, right: int) -> float:
+    rows = len(matrix)
+    if rows < 2:
+        return 0.0
+    a = [matrix[row][left] for row in range(rows)]
+    b = [matrix[row][right] for row in range(rows)]
+    mean_a = sum(a) / rows
+    mean_b = sum(b) / rows
+    covariance = sum((a[i] - mean_a) * (b[i] - mean_b) for i in range(rows))
+    spread_a = math.sqrt(sum((value - mean_a) ** 2 for value in a))
+    spread_b = math.sqrt(sum((value - mean_b) ** 2 for value in b))
+    if spread_a <= 0 or spread_b <= 0:
+        return 0.0
+    return abs(covariance / (spread_a * spread_b))
+
+
 def fit_percent_weights(
-    intervals: Sequence[Interval], bucket_hours: float
+    intervals: Sequence[Interval],
+    bucket_hours: float,
+    rate_card: Optional[Mapping[str, Any]] = None,
 ) -> Optional[Dict[str, Any]]:
-    """Non-negative least squares of measured drain against token features."""
+    """Non-negative least squares of measured drain against token features.
+
+    Least squares will happily return a number for a coefficient the data
+    cannot separate - a model that only ever ran beside another, or one with
+    too little token mass to move the target. Those are reported as
+    `unidentified` and stored as null rather than as a confident zero, because
+    a zero weight would price that model as free.
+    """
     buckets = aggregate_intervals(intervals, bucket_hours)
     if not buckets:
         return None
@@ -2149,16 +2207,85 @@ def fit_percent_weights(
     target = [drain for drain, _ in buckets]
     coefficients = nnls(matrix, target)
     score = r_squared(matrix, target, coefficients)
-    fitted = {}  # type: Dict[str, Dict[str, float]]
-    for (model, kind), value in zip(features, coefficients):
-        fitted.setdefault(model, {})[kind] = value
+
+    mass = [sum(matrix[row][column] for row in range(len(matrix)))
+            for column in range(len(features))]
+    total_mass = sum(mass) or 1.0
+    diagnostics = {}  # type: Dict[str, Dict[str, Any]]
+    fitted = {}  # type: Dict[str, Dict[str, Any]]
+    identified = 0
+    for column, (model, kind) in enumerate(features):
+        nonzero = sum(1 for row in matrix if row[column] > 0)
+        share = mass[column] / total_mass
+        correlation = 0.0
+        for other in range(len(features)):
+            if other != column:
+                correlation = max(correlation, column_correlation(matrix, column, other))
+        at_boundary = coefficients[column] <= 0.0
+        reasons = []
+        if nonzero < 3:
+            reasons.append("too few buckets")
+        if correlation > 0.95:
+            reasons.append("collinear")
+        if at_boundary and share < 0.05:
+            reasons.append("at zero with little token mass")
+        entry = {
+            "buckets": nonzero,
+            "token_share": share,
+            "max_correlation": correlation,
+            "at_boundary": at_boundary,
+            "unidentified": bool(reasons),
+            "reasons": reasons,
+        }
+        diagnostics.setdefault(model, {})[kind] = entry
+        # Only identified coefficients are stored as numbers; the rest are
+        # null so the loader falls back to the rate card instead of treating
+        # an unidentifiable model as free.
+        fitted.setdefault(model, {})[kind] = None if reasons else coefficients[column]
+        if not reasons:
+            identified += 1
+
+    scale = fit_fallback_scale(buckets, features, target, rate_card)
     return {
         "samples": len(buckets),
         "intervals": len(intervals),
         "r_squared": score,
-        "usable": score > 0.0,
+        "identified": identified,
+        "usable": score >= 0.5 and identified > 0 and scale > 0.0,
+        "fallback_scale": scale,
         "models": fitted,
+        "diagnostics": diagnostics,
     }
+
+
+def fit_fallback_scale(
+    buckets: Sequence[Tuple[float, Mapping[Tuple[str, str], float]]],
+    features: Sequence[Tuple[str, str]],
+    target: Sequence[float],
+    rate_card: Optional[Mapping[str, Any]],
+) -> float:
+    """Fit one percent-per-rate-card-unit scalar.
+
+    Models the fit cannot identify still have to be priced in the same unit as
+    the ones it can; mixing fitted percents with raw rate-card units would let
+    one model's event absorb a whole interval.
+    """
+    if not rate_card:
+        return 0.0
+    models = rate_card.get("models") or {}
+    numerator = 0.0
+    denominator = 0.0
+    for index, (_, values) in enumerate(buckets):
+        predicted = 0.0
+        for (model, kind), tokens in values.items():
+            entry = models.get(model)
+            if isinstance(entry, Mapping):
+                predicted += tokens * float(entry.get(kind, 0.0) or 0.0)
+        numerator += predicted * target[index]
+        denominator += predicted * predicted
+    if denominator <= 0:
+        return 0.0
+    return max(0.0, numerator / denominator)
 
 
 def r_squared(matrix: Sequence[Sequence[float]], target: Sequence[float],
@@ -2905,15 +3032,18 @@ def command_calibrate(args: argparse.Namespace) -> int:
         return calibrate_claude(args, analysis)
     window, intervals = analysis.window, analysis.intervals
     usable = [interval for interval in intervals if not interval.rollover and interval.features]
-    fit = fit_percent_weights(usable, args.calibrate_bucket_hours)
+    fit = fit_percent_weights(
+        usable, args.calibrate_bucket_hours, weights.table.get("codex")
+    )
     if fit is None:
         warn("no snapshot intervals with token activity in range")
         return 1
     if not fit["usable"]:
         warn(
-            "fit is worse than the mean (R^2 %.4f); the window reports whole "
-            "percents, so a longer range or a larger --calibrate-bucket-hours "
-            "is needed before these weights mean anything" % fit["r_squared"]
+            "fit is not usable (R^2 %.4f, %d identified coefficients); the window "
+            "reports whole percents, so a longer range or a larger "
+            "--calibrate-bucket-hours is needed before these weights mean anything"
+            % (fit["r_squared"], fit["identified"])
         )
     payload = {
         "schema": JSON_SCHEMA,
@@ -2922,9 +3052,12 @@ def command_calibrate(args: argparse.Namespace) -> int:
         "samples": fit["samples"],
         "intervals": fit["intervals"],
         "r_squared": fit["r_squared"],
+        "identified": fit["identified"],
         "usable": fit["usable"],
         "unit": "percent_per_mtok",
         "bucket_hours": args.calibrate_bucket_hours,
+        "fallback_scale": fit["fallback_scale"],
+        "diagnostics": fit["diagnostics"],
         "codex": {"unit": "percent_per_mtok", "models": fit["models"]},
     }
     fitted = fit["models"]
@@ -2944,15 +3077,29 @@ def command_calibrate(args: argparse.Namespace) -> int:
             "bold",
         )
     )
-    print("%-22s %-14s %14s %14s" % ("model", "kind", "fit %/Mtok", "default units"))
+    print(
+        "fallback scale %.8f %%/rate-card unit; unidentified coefficients use it"
+        % fit["fallback_scale"]
+    )
+    print("%-22s %-14s %14s %8s %8s %6s %s" % (
+        "model", "kind", "fit %/Mtok", "buckets", "share", "corr", "status"))
     for model in sorted(fitted):
-        entry = weights.model_entry("codex", model) or {}
         for kind in CODEX_FIT_KINDS:
             if kind not in fitted[model]:
                 continue
+            value = fitted[model][kind]
+            note = fit["diagnostics"][model][kind]
             print(
-                "%-22s %-14s %14.6f %14.2f"
-                % (model, kind, fitted[model][kind], float(entry.get(kind, 0.0)))
+                "%-22s %-14s %14s %8d %7.1f%% %6.2f %s"
+                % (
+                    model,
+                    kind,
+                    "-" if value is None else "%.6f" % value,
+                    note["buckets"],
+                    100.0 * note["token_share"],
+                    note["max_correlation"],
+                    ", ".join(note["reasons"]) or "identified",
+                )
             )
     print("saved to %s" % destination)
     return 0
@@ -3040,6 +3187,10 @@ def calibrate_claude(args: argparse.Namespace, analysis: "Analysis") -> int:
         fit = fit_percent_weights(usable, args.calibrate_bucket_hours)
         if fit is None:
             continue
+        fit["models"] = dict(
+            (model, dict((kind, value) for kind, value in entry.items()))
+            for model, entry in fit["models"].items()
+        )
         fit["dollars_per_percent"] = claude_dollars_per_percent()
         results[window] = fit
     if not results:
@@ -3074,12 +3225,23 @@ def calibrate_claude(args: argparse.Namespace, analysis: "Analysis") -> int:
                                           "implied x"))
         for model in sorted(result["models"]):
             entry = result["models"][model]
-            uncached = entry.get("input", 0.0)
-            cached = entry.get("cache_read", 0.0)
-            implied = (cached / uncached) if uncached > 0 else float("nan")
+            uncached = entry.get("input")
+            cached = entry.get("cache_read")
+            implied = (
+                (cached / uncached)
+                if isinstance(uncached, (int, float))
+                and isinstance(cached, (int, float))
+                and uncached > 0
+                else None
+            )
             print(
-                "  %-22s %14.6f %14.6f %10.3f"
-                % (model, uncached, cached, implied)
+                "  %-22s %14s %14s %10s"
+                % (
+                    model,
+                    "-" if uncached is None else "%.6f" % uncached,
+                    "-" if cached is None else "%.6f" % cached,
+                    "-" if implied is None else "%.3f" % implied,
+                )
             )
         print(
             "  list price puts cache reads at 0.1x input (0.025x on Fable 5.1); "
