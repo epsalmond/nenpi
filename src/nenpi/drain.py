@@ -1276,13 +1276,19 @@ class Interval:
 
 
 def resets_bucket(value: Any) -> Any:
-    """Collapse the +/- 1s jitter Codex writes into `resets_at`.
+    """Collapse the jitter both vendors put in `resets_at`.
 
-    Consecutive readings of the same window differ by a second or two, so a
-    raw equality test reads every line as a fresh window rollover.
+    Codex writes Unix seconds that move by a second or two between readings;
+    Claude writes an ISO timestamp whose microseconds differ on every poll. A
+    raw equality test reads either as a fresh window rollover on every line,
+    which inflates measured drain by more than an order of magnitude.
     """
     if isinstance(value, (int, float)):
         return int(round(float(value) / 60.0))
+    if isinstance(value, str):
+        epoch = parse_timestamp(value)
+        if epoch is not None:
+            return int(round(epoch / 60.0))
     return value
 
 
@@ -2661,6 +2667,7 @@ def command_calibrate(args: argparse.Namespace) -> int:
             "is needed before these weights mean anything" % fit["r_squared"]
         )
     payload = {
+        "schema": JSON_SCHEMA,
         "version": 1,
         "fitted_at": time.time(),
         "samples": fit["samples"],

@@ -159,9 +159,11 @@ attributed to the same window instance.
 
 Two details matter and are easy to get wrong:
 
-- **`resets_at` jitters by a second or two between readings.** Comparing it
-  exactly makes every line look like a window rollover and inflates drain by
-  more than an order of magnitude. The tool buckets `resets_at` to the nearest
+- **`resets_at` jitters between readings, in both harnesses.** Codex moves its
+  Unix seconds by a second or two; Claude stamps fresh microseconds onto its
+  ISO timestamp on every poll. Comparing either exactly makes every reading
+  look like a window rollover and inflates drain by more than an order of
+  magnitude. The tool parses both forms and buckets them to the nearest
   minute.
 - **`used_percent` is reported in whole percent.** A 1% step covers everything
   since the previous change, so the tool spans each interval back to the last

@@ -7,6 +7,7 @@ data and must never be copied into this repository.
 
 from __future__ import annotations
 
+import contextlib
 import importlib.machinery
 import importlib.util
 import json
@@ -312,6 +313,27 @@ class Harness(unittest.TestCase):
             for line in lines:
                 handle.write(line + "\n")
         return path
+
+    @contextlib.contextmanager
+    def env_applied(self):
+        """Apply the temp-dir overrides to this process.
+
+        In-process calls into the module would otherwise read the real
+        ~/.claude, ~/.cache and ~/.local/state of whoever runs the tests.
+        """
+        saved = dict(os.environ)
+        os.environ.update(
+            dict(
+                (key, value)
+                for key, value in self.environment.items()
+                if key.startswith("QUOTA_DRAIN_")
+            )
+        )
+        try:
+            yield
+        finally:
+            os.environ.clear()
+            os.environ.update(saved)
 
     def run_tool(self, *arguments: str, stdin: Optional[bytes] = None) -> subprocess.CompletedProcess:
         return subprocess.run(
@@ -736,6 +758,7 @@ class Calibration(Harness):
         payload = self.run_json(
             "calibrate", "--harness", "codex", "--json", "--calibrate-bucket-hours", "0.01"
         )
+        self.assertEqual(payload["schema"], 1)
         self.assertGreater(payload["samples"], 6)
         self.assertGreater(payload["r_squared"], 0.99)
         fitted = payload["codex"]["models"]
@@ -1459,24 +1482,15 @@ class OauthSampler(Harness):
             return FakeResponse(body.encode("utf-8"))
 
         original = urllib.request.urlopen
-        environment = dict(os.environ)
-        os.environ.update(
-            {
-                key: value
-                for key, value in self.environment.items()
-                if key.startswith("QUOTA_DRAIN_")
-            }
-        )
         urllib.request.urlopen = fake_urlopen
         stdout = sys.stdout
         sys.stdout = io.StringIO()
         try:
-            QD.main(list(args_list))
+            with self.env_applied():
+                QD.main(list(args_list))
         finally:
             sys.stdout = stdout
             urllib.request.urlopen = original
-            os.environ.clear()
-            os.environ.update(environment)
         self.captured = captured
         path = self.root / "state" / "snapshots.jsonl"
         if not path.is_file():
@@ -1598,6 +1612,40 @@ class ClaudeCalibration(Harness):
         self.assertLess(abs(fitted["input"] - input_rate) / input_rate, 0.05)
         self.assertLess(abs(fitted["cache_read"] - cache_rate) / cache_rate, 0.05)
         self.assertGreater(payload["windows"]["five_hour"]["r_squared"], 0.99)
+
+    def test_iso_resets_at_jitter_is_not_a_rollover(self) -> None:
+        # Claude stamps resets_at with fresh microseconds on every poll; a raw
+        # equality test reads each one as a new window and reports the whole
+        # utilisation as drain.
+        now = time.time() - 3600
+        path = self.root / "state" / "snapshots.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as handle:
+            for index, (offset, percent, micro) in enumerate(
+                ((0, 18.0, "104305"), (600, 20.0, "310581"), (1200, 23.0, "887001"))
+            ):
+                handle.write(
+                    json.dumps(
+                        {
+                            "source": "oauth",
+                            "config_dir": ".claude",
+                            "ts": now + offset,
+                            "windows": {
+                                "five_hour": {
+                                    "utilization_percent": percent,
+                                    "resets_at": "2026-09-16T21:30:00.%s+00:00" % micro,
+                                }
+                            },
+                        }
+                    )
+                    + "\n"
+                )
+        with self.env_applied():
+            rows = QD.load_claude_snapshots("five_hour")
+        intervals = QD.build_intervals(rows, None)
+        self.assertEqual(len(intervals), 2)
+        self.assertEqual([interval.rollover for interval in intervals], [False, False])
+        self.assertEqual([interval.drain for interval in intervals], [2.0, 3.0])
 
     def test_calibrate_without_snapshots_explains_itself(self) -> None:
         result = self.run_tool("calibrate", "--harness", "claude")
