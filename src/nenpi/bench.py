@@ -918,16 +918,21 @@ def fit_weights(estimates: Sequence[Mapping[str, Any]]) -> Optional[Dict[str, An
         target,
         (_QD.builtin_weights().get("claude") or {}),
     )
+    # An exact interpolation explains nothing: with one row per column the fit
+    # passes through every point whatever the weights are, so a usable fit
+    # needs at least one row the solver could have failed on.
+    freedom = len(rows) - len(ordered)
     return {
         "samples": len(rows),
         "intervals": len(rows),
         "columns": len(ordered),
+        "degrees_of_freedom": freedom,
         "underdetermined": underdetermined,
         "r_squared": score,
         "residual_relative": relative,
         "identified": identified,
         "fallback_scale": scale,
-        "usable": explained and identified > 0 and not underdetermined,
+        "usable": explained and identified > 0 and freedom >= 1,
         "models": fitted,
         "diagnostics": diagnostics,
         "residuals": residuals,
@@ -937,11 +942,19 @@ def fit_weights(estimates: Sequence[Mapping[str, Any]]) -> Optional[Dict[str, An
 def weights_payload(fit: Mapping[str, Any], window: str, run_id: str) -> Dict[str, Any]:
     """The shape `quota-drain calibrate --harness claude` reports.
 
-    The top-level `claude` section mirrors the `codex` section of
-    `codex-weights.json` so `merge_weights` can consume it unchanged; the
-    `windows` section mirrors the `calibrate --harness claude` payload.
+    The top-level `claude` section is what `merge_weights` consumes, so it
+    carries measured numbers only: a kind the fit could not identify is left
+    out entirely and keeps its built-in price. The nulls and their reasons live
+    in the `fit` section, which is a record of the run rather than a price
+    table.
     """
-    models = dict((name, dict(entry)) for name, entry in fit["models"].items())
+    models = {}  # type: Dict[str, Dict[str, float]]
+    for name, entry in fit["models"].items():
+        measured = dict((kind, float(value)) for kind, value in entry.items()
+                        if isinstance(value, (int, float)))
+        if measured:
+            models[name] = measured
+    fit_models = dict((name, dict(entry)) for name, entry in fit["models"].items())
     window_fit = {
         "samples": fit["samples"],
         "intervals": fit["intervals"],
@@ -950,7 +963,7 @@ def weights_payload(fit: Mapping[str, Any], window: str, run_id: str) -> Dict[st
         "identified": fit["identified"],
         "fallback_scale": fit["fallback_scale"],
         "usable": fit["usable"],
-        "models": models,
+        "models": fit_models,
         "diagnostics": fit["diagnostics"],
     }
     return {
@@ -968,8 +981,11 @@ def weights_payload(fit: Mapping[str, Any], window: str, run_id: str) -> Dict[st
         "residual_relative": fit["residual_relative"],
         "identified": fit["identified"],
         "fallback_scale": fit["fallback_scale"],
+        "degrees_of_freedom": fit["degrees_of_freedom"],
         "usable": fit["usable"],
         "claude": {"unit": "percent_per_mtok", "models": models},
+        "fit": {"unit": "percent_per_mtok", "models": fit_models,
+                "diagnostics": fit["diagnostics"]},
         "windows": {window: window_fit},
     }
 
@@ -1008,6 +1024,9 @@ def planning_weights(args: argparse.Namespace) -> Tuple[Dict[str, Dict[str, floa
         else:
             section = (payload.get("claude") or {}) if isinstance(payload, Mapping) else {}
             models = section.get("models") if isinstance(section, Mapping) else None
+            if isinstance(payload, Mapping) and not payload.get("usable"):
+                warn("ignoring %s: the stored fit is not usable" % fit_file)
+                models = None
             if isinstance(models, Mapping) and models:
                 scale = float(payload.get("fallback_scale") or 0.0)
                 scaled = list_price_weights(1.0 / scale) if scale > 0 else {}
@@ -1248,13 +1267,20 @@ def write_report(run_id: str, meta: Mapping[str, Any], records: Sequence[Mapping
         json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
     if fit is not None and not args.no_write_weights:
-        destination = _QD.state_dir() / "claude-weights.json"
+        # Only a usable fit becomes the weights file readers price with. An
+        # unusable one is still worth keeping, under a name nothing loads.
+        name = "claude-weights.json" if fit["usable"] else "claude-weights.unusable.json"
+        destination = _QD.state_dir() / name
         destination.parent.mkdir(parents=True, exist_ok=True)
         destination.write_text(
             json.dumps(weights_payload(fit, window, run_id), indent=2, sort_keys=True) + "\n",
             encoding="utf-8",
         )
         payload["weights_file"] = str(destination)
+        if not fit["usable"]:
+            warn("fit is not usable (%d of %d columns identified, %d degrees of freedom); "
+                 "wrote %s and left claude-weights.json alone"
+                 % (fit["identified"], fit["columns"], fit["degrees_of_freedom"], destination))
     if args.json:
         print(json.dumps(payload, indent=2, sort_keys=True))
         return EXIT_OK

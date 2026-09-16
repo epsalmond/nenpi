@@ -615,6 +615,57 @@ class Fitting(Harness):
             payload["claude"]["models"]["claude-haiku-4-5"]["input"],
         )
 
+    def test_an_unidentified_kind_is_left_out_of_the_price_table(self) -> None:
+        # input and cache_read move together across every scenario, so neither
+        # can be separated from the other; output can.
+        model = "claude-opus-5"
+        fit = QB.fit_weights([
+            {"key": "a", "percent": 1.0, "contaminated": False, "bracketed": True,
+             "models": {model: {"input": 1_000_000.0, "cache_read": 1_000_000.0,
+                                "output": 100_000.0}}},
+            {"key": "b", "percent": 2.0, "contaminated": False, "bracketed": True,
+             "models": {model: {"input": 2_000_000.0, "cache_read": 2_000_000.0,
+                                "output": 500_000.0}}},
+            {"key": "c", "percent": 3.0, "contaminated": False, "bracketed": True,
+             "models": {model: {"input": 3_000_000.0, "cache_read": 3_000_000.0,
+                                "output": 200_000.0}}},
+        ])
+        payload = QB.weights_payload(fit, "five_hour", "run")
+        self.assertIsNone(payload["fit"]["models"][model]["cache_read"])
+        self.assertIn("collinear", fit["diagnostics"][model]["cache_read"]["reasons"])
+        self.assertNotIn("cache_read", payload["claude"]["models"][model])
+        # The section quota-drain merges must price without error, and an
+        # omitted kind keeps its built-in price rather than becoming free.
+        merged = QD.builtin_weights()
+        QD.merge_weights(merged, {"claude": payload["claude"]})
+        units = QD.Weights(merged, ["test"]).claude_units(
+            model, {"cache_read": 1_000_000}, None
+        )
+        self.assertAlmostEqual(units, 0.5)
+
+    def test_an_unusable_fit_does_not_become_the_weights_file(self) -> None:
+        self.run_scenarios("--models", "claude-haiku-4-5", "--contexts", "10k",
+                           "--cache", "warm")
+        state = self.root / "state"
+        self.assertFalse((state / "claude-weights.json").exists())
+        self.assertTrue((state / "claude-weights.unusable.json").exists())
+        payload = json.loads((state / "claude-weights.unusable.json").read_text())
+        self.assertFalse(payload["usable"])
+
+    def test_an_exact_interpolation_is_not_usable(self) -> None:
+        # Three rows and three columns pass through every point whatever the
+        # weights are, so the fit has nothing to be wrong about.
+        rows = [
+            {"key": "a", "percent": 1.0, "contaminated": False, "bracketed": True,
+             "models": {"m": {"input": 1_000_000.0}}},
+            {"key": "b", "percent": 2.0, "contaminated": False, "bracketed": True,
+             "models": {"m": {"input": 2_000_000.0}}},
+        ]
+        fit = QB.fit_weights(rows[:1])
+        self.assertEqual(fit["degrees_of_freedom"], 0)
+        self.assertFalse(fit["usable"])
+        self.assertTrue(QB.fit_weights(rows)["usable"])
+
     def test_report_replays_the_stored_run(self) -> None:
         first = self.run_three_scenarios()
         run_id = first["run_id"]
