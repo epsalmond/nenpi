@@ -19,12 +19,14 @@ quota-drain reads: ``HOME_DIR``, ``CACHE_DIR``, ``STATE_DIR``, ``CONFIG_DIR``.
 from __future__ import annotations
 
 import argparse
+import atexit
 import importlib.machinery
 import importlib.util
 import json
 import math
 import random
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -220,21 +222,27 @@ def scenario_task(scenario: Scenario) -> str:
     return LONG_TASK if scenario.output == "long" else SHORT_TASK
 
 
-def expected_tokens(scenario: Scenario, first_call: bool) -> Dict[str, float]:
-    """Per-call token mix a scenario is expected to produce, for planning only."""
+def expected_tokens(scenario: Scenario, first_call: bool,
+                    cold_as_creation: bool = True) -> Dict[str, float]:
+    """Per-call token mix a scenario is expected to produce, for planning only.
+
+    Claude Code sets cache breakpoints on its own prefix, so a call that sends
+    a prefix the cache has not seen is expected to pay cache creation at 1.25x
+    rather than plain input. That is the conservative reading and it is
+    unverified; `--cold-as-creation` turns it off.
+    """
     context = float(scenario.context_tokens)
     output = float(LONG_OUTPUT_TOKENS if scenario.output == "long" else SHORT_OUTPUT_TOKENS)
     tokens = {"input": 0.0, "cache_read": 0.0, "cache_write_5m": 0.0,
               "cache_write_1h": 0.0, "output": output}
-    if scenario.cache == "warm" and not first_call:
+    fresh_prefix = scenario.cache != "warm" or first_call
+    if not fresh_prefix:
         tokens["cache_read"] = context
         tokens["input"] = 200.0
-    elif scenario.cache == "warm":
-        tokens["cache_write_5m"] = context
-    elif scenario.cache == "write-heavy":
-        tokens["cache_write_5m"] = context
-    else:
+    elif scenario.cache == "cold" and not cold_as_creation:
         tokens["input"] = context
+    else:
+        tokens["cache_write_5m"] = context
     return tokens
 
 
@@ -513,10 +521,23 @@ def parse_result(payload: Mapping[str, Any], fallback_model: str) -> Optional[Ca
     )
 
 
+def call_flags(args: argparse.Namespace) -> List[str]:
+    """The flags every benchmark call carries, recorded in meta.json.
+
+    A tool call would add turns and tokens this scenario did not ask for, so
+    the built-in tools are switched off. `--tools ""` is the documented way to
+    do that on 2.1.273; that build's `--help` lists no turn limit, and with no
+    tools there is nothing for a second turn to do.
+    """
+    flags = ["--output-format", "json", "--strict-mcp-config"]
+    if not args.allow_tools:
+        flags += ["--tools", ""]
+    return flags
+
+
 def run_call(scenario: Scenario, prompt: str, system_file: Optional[Path],
              args: argparse.Namespace, workdir: Path) -> Optional[CallResult]:
-    command = [args.claude, "-p", "--output-format", "json", "--model", scenario.model,
-               "--strict-mcp-config"]
+    command = [args.claude, "-p", "--model", scenario.model] + call_flags(args)
     if system_file is not None:
         command += ["--system-prompt-file", str(system_file)]
     command += list(args.claude_arg)
@@ -571,6 +592,7 @@ class ScenarioRun:
         self.contaminated_by = []  # type: List[str]
         self.contamination_reasons = []  # type: List[str]
         self.rollover = False
+        self.warm_drift = False
         self.start_percent = None  # type: Optional[float]
         self.measured_context = None  # type: Optional[int]
         self.models = {}  # type: Dict[str, Dict[str, int]]
@@ -633,6 +655,7 @@ class ScenarioRun:
             "contaminated": bool(self.contaminated_by or self.contamination_reasons),
             "contaminated_by": list(self.contaminated_by),
             "contamination_reasons": list(self.contamination_reasons),
+            "warm_drift": self.warm_drift,
             "window_rollover": self.rollover,
         }
 
@@ -678,6 +701,7 @@ def run_scenario(scenario: Scenario, args: argparse.Namespace, sampler: Sampler,
     state = ScenarioRun(scenario)
     warm_filler = filler_text(scenario.context_tokens, seed=hash_seed(scenario.key))
     last_started = None  # type: Optional[float]
+    last_finished = None  # type: Optional[float]
     seen = sampler.latest
     last_percent = seen.percent(args.window) if seen is not None else None
     state.start_percent = last_percent
@@ -754,16 +778,27 @@ def run_scenario(scenario: Scenario, args: argparse.Namespace, sampler: Sampler,
             prompt = filler + "\n\n" + scenario_task(scenario)
 
         last_started = time.time()
+        # A warm scenario means "the prefix is still cached". Past the TTL it
+        # is not, whatever the label says, so the drift is recorded and the
+        # scenario stays out of the fit.
+        cache_ttl_risk = (
+            scenario.cache == "warm"
+            and last_finished is not None
+            and last_started - last_finished > WARM_MAX_GAP_SECONDS
+        )
+        if cache_ttl_risk:
+            state.warm_drift = True
         call = run_call(scenario, prompt, system_file, args, workdir)
         if call is None:
             state.stop_reason = "call-failed"
             break
+        last_finished = call.ended
         state.absorb(call)
         if call.session_id and call.session_id not in own_sessions:
             own_sessions.append(call.session_id)
 
         poll()
-        write_call_line(calls_log, scenario, call, sampler.latest)
+        write_call_line(calls_log, scenario, call, sampler.latest, cache_ttl_risk)
 
     state.ended = time.time()
     return state
@@ -777,7 +812,7 @@ def hash_seed(text: str) -> int:
 
 
 def write_call_line(handle, scenario: Scenario, call: CallResult,
-                    sample: Optional[Sample]) -> None:
+                    sample: Optional[Sample], cache_ttl_risk: bool = False) -> None:
     """One line per call. Usage and timing only; never prompt text."""
     record = {
         "scenario": scenario.key,
@@ -789,6 +824,7 @@ def write_call_line(handle, scenario: Scenario, call: CallResult,
         "models": dict((name, dict(counts)) for name, counts in call.models.items()),
         "cost_usd": call.cost,
         "session_id": call.session_id,
+        "cache_ttl_risk": cache_ttl_risk,
     }
     if sample is not None:
         record["sample"] = sample.as_json()
@@ -1098,33 +1134,41 @@ def planning_weights(args: argparse.Namespace) -> Tuple[Dict[str, Dict[str, floa
 
 
 def projected_percent(scenario: Scenario, weights: Mapping[str, Mapping[str, float]],
-                      first_call: bool) -> float:
+                      first_call: bool, cold_as_creation: bool = True) -> float:
     entry = weights.get(scenario.normalized_model) or {}
-    tokens = expected_tokens(scenario, first_call)
+    tokens = expected_tokens(scenario, first_call, cold_as_creation)
     return sum(value / 1_000_000.0 * float(entry.get(kind, 0.0)) for kind, value in tokens.items())
 
 
 def project(scenarios: Sequence[Scenario], args: argparse.Namespace
             ) -> Tuple[List[Dict[str, Any]], str]:
     weights, source = planning_weights(args)
+    cold_as_creation = not args.no_cold_as_creation
     projections = []
     for scenario in scenarios:
-        per_call = projected_percent(scenario, weights, first_call=False)
+        per_call = projected_percent(scenario, weights, False, cold_as_creation)
+        # The first call of a warm or write-heavy scenario pays cache creation
+        # at 1.25x rather than a cache read, so it is priced on its own.
+        first = projected_percent(scenario, weights, True, cold_as_creation)
         # One percent beyond the requested ticks: the partial percent before the
         # first tick is discarded, so it still has to be paid for.
         wanted = float(args.ticks) + 1.0
-        needed = int(math.ceil(wanted / per_call)) if per_call > 0 else args.max_calls
+        if per_call > 0:
+            needed = 1 + int(math.ceil(max(0.0, wanted - first) / per_call))
+        else:
+            needed = args.max_calls
         needed = max(1, needed)
         calls = min(needed, args.max_calls)
         projections.append(
             {
                 "scenario": scenario,
                 "percent_per_call": per_call,
+                "percent_first_call": first,
                 "calls": calls,
                 "calls_needed": needed,
                 "capped": needed > args.max_calls,
-                "percent": per_call * calls,
-                "tokens_per_call": expected_tokens(scenario, first_call=False),
+                "percent": first + per_call * (calls - 1),
+                "tokens_per_call": expected_tokens(scenario, False, cold_as_creation),
             }
         )
     return projections, source
@@ -1158,8 +1202,11 @@ def render_plan(projections: Sequence[Mapping[str, Any]], source: str,
         lines.append("")
     lines.append("projected five_hour spend %.2f%% against --max-percent %.2f%%"
                  % (total, args.max_percent))
-    lines.append("projected weekly spend    %.2f%% against --max-percent-weekly %.2f%%"
-                 % (total, args.max_percent_weekly))
+    # The weekly cap is in percent of the seven-day window, which the same
+    # tokens move by a different and unknown amount. It is enforced from
+    # measured samples during the run, not projected here.
+    lines.append("weekly spend is not projected; --max-percent-weekly %.2f%% is enforced "
+                 "from live samples" % args.max_percent_weekly)
     if total > args.max_percent:
         lines.append("OVER BUDGET: raise --max-percent, cut scenarios, or lower --ticks")
     return lines
@@ -1369,6 +1416,7 @@ def command_plan(args: argparse.Namespace) -> int:
                         "output": item["scenario"].output,
                         "projected_calls": item["calls"],
                         "projected_percent_per_call": item["percent_per_call"],
+                        "projected_percent_first_call": item["percent_first_call"],
                         "projected_percent": item["percent"],
                         "expected_tokens_per_call": item["tokens_per_call"],
                     }
@@ -1385,6 +1433,31 @@ def command_plan(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def install_workdir_cleanup(workdir: Path) -> None:
+    """Remove the filler scratch directory even when the run is killed."""
+    def remove(*_: Any) -> None:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+    atexit.register(remove)
+    for name in ("SIGTERM", "SIGINT", "SIGHUP"):
+        number = getattr(signal, name, None)
+        if number is None:
+            continue
+        previous = signal.getsignal(number)
+
+        def handler(signum: int, frame: Any, previous=previous) -> None:
+            remove()
+            if callable(previous):
+                previous(signum, frame)
+            else:
+                raise SystemExit(128 + signum)
+
+        try:
+            signal.signal(number, handler)
+        except (OSError, ValueError):  # not the main thread, or unsupported
+            continue
+
+
 def command_run(args: argparse.Namespace) -> int:
     scenarios = build_scenarios(args)
     projections, source = project(scenarios, args)
@@ -1393,6 +1466,13 @@ def command_run(args: argparse.Namespace) -> int:
     print("")
     if not args.yes:
         warn("every percent above is real quota; re-run with --yes to spend it")
+        return EXIT_USAGE
+    projected = sum(item["percent"] for item in projections)
+    if projected > args.max_percent and not args.force_projection:
+        warn("the projection (%.2f%%) already exceeds --max-percent (%.2f%%); the run "
+             "would abort part way through. Cut scenarios, lower --ticks, raise the cap, "
+             "or pass --force-projection to start anyway"
+             % (projected, args.max_percent))
         return EXIT_USAGE
     if shutil.which(args.claude) is None and not Path(args.claude).is_file():
         warn("no claude executable at %r" % args.claude)
@@ -1428,7 +1508,9 @@ def command_run(args: argparse.Namespace) -> int:
                  "window cannot be confirmed; nothing was spent")
             return EXIT_GUARD
 
-    run_id = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime(started))
+    # Two runs started in the same second must not share a directory.
+    run_id = "%s-%04x" % (time.strftime("%Y%m%dT%H%M%SZ", time.gmtime(started)),
+                          random.getrandbits(16))
     directory = run_dir(run_id)
     directory.mkdir(parents=True, exist_ok=True)
     meta = {
@@ -1441,6 +1523,12 @@ def command_run(args: argparse.Namespace) -> int:
         "sample_interval_s": args.sample_interval,
         "max_sample_age_s": max_sample_age,
         "filler_channel": args.filler_channel,
+        "claude_flags": call_flags(args),
+        # The values may carry anything the operator passed; only the shape of
+        # the extra arguments is recorded.
+        "claude_extra_args": len(args.claude_arg),
+        "claude_extra_args_redacted": bool(args.claude_arg),
+        "cold_as_creation": not args.no_cold_as_creation,
         "scenarios": [scenario.key for scenario in scenarios],
         "baseline": baseline.as_json(),
     }
@@ -1449,6 +1537,7 @@ def command_run(args: argparse.Namespace) -> int:
     )
 
     workdir = Path(tempfile.mkdtemp(prefix="quota-bench-"))
+    install_workdir_cleanup(workdir)
     records = []  # type: List[Dict[str, Any]]
     status = EXIT_OK
     try:
@@ -1547,6 +1636,9 @@ def add_scenario_arguments(parser: argparse.ArgumentParser) -> None:
                         default=DEFAULT_MAX_PERCENT_WEEKLY, metavar="PCT")
     parser.add_argument("--max-calls", type=int, default=DEFAULT_MAX_CALLS, metavar="N")
     parser.add_argument("--usd-per-percent", type=float, default=None, metavar="USD")
+    parser.add_argument("--no-cold-as-creation", action="store_true",
+                        help="project cold calls as uncached input rather than cache "
+                             "creation (the default is the conservative 1.25x)")
     parser.add_argument("--json", action="store_true")
 
 
@@ -1582,6 +1674,10 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--require-idle", action="store_true",
                      help="refuse to start while another Claude session is active")
     run.add_argument("--claude", default="claude", metavar="PATH")
+    run.add_argument("--allow-tools", action="store_true",
+                     help="leave the built-in tools enabled (they add turns and tokens)")
+    run.add_argument("--force-projection", action="store_true",
+                     help="start even though the projection already exceeds --max-percent")
     run.add_argument("--claude-arg", action="append", default=[], metavar="ARG",
                      help="extra argument for every claude call; repeatable")
     run.add_argument("--config-dir", action="append", default=[], metavar="PATH",

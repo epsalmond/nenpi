@@ -360,6 +360,53 @@ class Planning(Harness):
         self.assertEqual(result.returncode, 0)
         self.assertIn(b"needs more calls", result.stdout)
 
+    def test_the_first_call_of_a_warm_scenario_is_priced_as_cache_creation(self) -> None:
+        payload = self.bench_json("plan", "--models", "claude-haiku-4-5", "--contexts", "150k",
+                                  "--cache", "warm", "--json")
+        row = payload["scenarios"][0]
+        # 150K tokens written at 1.25x costs far more than reading them at 0.1x.
+        self.assertGreater(row["projected_percent_first_call"],
+                           row["projected_percent_per_call"] * 5)
+        self.assertAlmostEqual(
+            row["projected_percent"],
+            row["projected_percent_first_call"]
+            + row["projected_percent_per_call"] * (row["projected_calls"] - 1),
+            places=6,
+        )
+
+    def test_cold_is_projected_as_cache_creation_by_default(self) -> None:
+        conservative = self.bench_json("plan", "--models", "claude-haiku-4-5",
+                                       "--contexts", "60k", "--cache", "cold", "--json")
+        plain = self.bench_json("plan", "--models", "claude-haiku-4-5", "--contexts", "60k",
+                                "--cache", "cold", "--no-cold-as-creation", "--json")
+        self.assertAlmostEqual(
+            conservative["scenarios"][0]["projected_percent_per_call"]
+            / plain["scenarios"][0]["projected_percent_per_call"],
+            1.25,
+            places=2,
+        )
+
+    def test_the_weekly_cap_is_not_projected_in_five_hour_percent(self) -> None:
+        result = self.bench("plan", "--models", "claude-haiku-4-5", "--contexts", "10k")
+        self.assertNotIn(b"projected weekly spend", result.stdout)
+        self.assertIn(b"enforced from live samples", result.stdout)
+
+    def test_run_refuses_a_projection_over_the_cap(self) -> None:
+        result = self.bench(
+            "run", "--yes", "--quota-drain", str(self.fake_drain), "--sample-interval", "0",
+            "--models", "claude-haiku-4-5", "--contexts", "150k", "--cache", "cold",
+            "--max-percent", "0.01",
+        )
+        self.assertEqual(result.returncode, QB.EXIT_USAGE)
+        self.assertIn(b"already exceeds --max-percent", result.stderr)
+        self.assertEqual(self.fake_calls(), [])
+        forced = self.bench(
+            "run", "--yes", "--force-projection", "--quota-drain", str(self.fake_drain),
+            "--sample-interval", "0", "--models", "claude-haiku-4-5", "--contexts", "150k",
+            "--cache", "cold", "--max-percent", "0.01",
+        )
+        self.assertEqual(forced.returncode, QB.EXIT_BUDGET)
+
     def test_run_refuses_without_yes(self) -> None:
         result = self.bench("run", "--quota-drain", str(self.fake_drain),
                             "--models", "claude-haiku-4-5", "--contexts", "10k")
@@ -781,6 +828,43 @@ class Hygiene(Harness):
         self.assertGreater(len(calls), 1)
         # Every cold call is a cache miss, so the fake never bills a cache read.
         self.assertTrue(all(call["tokens"]["cache_read"] == 0 for call in calls))
+
+    def test_calls_run_with_the_built_in_tools_off(self) -> None:
+        self.run_scenarios("--models", "claude-haiku-4-5", "--contexts", "10k",
+                           "--cache", "warm")
+        argv = self.fake_calls()[0]["argv"]
+        self.assertIn("--tools", argv)
+        self.assertEqual(argv[argv.index("--tools") + 1], "")
+        self.assertIn("--strict-mcp-config", argv)
+        runs = sorted((self.root / "state" / "bench").iterdir())
+        meta = json.loads((runs[-1] / "meta.json").read_text(encoding="utf-8"))
+        self.assertIn("--tools", meta["claude_flags"])
+        self.assertEqual(meta["claude_extra_args"], 0)
+        self.assertFalse(meta["claude_extra_args_redacted"])
+
+    def test_run_ids_do_not_collide_within_a_second(self) -> None:
+        for _ in range(2):
+            self.run_scenarios("--models", "claude-haiku-4-5", "--contexts", "10k",
+                               "--cache", "warm", "--max-calls", "1")
+        self.assertEqual(len(list((self.root / "state" / "bench").iterdir())), 2)
+
+    def test_a_warm_call_past_the_cache_ttl_is_marked_and_dropped(self) -> None:
+        estimate = QB.estimate_scenario(
+            {
+                "key": "m/10k/warm/short", "model": "m", "context": "10k", "cache": "warm",
+                "output": "short", "calls": 4, "start_percent": 0.0, "warm_drift": True,
+                "ticks": [
+                    {"ts": 1.0, "percent": 1.0, "calls": 2, "tokens": {"input": 10},
+                     "models": {"m": {"input": 10}}},
+                    {"ts": 2.0, "percent": 2.0, "calls": 4, "tokens": {"input": 20},
+                     "models": {"m": {"input": 20}}},
+                ],
+            },
+            required_ticks=2,
+        )
+        self.assertTrue(estimate["warm_drift"])
+        self.assertIsNone(QB.fit_weights([estimate]))
+        self.assertIsNotNone(QB.fit_weights([estimate], include_drifted=True))
 
     def test_system_prompt_file_channel_passes_the_flag(self) -> None:
         self.run_scenarios("--models", "claude-haiku-4-5", "--contexts", "10k",
