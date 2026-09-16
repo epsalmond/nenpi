@@ -467,6 +467,29 @@ class Fitting(Harness):
         self.assertLess(report["fit"]["residual_relative"], 0.01)
         self.assertTrue(report["fit"]["usable"])
         self.assertFalse(report["fit"]["underdetermined"])
+        self.assertEqual(report["fit"]["identified"], 3)
+        self.assertGreater(report["fit"]["fallback_scale"], 0.0)
+        for kind in ("input", "cache_read", "output"):
+            diagnostic = report["fit"]["diagnostics"]["claude-haiku-4-5"][kind]
+            self.assertFalse(diagnostic["unidentified"], diagnostic["reasons"])
+
+    def test_an_unidentifiable_coefficient_is_null_not_zero(self) -> None:
+        # One scenario cannot separate three kinds; a confident zero there would
+        # price a kind as free, so the fit stores null instead.
+        result = self.run_scenarios("--models", "claude-haiku-4-5", "--contexts", "10k",
+                                    "--cache", "warm")
+        self.assertEqual(result.returncode, 0, result.stderr.decode("utf-8", "replace"))
+        fit = self.latest_report()["fit"]
+        self.assertTrue(fit["underdetermined"])
+        self.assertFalse(fit["usable"])
+        self.assertEqual(fit["identified"], 0)
+        entry = fit["models"]["claude-haiku-4-5"]
+        self.assertIsNone(entry["cache_read"])
+        self.assertIn("too few scenarios",
+                      fit["diagnostics"]["claude-haiku-4-5"]["cache_read"]["reasons"])
+        text = self.bench("report", "--ticks", "3",
+                          "--quota-drain", str(self.fake_drain)).stdout.decode("utf-8")
+        self.assertIn("unidentified (too few scenarios)", text)
 
     def test_weights_file_carries_the_quota_drain_shape(self) -> None:
         self.run_three_scenarios()

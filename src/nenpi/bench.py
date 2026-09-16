@@ -264,6 +264,9 @@ class Sampler:
         self.interval = interval
         self.last_attempt = 0.0
         self.latest = None  # type: Optional[Sample]
+        # The snapshot log holds two months of observations; a run only ever
+        # wants the newest, so every read is bounded to the recent tail.
+        self.since = time.time() - 3600.0
 
     def due(self, now: Optional[float] = None) -> bool:
         return (now or time.time()) - self.last_attempt >= self.interval
@@ -290,7 +293,7 @@ class Sampler:
         windows = {}
         stamp = None
         for window in ("five_hour", "seven_day"):
-            rows = self.qd.load_claude_snapshots(window)
+            rows = self.qd.load_claude_snapshots(window, since=self.since)
             if not rows:
                 continue
             row = rows[-1]
@@ -763,7 +766,15 @@ def estimate_scenario(record: Mapping[str, Any], required_ticks: int) -> Optiona
 
 
 def fit_weights(estimates: Sequence[Mapping[str, Any]]) -> Optional[Dict[str, Any]]:
-    """Non-negative least squares of measured percent against token features."""
+    """Non-negative least squares of measured percent against token features.
+
+    Coefficients the scenarios cannot separate are stored as null rather than
+    as a confident zero, the same way `quota-drain calibrate` does, because a
+    zero weight prices that model and kind as free. The identifiability rules
+    differ from quota-drain's: its rows are time buckets of whatever ran, while
+    these rows are designed scenarios, so a kind that appears in one scenario
+    is still identified as long as the system is not underdetermined.
+    """
     rows = [item for item in estimates if not item["contaminated"] and item["percent"] > 0]
     if not rows:
         return None
@@ -789,9 +800,38 @@ def fit_weights(estimates: Sequence[Mapping[str, Any]]) -> Optional[Dict[str, An
     # the same number of percents. R^2 is undefined against zero variance; the
     # relative residual is what says whether the fit explains the rows.
     score = _QD.r_squared(matrix, target, coefficients) if spread > 0 else None
-    fitted = {}  # type: Dict[str, Dict[str, float]]
-    for (model, kind), value in zip(ordered, coefficients):
-        fitted.setdefault(model, {})[kind] = value
+    underdetermined = len(rows) < len(ordered)
+    mass = [sum(row[column] for row in matrix) for column in range(len(ordered))]
+    total_mass = sum(mass) or 1.0
+    fitted = {}  # type: Dict[str, Dict[str, Optional[float]]]
+    diagnostics = {}  # type: Dict[str, Dict[str, Any]]
+    identified = 0
+    for column, (model, kind) in enumerate(ordered):
+        scenarios = sum(1 for row in matrix if row[column] > 0)
+        share = mass[column] / total_mass
+        correlation = 0.0
+        for other in range(len(ordered)):
+            if other != column:
+                correlation = max(correlation, _QD.column_correlation(matrix, column, other))
+        at_boundary = coefficients[column] <= 0.0
+        reasons = []
+        if correlation > 0.95:
+            reasons.append("collinear")
+        if at_boundary and share < 0.05:
+            reasons.append("at zero with little token mass")
+        if underdetermined and scenarios < 2:
+            reasons.append("too few scenarios")
+        diagnostics.setdefault(model, {})[kind] = {
+            "scenarios": scenarios,
+            "token_share": share,
+            "max_correlation": correlation,
+            "at_boundary": at_boundary,
+            "unidentified": bool(reasons),
+            "reasons": reasons,
+        }
+        fitted.setdefault(model, {})[kind] = None if reasons else coefficients[column]
+        if not reasons:
+            identified += 1
     residuals = []
     squared = 0.0
     for index, row in enumerate(rows):
@@ -804,16 +844,28 @@ def fit_weights(estimates: Sequence[Mapping[str, Any]]) -> Optional[Dict[str, An
              "predicted_percent": predicted, "residual": row["percent"] - predicted}
         )
     relative = math.sqrt(squared / len(rows)) / mean if mean > 0 else float("inf")
-    explained = score > 0.0 if score is not None else relative < 0.05
+    explained = score >= 0.5 if score is not None else relative < 0.05
+    scale = _QD.fit_fallback_scale(
+        [(row["percent"], dict(((model, kind), (row["models"].get(model) or {}).get(kind, 0.0)
+                                / 1_000_000.0)
+                               for model, kind in ordered))
+         for row in rows],
+        ordered,
+        target,
+        (_QD.builtin_weights().get("claude") or {}),
+    )
     return {
         "samples": len(rows),
         "intervals": len(rows),
         "columns": len(ordered),
-        "underdetermined": len(rows) < len(ordered),
+        "underdetermined": underdetermined,
         "r_squared": score,
         "residual_relative": relative,
-        "usable": explained and len(rows) >= len(ordered),
+        "identified": identified,
+        "fallback_scale": scale,
+        "usable": explained and identified > 0 and not underdetermined,
         "models": fitted,
+        "diagnostics": diagnostics,
         "residuals": residuals,
     }
 
@@ -831,8 +883,11 @@ def weights_payload(fit: Mapping[str, Any], window: str, run_id: str) -> Dict[st
         "intervals": fit["intervals"],
         "r_squared": fit["r_squared"],
         "residual_relative": fit["residual_relative"],
+        "identified": fit["identified"],
+        "fallback_scale": fit["fallback_scale"],
         "usable": fit["usable"],
         "models": models,
+        "diagnostics": fit["diagnostics"],
     }
     return {
         "schema": _QD.JSON_SCHEMA,
@@ -847,6 +902,8 @@ def weights_payload(fit: Mapping[str, Any], window: str, run_id: str) -> Dict[st
         "intervals": fit["intervals"],
         "r_squared": fit["r_squared"],
         "residual_relative": fit["residual_relative"],
+        "identified": fit["identified"],
+        "fallback_scale": fit["fallback_scale"],
         "usable": fit["usable"],
         "claude": {"unit": "percent_per_mtok", "models": models},
         "windows": {window: window_fit},
@@ -857,8 +914,27 @@ def weights_payload(fit: Mapping[str, Any], window: str, run_id: str) -> Dict[st
 # projection
 
 
+def list_price_weights(usd_per_percent: float) -> Dict[str, Dict[str, float]]:
+    models = {}
+    for name, price in _QD.CLAUDE_PRICES.items():
+        models[name] = {
+            "input": price[0] / usd_per_percent,
+            "cache_read": price[1] / usd_per_percent,
+            "cache_write_5m": price[2] / usd_per_percent,
+            "cache_write_1h": price[3] / usd_per_percent,
+            "output": price[4] / usd_per_percent,
+        }
+    return models
+
+
 def planning_weights(args: argparse.Namespace) -> Tuple[Dict[str, Dict[str, float]], str]:
-    """Percent per million tokens per model, best available source."""
+    """Percent per million tokens per model, best available source.
+
+    A stored fit carries null for every coefficient it could not identify.
+    Those fall back to the list price scaled onto the fitted unit, the way
+    quota-drain prices an unidentified Codex model, so the whole table stays on
+    one scale.
+    """
     fit_file = _QD.state_dir() / "claude-weights.json"
     if fit_file.is_file():
         try:
@@ -866,24 +942,25 @@ def planning_weights(args: argparse.Namespace) -> Tuple[Dict[str, Dict[str, floa
         except (OSError, ValueError) as error:
             warn("ignoring %s: %s" % (fit_file, error))
         else:
-            models = ((payload.get("claude") or {}).get("models")) if isinstance(payload, Mapping) else None
+            section = (payload.get("claude") or {}) if isinstance(payload, Mapping) else {}
+            models = section.get("models") if isinstance(section, Mapping) else None
             if isinstance(models, Mapping) and models:
-                return (
-                    dict((str(name), dict(entry)) for name, entry in models.items()),
-                    "fit at %s" % fit_file,
-                )
+                scale = float(payload.get("fallback_scale") or 0.0)
+                scaled = list_price_weights(1.0 / scale) if scale > 0 else {}
+                table = {}
+                for name, entry in models.items():
+                    priced = dict(scaled.get(str(name)) or {})
+                    for kind, value in entry.items():
+                        if isinstance(value, (int, float)):
+                            priced[kind] = float(value)
+                    if priced:
+                        table[str(name)] = priced
+                for name, priced in scaled.items():
+                    table.setdefault(name, priced)
+                if table:
+                    return table, "fit at %s" % fit_file
     usd = args.usd_per_percent or _QD.claude_dollars_per_percent() or PLANNING_USD_PER_PERCENT
-    source = "list price at %.2f USD per percent" % usd
-    models = {}
-    for name, price in _QD.CLAUDE_PRICES.items():
-        models[name] = {
-            "input": price[0] / usd,
-            "cache_read": price[1] / usd,
-            "cache_write_5m": price[2] / usd,
-            "cache_write_1h": price[3] / usd,
-            "output": price[4] / usd,
-        }
-    return models, source
+    return list_price_weights(usd), "list price at %.2f USD per percent" % usd
 
 
 def projected_percent(scenario: Scenario, weights: Mapping[str, Mapping[str, float]],
@@ -1001,9 +1078,13 @@ def render_report(meta: Mapping[str, Any], estimates: Sequence[Mapping[str, Any]
     lines.append("")
     quality = ("R^2 %.4f" % fit["r_squared"] if fit["r_squared"] is not None
                else "R^2 undefined (every scenario bracketed the same percent)")
-    lines.append("%s, relative residual %.4f over %d scenarios and %d columns%s"
-                 % (quality, fit["residual_relative"], fit["samples"], fit["columns"],
-                    "  (UNDERDETERMINED)" if fit["underdetermined"] else ""))
+    lines.append("%s, relative residual %.4f over %d scenarios, %d of %d columns identified%s"
+                 % (quality, fit["residual_relative"], fit["samples"], fit["identified"],
+                    fit["columns"], "  (UNDERDETERMINED)" if fit["underdetermined"] else ""))
+    if fit["fallback_scale"] > 0:
+        lines.append("")
+        lines.append("list-price scale: %.4f percent per USD (%.2f USD per percent)"
+                     % (fit["fallback_scale"], 1.0 / fit["fallback_scale"]))
     lines.append("")
     lines.append("| model | kind | %/Mtok | ratio to input | list ratio |")
     lines.append("| --- | --- | --- | --- | --- |")
@@ -1011,14 +1092,21 @@ def render_report(meta: Mapping[str, Any], estimates: Sequence[Mapping[str, Any]
                   "cache_write_1h": 2.0, "output": 5.0}
     for model in sorted(fit["models"]):
         entry = fit["models"][model]
-        base = entry.get("input", 0.0)
+        base = entry.get("input")
         for kind in _QD.CLAUDE_KINDS:
             if kind not in entry:
                 continue
-            ratio = (entry[kind] / base) if base > 0 else float("nan")
+            value = entry[kind]
+            if value is None:
+                reasons = ((fit["diagnostics"].get(model) or {}).get(kind) or {}).get("reasons")
+                lines.append("| %s | %s | unidentified (%s) | - | %.3f |"
+                             % (model, kind, ", ".join(reasons or ["unidentified"]),
+                                list_ratio.get(kind, float("nan"))))
+                continue
+            ratio = "%.3f" % (value / base) if base else "-"
             lines.append(
-                "| %s | %s | %.4f | %.3f | %.3f |"
-                % (model, kind, entry[kind], ratio, list_ratio.get(kind, float("nan")))
+                "| %s | %s | %.4f | %s | %.3f |"
+                % (model, kind, value, ratio, list_ratio.get(kind, float("nan")))
             )
     lines.append("")
     lines.append("## Residuals")

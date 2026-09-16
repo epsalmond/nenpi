@@ -67,7 +67,10 @@ Utilisation is sampled through `quota-drain snapshot --oauth`, which owns the
 credential read: the OAuth token is read, used and dropped inside quota-drain
 and never crosses into this tool. The sampler enforces a 60 s minimum interval
 per config dir and backs off on HTTP 429, so `--sample-interval` below 60 has
-no effect outside tests.
+no effect outside tests. Each read of the snapshot log is bounded to the last
+hour, so a two-month log costs nothing to poll, and `quota-drain snapshot
+--compact` running beside a benchmark is harmless: it drops repeats and expired
+records, never the newest observation.
 
 If the five-hour window rolls over mid-scenario the bracket spans a boundary
 and measures nothing; the ticks collected so far are discarded and the record
@@ -138,6 +141,23 @@ which leaves R² undefined; the report then grades the fit by relative residual
 instead and says so. A fit with fewer rows than columns is marked
 `UNDERDETERMINED` and is not `usable`.
 
+Least squares returns a number for every column, including ones the scenarios
+cannot separate. Those are reported `unidentified` with a reason and stored as
+null rather than as a confident zero, because a zero weight prices that kind as
+free — the same convention `quota-drain calibrate` uses. The rules differ from
+quota-drain's, because its rows are time buckets of whatever happened to run
+while these rows are designed scenarios: a column is unidentified when it
+correlates above 0.95 with another, when it lands at zero with under 5% of the
+token mass, or when the fit is underdetermined and the column appears in fewer
+than two scenarios. A single-scenario run therefore identifies nothing, which
+is the honest answer.
+
+The fit also reports `fallback_scale`, one scalar mapping API list price onto
+the fitted percent unit (percent per USD, so its inverse is the measured
+dollars per percent). Unidentified coefficients are priced through it, which
+keeps every model on one scale instead of mixing fitted percents with raw
+dollars.
+
 ## State
 
 ```
@@ -163,13 +183,25 @@ stderr can echo the prompt back.
 {
   "harness": "claude",
   "unit": "percent_per_mtok",
+  "usable": true,
+  "identified": 3,
+  "fallback_scale": 0.71,
   "claude": {
     "unit": "percent_per_mtok",
-    "models": { "claude-haiku-4-5": { "input": 0.9, "cache_read": 0.12, "output": 4.7 } }
+    "models": {
+      "claude-haiku-4-5": {
+        "input": 0.9, "cache_read": 0.12, "output": 4.7, "cache_write_5m": null
+      }
+    }
   },
   "windows": { "five_hour": { "models": { "claude-haiku-4-5": { "input": 0.9 } } } }
 }
 ```
+
+A null is "the run could not measure this", not zero. A reader prices those
+from the rate card scaled by `fallback_scale`, and ignores a payload whose
+`usable` is false, exactly as `quota-drain --use-calibrated` treats the Codex
+fit.
 
 `QUOTA_DRAIN_HOME_DIR`, `QUOTA_DRAIN_CACHE_DIR`, `QUOTA_DRAIN_STATE_DIR` and
 `QUOTA_DRAIN_CONFIG_DIR` relocate all of it, exactly as they do for
@@ -220,7 +252,7 @@ spending a run.
 ## Verification
 
 ```sh
-scripts/test-quota-bench                                  # 30 tests, no quota spent
+scripts/test-quota-bench                                  # 31 tests, no quota spent
 python3 -m py_compile scripts/quota-bench
 uv run --python 3.9 --no-project scripts/test-quota-bench # 3.9 floor
 ```
