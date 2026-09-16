@@ -306,6 +306,22 @@ def merge_weights(base: Dict[str, Any], override: Mapping[str, Any]) -> Dict[str
     return base
 
 
+def claude_price(entry: Mapping[str, Any], model: str, kind: str) -> float:
+    """One Claude price, falling back to the list price for a null coefficient.
+
+    A calibrated table stores null for a coefficient the fit could not identify.
+    Null means "not measured", so it falls back to the built-in price; reading
+    it as zero would price that kind as free.
+    """
+    value = entry.get(kind)
+    if isinstance(value, (int, float)):
+        return float(value)
+    price = CLAUDE_PRICES.get(normalize_claude_model(model))
+    if price is None or kind not in CLAUDE_KINDS:
+        return 0.0
+    return float(price[CLAUDE_KINDS.index(kind)])
+
+
 class Weights:
     """Per-model price tables plus the provenance shown in the report header."""
 
@@ -337,12 +353,12 @@ class Weights:
         entry = self.model_entry("claude", model)
         if entry is None:
             return 0.0
-        cache_read_price = entry.get("cache_read", 0.0)
+        cache_read_price = claude_price(entry, model, "cache_read")
         if cache_read_weight is not None:
-            cache_read_price = float(entry.get("input", 0.0)) * cache_read_weight
+            cache_read_price = claude_price(entry, model, "input") * cache_read_weight
         total = 0.0
         for kind in CLAUDE_KINDS:
-            price = cache_read_price if kind == "cache_read" else float(entry.get(kind, 0.0))
+            price = cache_read_price if kind == "cache_read" else claude_price(entry, model, kind)
             total += tokens.get(kind, 0) / 1_000_000.0 * price
         return total
 

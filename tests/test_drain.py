@@ -1913,6 +1913,18 @@ class ClaudeCalibration(Harness):
             self.assertIn("collinear", note["reasons"])
             self.assertIsNone(result["models"][model]["input"])
 
+    def test_a_null_weight_falls_back_to_the_list_price(self) -> None:
+        # A calibrated table stores null for a coefficient the fit could not
+        # identify; pricing it as zero would make that kind free.
+        weights = QD.Weights(
+            {"claude": {"models": {"claude-opus-5": {"input": 3.0, "cache_read": None}}}},
+            ["test"],
+        )
+        units = weights.claude_units(
+            "claude-opus-5", {"input": 1_000_000, "cache_read": 1_000_000}, None
+        )
+        self.assertAlmostEqual(units, 3.0 + 0.5)
+
     def test_calibrate_without_snapshots_explains_itself(self) -> None:
         result = self.run_tool("calibrate", "--harness", "claude")
         self.assertEqual(result.returncode, 1)
