@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Measure what one percent of a Claude plan window costs, per token kind.
 
 Fires controlled `claude -p` calls, watches live utilisation tick over through
@@ -34,8 +33,6 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
-
-SCRIPT_DIR = Path(__file__).resolve().parent
 
 DEFAULT_MAX_PERCENT = 3.0
 DEFAULT_MAX_PERCENT_WEEKLY = 1.0
@@ -108,7 +105,7 @@ EXIT_MAX_CALLS = 5
 
 
 def warn(message: str) -> None:
-    sys.stderr.write("quota-bench: " + message + "\n")
+    sys.stderr.write("nenpi-bench: " + message + "\n")
 
 
 def load_quota_drain(path: Path) -> Any:
@@ -275,10 +272,10 @@ class Sampler:
     about it crosses this boundary.
     """
 
-    def __init__(self, qd: Any, script: Path, config_dirs: Sequence[str], interval: float,
-                 max_age: float):
+    def __init__(self, qd: Any, drain_command: Sequence[str], config_dirs: Sequence[str],
+                 interval: float, max_age: float):
         self.qd = qd
-        self.script = script
+        self.drain_command = drain_command
         self.config_dirs = list(config_dirs)
         self.interval = interval
         self.max_age = max_age
@@ -300,7 +297,7 @@ class Sampler:
         if not force and not self.due(now):
             return self.latest
         self.last_attempt = now
-        command = [sys.executable, str(self.script), "snapshot", "--oauth"]
+        command = list(self.drain_command) + ["snapshot", "--oauth"]
         for config in self.config_dirs:
             command += ["--config-dir", config]
         try:
@@ -360,7 +357,7 @@ class Sampler:
 
 
 def foreign_sessions(
-    qd_script: Path, since: str, start: float, end: float, own: Sequence[str]
+    drain_command: Sequence[str], since: str, start: float, end: float, own: Sequence[str]
 ) -> Tuple[List[str], bool]:
     """Claude sessions other than this run's that had API turns in the interval.
 
@@ -368,7 +365,7 @@ def foreign_sessions(
     could not run is not evidence of an idle window, so its failure is reported
     rather than read as a clean result.
     """
-    command = [sys.executable, str(qd_script), "sessions", "--harness", "claude",
+    command = list(drain_command) + ["sessions", "--harness", "claude",
                "--since", since, "--json", "--top", "200"]
     try:
         result = subprocess.run(command, check=False, capture_output=True, timeout=300)
@@ -1509,7 +1506,7 @@ def command_run(args: argparse.Namespace) -> int:
              "between polls; using %.0fs"
              % (max_sample_age, SAMPLE_AGE_FLOOR, SAMPLE_AGE_FLOOR))
         max_sample_age = SAMPLE_AGE_FLOOR
-    sampler = Sampler(_QD, args.quota_drain, args.config_dir, args.sample_interval,
+    sampler = Sampler(_QD, args.drain_command, args.config_dir, args.sample_interval,
                       max_sample_age)
     baseline = sampler.sample(force=True)
     if baseline is None:
@@ -1525,7 +1522,7 @@ def command_run(args: argparse.Namespace) -> int:
     own_sessions = []  # type: List[str]
     started = time.time()
     if args.require_idle:
-        foreign, checked = foreign_sessions(args.quota_drain, args.contamination_since,
+        foreign, checked = foreign_sessions(args.drain_command, args.contamination_since,
                                             started - 600.0, started, own_sessions)
         if foreign:
             warn("--require-idle: %d other Claude session(s) active in the last 10 minutes"
@@ -1575,12 +1572,12 @@ def command_run(args: argparse.Namespace) -> int:
                 print("running %s" % scenario.key)
                 scenario_start = time.time()
                 before, before_checked = foreign_sessions(
-                    args.quota_drain, args.contamination_since,
+                    args.drain_command, args.contamination_since,
                     scenario_start - 300.0, scenario_start, own_sessions)
                 state = run_scenario(scenario, args, sampler, budget, workdir,
                                      calls_log, own_sessions)
                 after, after_checked = foreign_sessions(
-                    args.quota_drain, args.contamination_since,
+                    args.drain_command, args.contamination_since,
                     scenario_start, state.ended, own_sessions)
                 # The pre-check runs before this scenario's own session ids are
                 # known, so its findings are re-filtered once they are.
@@ -1679,14 +1676,15 @@ def add_fit_arguments(parser: argparse.ArgumentParser) -> None:
 
 
 def add_common_arguments(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--quota-drain", type=Path, default=SCRIPT_DIR / "quota-drain",
+    parser.add_argument("--quota-drain", type=Path, default=None,
                         metavar="PATH",
-                        help="quota-drain used for sampling and contamination checks")
+                        help="quota-drain used for sampling and contamination checks "
+                             "(default: the bundled nenpi.drain module)")
     parser.add_argument("--window", choices=("five_hour", "seven_day"), default="five_hour")
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="quota-bench",
+    parser = argparse.ArgumentParser(prog="nenpi-bench",
                                      description=__doc__.splitlines()[0])
     sub = parser.add_subparsers(dest="command")
 
@@ -1746,7 +1744,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if not getattr(args, "handler", None):
         parser.print_help()
         return EXIT_USAGE
-    _QD = load_quota_drain(Path(args.quota_drain).expanduser())
+    if args.quota_drain is None:
+        _QD = importlib.import_module("nenpi.drain")
+        args.drain_command = [sys.executable, "-m", "nenpi.drain"]
+    else:
+        path = Path(args.quota_drain).expanduser()
+        _QD = load_quota_drain(path)
+        args.drain_command = [sys.executable, str(path)]
     return args.handler(args)
 
 

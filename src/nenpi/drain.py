@@ -1,10 +1,9 @@
-#!/usr/bin/env python3
 """Report which Claude Code and Codex CLI sessions drained subscription quota.
 
 Codex quota is measured from the `rate_limits` snapshots the CLI writes into
 its own rollouts. Claude writes no quota data at all, so Claude sessions are
 modelled as API list-price dollars and reported as a share of the observed
-total; see docs/quota-drain.md for what is official, community-sourced, and
+total; see docs/drain.md for what is official, community-sourced, and
 unknown.
 
 Test path overrides use the ``QUOTA_DRAIN_*`` environment variables:
@@ -204,7 +203,7 @@ def parse_since(value: Optional[str], now: float) -> Optional[float]:
     try:
         parsed = datetime.fromisoformat(text)
     except ValueError:
-        raise SystemExit("quota-drain: cannot parse time %r (use 7d, 12h, or 2026-09-10)" % value)
+        raise SystemExit("nenpi: cannot parse time %r (use 7d, 12h, or 2026-09-10)" % value)
     if parsed.tzinfo is None:
         # astimezone() on a naive datetime reads it as local time and applies
         # the offset in force on that date, not today's.
@@ -440,7 +439,7 @@ _WARNED = set()  # type: set
 
 
 def warn(message: str) -> None:
-    sys.stderr.write("quota-drain: %s\n" % message)
+    sys.stderr.write("nenpi: %s\n" % message)
 
 
 def warn_once(message: str) -> None:
@@ -4166,7 +4165,7 @@ def add_common(parser: argparse.ArgumentParser) -> None:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="quota-drain", description=__doc__.splitlines()[0])
+    parser = argparse.ArgumentParser(prog="nenpi", description=__doc__.splitlines()[0])
     sub = parser.add_subparsers(dest="command")
 
     sessions = sub.add_parser("sessions", help="one row per session, ranked by quota drain")
