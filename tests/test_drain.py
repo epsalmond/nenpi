@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Contract tests for quota-drain.
 
 Every fixture here is synthetic. Real transcripts hold prompts and customer
@@ -8,8 +7,6 @@ data and must never be copied into this repository.
 from __future__ import annotations
 
 import contextlib
-import importlib.machinery
-import importlib.util
 import json
 import os
 import subprocess
@@ -19,17 +16,11 @@ import time
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+import nenpi.drain as QD
 
-SCRIPT_DIR = Path(__file__).resolve().parent
-QUOTA_DRAIN = SCRIPT_DIR / "quota-drain"
-LOADER = importlib.machinery.SourceFileLoader("quota_drain_contract", str(QUOTA_DRAIN))
-SPEC = importlib.util.spec_from_loader(LOADER.name, LOADER)
-assert SPEC and SPEC.loader
-QD = importlib.util.module_from_spec(SPEC)
-sys.modules[SPEC.name] = QD
-SPEC.loader.exec_module(QD)
+DRAIN_COMMAND = [sys.executable, "-m", "nenpi.drain"]
 
 
 def iso(epoch: float) -> str:
@@ -337,7 +328,7 @@ class Harness(unittest.TestCase):
 
     def run_tool(self, *arguments: str, stdin: Optional[bytes] = None) -> subprocess.CompletedProcess:
         return subprocess.run(
-            [sys.executable, str(QUOTA_DRAIN)] + list(arguments),
+            DRAIN_COMMAND + list(arguments),
             check=False,
             input=stdin,
             capture_output=True,

@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Contract tests for quota-bench.
 
 Nothing here spends quota or touches the network: `claude` is a fake
@@ -11,8 +10,6 @@ produced it.
 
 from __future__ import annotations
 
-import importlib.machinery
-import importlib.util
 import json
 import os
 import subprocess
@@ -21,26 +18,13 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Sequence
 
+import nenpi.bench as QB
+import nenpi.drain as QD
 
-SCRIPT_DIR = Path(__file__).resolve().parent
-QUOTA_BENCH = SCRIPT_DIR / "quota-bench"
-QUOTA_DRAIN = SCRIPT_DIR / "quota-drain"
-
-
-def load(name: str, path: Path) -> Any:
-    loader = importlib.machinery.SourceFileLoader(name, str(path))
-    spec = importlib.util.spec_from_loader(loader.name, loader)
-    assert spec and spec.loader
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
-    return module
-
-
-QD = load("quota_drain_bench_contract", QUOTA_DRAIN)
-QB = load("quota_bench_contract", QUOTA_BENCH)
+QUOTA_BENCH = Path(QB.__file__)
+QUOTA_DRAIN = Path(QD.__file__)
 QB._QD = QD
 
 
