@@ -63,8 +63,8 @@ a detail line underneath:
 
 ```
 H session  cwd      model         start            dur    in     cached  write  out     units    drain    prm resent share
-X 0123abcd project gpt-6-astra   2026-09-13 21:14 3h20m  2.1M   90.4M   0      210.0K  1180.55  4.220%   9   62%   ████████
-          api turns 1725, turns/prompt p90 243, peak context 419.9K; subagents 993 requests / 236.98 units
+X 0123abcd projects gpt-6-astra   2026-09-13 21:14 3h20m  2.1M   90.4M   0      210.0K  1180.55  4.220%   9   62%   ████████
+          api turns 140, turns/prompt p90 31, peak context 168.4K; subagents 22 requests / 4.10 units
 ```
 
 `H` is `C` for Claude and `X` for Codex. `units` is weighted tokens: credit
