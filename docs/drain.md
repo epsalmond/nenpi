@@ -1,12 +1,12 @@
 ---
-description: quota-drain subcommands, the Codex measured and Claude modelled metering models, weight configuration, and what about subscription quota is official, community-sourced, or unknown.
+description: nenpi subcommands, the Codex measured and Claude modelled metering models, weight configuration, and what about subscription quota is official, community-sourced, or unknown.
 status: reference
-read-when: Attributing subscription-plan quota to agent sessions, tuning quota-drain weights, or wiring its snapshot sampler into a timer.
+read-when: Attributing subscription-plan quota to agent sessions, tuning nenpi weights, or wiring its snapshot sampler into a timer.
 ---
 
-# quota-drain
+# nenpi
 
-`scripts/quota-drain` reads Claude Code and Codex CLI transcripts on disk and
+`nenpi` reads Claude Code and Codex CLI transcripts on disk and
 reports which sessions drained how much **subscription-plan quota** — not API
 dollars. It is standalone: Python standard library only, Python 3.9 or newer,
 Linux and macOS.
@@ -30,17 +30,17 @@ so cost grows faster than session length. See
 ## Subcommands
 
 ```
-quota-drain sessions    [--harness claude|codex|all] [--since 7d|2026-09-10] [--until ...]
-                        [--window auto|five_hour|weekly] [--top 25]
-                        [--sort drain|tokens|start] [--json] [--no-color] [--width N]
-quota-drain prompts     --session <id-prefix> [--top N]
-quota-drain fanout      [--since ...] [--harness ...]
-quota-drain reductions  [--since ...]
-quota-drain timeline    [--bucket 1h|5h|1d]
-quota-drain windows     [--harness codex]
-quota-drain calibrate   [--harness codex|claude] [--since ...]
-quota-drain verify      [--since ...]
-quota-drain snapshot    [--stdin | --oauth [--config-dir PATH] | --compact]
+nenpi sessions    [--harness claude|codex|all] [--since 7d|2026-09-10] [--until ...]
+                  [--window auto|five_hour|weekly] [--top 25]
+                  [--sort drain|tokens|start] [--json] [--no-color] [--width N]
+nenpi prompts     --session <id-prefix> [--top N]
+nenpi fanout      [--since ...] [--harness ...]
+nenpi reductions  [--since ...]
+nenpi timeline    [--bucket 1h|5h|1d]
+nenpi windows     [--harness codex]
+nenpi calibrate   [--harness codex|claude] [--since ...]
+nenpi verify      [--since ...]
+nenpi snapshot    [--stdin | --oauth [--config-dir PATH] | --compact]
 ```
 
 Common flags on every reporting subcommand: `--claude-root PATH` and
@@ -63,7 +63,7 @@ a detail line underneath:
 
 ```
 H session  cwd      model         start            dur    in     cached  write  out     units    drain    prm resent share
-X 01a09e1f arcade   gpt-6-astra   2026-09-13 21:14 6h57m  6.1M   302.1M  0      712.3K  3628.99  13.717%  16  87%   ████████
+X 0123abcd project gpt-6-astra   2026-09-13 21:14 3h20m  2.1M   90.4M   0      210.0K  1180.55  4.220%   9   62%   ████████
           api turns 1725, turns/prompt p90 243, peak context 419.9K; subagents 993 requests / 236.98 units
 ```
 
@@ -307,7 +307,7 @@ On real sessions this runs 75-90%.
 
 ## Context reductions
 
-`quota-drain reductions` finds points where one thread's context shrank
+`nenpi reductions` finds points where one thread's context shrank
 sharply, and prices what that saved.
 
 - **`compact`** — a Codex `compacted` record was written between the two
@@ -341,7 +341,7 @@ fork would make this exact.** It should carry `kind`, `before`, `after`,
 
 ## Snapshots
 
-`quota-drain snapshot` logs Claude quota observations to
+`nenpi snapshot` logs Claude quota observations to
 `~/.local/state/quota-drain/snapshots.jsonl`. Three sources:
 
 ### `--oauth` (recommended)
@@ -352,7 +352,7 @@ in `.claude.json` is stale, and the statusline only runs while someone is
 using the CLI.
 
 ```
-quota-drain snapshot --oauth [--config-dir ~/.claude]
+nenpi snapshot --oauth [--config-dir ~/.claude]
 ```
 
 `--config-dir` is repeatable; with none given, every `~/.claude*` directory
@@ -380,17 +380,17 @@ account identifiers are never stored.
 To sample every five minutes, without installing anything here:
 
 ```ini
-# ~/.config/systemd/user/quota-drain-snapshot.service
+# ~/.config/systemd/user/nenpi-snapshot.service
 [Unit]
 Description=Sample Claude quota utilization
 
 [Service]
 Type=oneshot
-ExecStart=%h/git/management-plane/scripts/quota-drain snapshot --oauth
+ExecStart=%h/.local/bin/nenpi snapshot --oauth
 ```
 
 ```ini
-# ~/.config/systemd/user/quota-drain-snapshot.timer
+# ~/.config/systemd/user/nenpi-snapshot.timer
 [Unit]
 Description=Sample Claude quota utilization every 5 minutes
 
@@ -403,7 +403,7 @@ Persistent=true
 WantedBy=timers.target
 ```
 
-`systemctl --user enable --now quota-drain-snapshot.timer`. The macOS
+`systemctl --user enable --now nenpi-snapshot.timer`. The macOS
 equivalent is a launchd agent in `~/Library/LaunchAgents` with
 `StartInterval` set to `300` and `ProgramArguments` of the script path plus
 `snapshot` and `--oauth`.
@@ -415,7 +415,7 @@ Reads the Claude statusline JSON on stdin, extracts
 stdout byte for byte so it can sit inside the statusline pipeline:
 
 ```sh
-... | quota-drain snapshot --stdin | bash ~/.claude/statusline-command.sh
+... | nenpi snapshot --stdin | bash ~/.claude/statusline-command.sh
 ```
 
 It never fails the pipeline: the passthrough is wrapped end to end, every
@@ -423,7 +423,7 @@ error is swallowed, and it always exits 0. It appends only when a window's
 utilisation or reset time actually moved, so a statusline that runs on every
 prompt does not grow the log.
 
-`quota-drain snapshot --compact` drops repeated entries and anything older
+`nenpi snapshot --compact` drops repeated entries and anything older
 than 60 days. Reporting subcommands read only the entries inside the requested
 range.
 
@@ -495,7 +495,7 @@ Sharding rather than a single index is deliberate: one index of this corpus
 reaches nine figures of JSON and has to be parsed in full on every
 invocation, which dominates the runtime of a narrow query.
 
-Measured on `nas` over 2614 Claude transcripts (1.2 GB) and 3373 Codex
+Measured on a 2600-transcript Claude corpus (1.2 GB) and 3400 Codex
 rollouts (9.1 GB):
 
 | run | wall | peak rss |
@@ -577,16 +577,15 @@ wants:
   distinct `resets_at`, but two accounts on the same plan would be merged.
 - `unmarked` reductions are heuristic until the Codex fork writes a shake
   marker.
-- A green parse is not proof of a correct model: `quota-drain verify` compares
+- A green parse is not proof of a correct model: `nenpi verify` compares
   the parse against the harnesses' own totals, and `calibrate` compares the
   weights against measured drain. Use both before trusting a number.
 
 ## Verification
 
 ```sh
-scripts/test-quota-drain                                  # 82 synthetic-fixture tests
-python3 -m py_compile scripts/quota-drain
-uv run --python 3.9 --no-project scripts/test-quota-drain # 3.9 floor
+uv run --python 3.9 python -m unittest discover -s tests -v  # 3.9 floor
+uv run --python 3.13 python -m unittest discover -s tests -v
 ```
 
 Fixtures are synthetic and must stay that way. Real transcripts hold prompts
