@@ -3263,7 +3263,7 @@ def calibrate_claude(args: argparse.Namespace, analysis: "Analysis") -> int:
     if not results:
         warn(
             "no usable Claude snapshot intervals; sample utilisation with "
-            "`quota-drain snapshot --oauth` (see docs/quota-drain.md) and retry"
+            "`quota-drain snapshot --oauth` (see docs/drain.md) and retry"
         )
         return 1
     payload = {
@@ -3893,7 +3893,7 @@ def snapshot_from_oauth(destination: Path, args: argparse.Namespace) -> int:
         warn(
             "no config dir holds a .credentials.json with a claudeAiOauth block. "
             "On macOS the CLI keeps these in the login Keychain instead, which "
-            "this tool does not read; see docs/quota-drain.md"
+            "this tool does not read; see docs/drain.md"
         )
         return 1
     state = load_poll_state()
