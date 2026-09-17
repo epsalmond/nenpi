@@ -1,18 +1,18 @@
 ---
-description: quota-bench scenarios, tick bracketing, the budget and contamination guards, the NNLS fit it writes for quota-drain, and what a run costs.
+description: nenpi-bench scenarios, tick bracketing, the budget and contamination guards, the NNLS fit it writes for nenpi, and what a run costs.
 status: reference
-read-when: Measuring what a percent of a Claude plan window buys, or fitting quota-drain's Claude weights against real drain.
+read-when: Measuring what a percent of a Claude plan window buys, or fitting nenpi's Claude weights against real drain.
 ---
 
-# quota-bench
+# nenpi-bench
 
-`scripts/quota-bench` measures how many tokens of each kind one percent of a
+`nenpi-bench` measures how many tokens of each kind one percent of a
 Claude plan window costs, by firing controlled `claude -p` calls and watching
 live utilisation tick over. Output is a per-scenario tokens-per-percent table
 and a fitted weight table (percent per million tokens, per model and kind)
-written where `quota-drain` keeps its calibration.
+written where `nenpi` keeps its calibration.
 
-It is standalone apart from `scripts/quota-drain`, which it imports for the
+It is standalone apart from `nenpi.drain`, which it imports for the
 snapshot format and the NNLS solver and runs as a subprocess to sample. Python
 standard library only, Python 3.9 or newer, Linux and macOS.
 
@@ -22,11 +22,11 @@ to start without `--yes`, and aborts at `--max-percent`.
 ## Subcommands
 
 ```
-quota-bench plan   [--models ...] [--contexts 10k,60k,150k] [--cache cold,warm]
+nenpi-bench plan   [--models ...] [--contexts 10k,60k,150k] [--cache cold,warm]
                    [--outputs short,long] [--ticks 2] [--max-percent 3]
-quota-bench run    ... --yes [--require-idle] [--config-dir PATH] [--claude PATH]
+nenpi-bench run    ... --yes [--require-idle] [--config-dir PATH] [--claude PATH]
                    [--sample-interval 60] [--filler-channel prompt|system-prompt-file]
-quota-bench report [--run-id ID] [--ticks N] [--json]
+nenpi-bench report [--run-id ID] [--ticks N] [--json]
 ```
 
 `plan` spends nothing: it prints the scenario list, the calls each scenario
@@ -63,12 +63,12 @@ unknown size and is discarded. `--ticks 2` is the floor that yields one fully
 bracketed percent; more ticks average over more percents. `--ticks 1` produces
 an estimate that includes the leading partial and is reported `unbracketed`.
 
-Utilisation is sampled through `quota-drain snapshot --oauth`, which owns the
-credential read: the OAuth token is read, used and dropped inside quota-drain
+Utilisation is sampled through `nenpi snapshot --oauth`, which owns the
+credential read: the OAuth token is read, used and dropped inside nenpi
 and never crosses into this tool. The sampler enforces a 60 s minimum interval
 per config dir and backs off on HTTP 429, so `--sample-interval` below 60 has
 no effect outside tests. Each read of the snapshot log is bounded to the last
-hour, so a two-month log costs nothing to poll, and `quota-drain snapshot
+hour, so a two-month log costs nothing to poll, and `nenpi snapshot
 --compact` running beside a benchmark is harmless: it drops repeats and expired
 records, never the newest observation.
 
@@ -129,7 +129,7 @@ window blind.
 
 **Contamination.** Any other Claude session burning quota during the run lands
 in the same window and corrupts the measurement. Before each scenario and after
-it, `quota-drain sessions --harness claude --since 6h --json` is read and every
+it, `nenpi sessions --harness claude --since 6h --json` is read and every
 Claude session that overlaps the scenario and is not one of this run's own
 marks it `contaminated`. A check that could not run is `check_failed`, which
 counts as contamination rather than as a clean window: under `--require-idle`
@@ -141,7 +141,7 @@ fit. Contaminated scenarios stay in the logs.
 Each scenario that was fully bracketed, uncontaminated and free of cache drift
 contributes one row: bracketed tokens per model and kind against the bracketed
 percent. Non-negative least squares over those rows gives percent per million
-tokens for each `(model, kind)` pair, using quota-drain's solver. Every model a
+tokens for each `(model, kind)` pair, using nenpi's solver. Every model a
 call touched keeps its own row, so a subagent or internal helper call is not
 priced at the requested model's weight.
 
@@ -164,8 +164,8 @@ instead and says so. A fit with fewer rows than columns is marked
 Least squares returns a number for every column, including ones the scenarios
 cannot separate. Those are reported `unidentified` with a reason and stored as
 null rather than as a confident zero, because a zero weight prices that kind as
-free — the same convention `quota-drain calibrate` uses. The rules differ from
-quota-drain's, because its rows are time buckets of whatever happened to run
+free — the same convention `nenpi calibrate` uses. The rules differ from
+nenpi's, because its rows are time buckets of whatever happened to run
 while these rows are designed scenarios: a column is unidentified when it
 correlates above 0.95 with another, when it lands at zero with under 5% of the
 token mass, or when the fit is underdetermined and the column appears in fewer
@@ -197,7 +197,7 @@ Prompt text, filler text and the OAuth token are never printed, logged or
 stored; a failing `claude` call is reported by exit status only, because its
 stderr can echo the prompt back.
 
-`claude-weights.json` carries the shapes quota-drain reads: a top-level
+`claude-weights.json` carries the shapes nenpi reads: a top-level
 `claude` section shaped like the `codex` section of `codex-weights.json`, so
 `merge_weights` consumes it unchanged, and a `windows` section shaped like the
 `calibrate --harness claude` payload.
@@ -233,7 +233,7 @@ record of the run rather than a price table. Only a usable fit is written to
 `claude-weights.json` at all; an unusable one lands beside it as
 `claude-weights.unusable.json`, which nothing loads.
 
-### Merging a fit into quota-drain by hand
+### Merging a fit into nenpi by hand
 
 Copying the `claude` section into `~/.config/quota-drain/weights.json` mixes
 two units. The fitted numbers are percent per million tokens; every kind the
@@ -241,20 +241,20 @@ section omits keeps its built-in price, which is USD per million tokens. A
 partial fit merged that way prices some kinds in percent and the rest in
 dollars, and the two differ by orders of magnitude, so one kind's tokens will
 swamp the rest. `fallback_scale` is what converts the omitted kinds onto the
-fitted unit, and quota-drain does not yet apply it when merging a Claude fit.
+fitted unit, and nenpi does not yet apply it when merging a Claude fit.
 
 Until it does, merge only a fit that identifies all four kinds for the models
 you care about — `input`, `cache_read`, `cache_write_5m` and `output` — so no
-kind falls back. `quota-bench report` names every unidentified kind and its
+kind falls back. `nenpi-bench report` names every unidentified kind and its
 reason.
 
 `QUOTA_DRAIN_HOME_DIR`, `QUOTA_DRAIN_CACHE_DIR`, `QUOTA_DRAIN_STATE_DIR` and
 `QUOTA_DRAIN_CONFIG_DIR` relocate all of it, exactly as they do for
-quota-drain.
+nenpi.
 
 ## What the result JSON is read from
 
-`claude -p --output-format json` returns one result envelope. quota-bench reads
+`claude -p --output-format json` returns one result envelope. nenpi-bench reads
 `modelUsage` — per-model totals for every model call the run made, which the
 Agent SDK type documentation names as the field for token accounting — and
 falls back to `usage`, the main-loop-only block, when a build reports no
@@ -273,7 +273,7 @@ spending a run.
 | --- | --- |
 | 0 | done |
 | 1 | usage error, or no scenario reached its tick target |
-| 2 | missing dependency: no quota-drain, no `claude`, no baseline sample |
+| 2 | missing dependency: no nenpi, no `claude`, no baseline sample |
 | 3 | budget reached |
 | 4 | a guard stopped the run: the sampler, or a contaminated window under `--require-idle` |
 | 5 | a scenario hit `--max-calls` before its tick target |
@@ -305,25 +305,24 @@ spending a run.
   no dollar field exists, because Anthropic publishes no dollar ceiling and
   every account seen reports `limit_dollars` null. It scales projected call
   counts only; nothing measured depends on it.
-- Contamination detection sees only what quota-drain can parse from
+- Contamination detection sees only what nenpi can parse from
   transcripts, so a session writing no transcript is invisible.
 
 ## Verification
 
 ```sh
-scripts/test-quota-bench                                  # 58 tests, no quota spent
-python3 -m py_compile scripts/quota-bench
-uv run --python 3.9 --no-project scripts/test-quota-bench # 3.9 floor
+uv run --python 3.9 python -m unittest discover -s tests -v  # 3.9 floor, no quota spent
+uv run --python 3.13 python -m unittest discover -s tests -v
 ```
 
-The suite puts a fake `claude` on PATH and a fake quota-drain sampler that
+The suite puts a fake `claude` on PATH and a fake nenpi sampler that
 bills the calls at known weights, so tick bracketing, the budget abort, the
 contamination flag and the fit are all checked without a network call or a
 percent of quota. A real smoke run costs real quota and needs an explicit
 decision each time; start with one cheap scenario:
 
 ```sh
-scripts/quota-bench run --models claude-haiku-4-5-20251001 --contexts 10k \
+nenpi-bench run --models claude-haiku-4-5-20251001 --contexts 10k \
     --cache warm --ticks 1 --max-percent 1 --require-idle --yes
 ```
 

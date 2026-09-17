@@ -30,7 +30,7 @@ uv tool install .
 
 ```
 nenpi sessions --harness all --since 7d --top 25
-nenpi prompts --session 01a09e1f
+nenpi prompts --session 0123abcd
 nenpi-bench plan --models claude-haiku-4-5 --contexts 10k,60k --cache cold,warm
 ```
 
