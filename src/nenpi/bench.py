@@ -1,18 +1,18 @@
 """Measure what one percent of a Claude plan window costs, per token kind.
 
 Fires controlled `claude -p` calls, watches live utilisation tick over through
-`quota-drain snapshot --oauth`, and brackets the tokens spent between ticks.
+`nenpi snapshot --oauth`, and brackets the tokens spent between ticks.
 The output is a per-scenario tokens-per-percent table plus a non-negative
 least squares fit of percent per million tokens per model and kind, stored in
-the shape `quota-drain calibrate --harness claude` reports.
+the shape `nenpi calibrate --harness claude` reports.
 
 Every percent this spends is real quota: `run` refuses to start without
 `--yes` and aborts at `--max-percent`. Prompt text, filler text and the OAuth
 token are never printed, logged or stored; token handling stays inside
-quota-drain, which owns the credential read.
+nenpi-bench, which owns the credential read.
 
 Test path overrides use the same ``QUOTA_DRAIN_*`` environment variables
-quota-drain reads: ``HOME_DIR``, ``CACHE_DIR``, ``STATE_DIR``, ``CONFIG_DIR``.
+nenpi reads: ``HOME_DIR``, ``CACHE_DIR``, ``STATE_DIR``, ``CONFIG_DIR``.
 """
 
 from __future__ import annotations
@@ -42,7 +42,7 @@ DEFAULT_SAMPLE_INTERVAL = 60.0
 # A call may only be launched while the newest utilisation sample is younger
 # than this; older than it, the budget check is reading a stale number.
 MIN_SAMPLE_AGE = 90.0
-# quota-drain will not poll the usage endpoint more than once a minute, so a
+# nenpi will not poll the usage endpoint more than once a minute, so a
 # shorter limit than this can only ever fire against its own floor.
 SAMPLE_AGE_FLOOR = 60.0
 DEFAULT_CALL_TIMEOUT = 900.0
@@ -266,7 +266,7 @@ class Sample:
 
 
 class Sampler:
-    """Runs `quota-drain snapshot --oauth` and reads back what it logged.
+    """Runs `nenpi snapshot --oauth` and reads back what it logged.
 
     The OAuth token is read, used and discarded inside quota-drain; nothing
     about it crosses this boundary.

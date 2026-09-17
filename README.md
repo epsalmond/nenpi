@@ -17,7 +17,7 @@ convert Claude token counts into percent.
 ## Install
 
 ```
-uv tool install nenpi
+uv tool install git+https://github.com/epsalmond/nenpi
 ```
 
 or, from a checkout:
