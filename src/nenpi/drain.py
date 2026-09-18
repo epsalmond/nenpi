@@ -33,6 +33,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, List, Mapping, Optional, Sequence, Tuple
 
 from nenpi.config import (
+    Config,
     account_for_root,
     cache_dir,
     config_dir,
@@ -41,6 +42,7 @@ from nenpi.config import (
     load_config,
     migrate_dirs,
     resolve_roots,
+    save_config,
     state_dir,
     warn,
     warn_once,
@@ -5211,10 +5213,6 @@ def command_config(args: argparse.Namespace) -> int:
     return 0
 
 
-def _toml_escape(value: str) -> str:
-    return value.replace("\\", "\\\\").replace('"', '\\"')
-
-
 def command_config_init(args: argparse.Namespace) -> int:
     path = config_path()
     if path.is_dir():
@@ -5223,26 +5221,44 @@ def command_config_init(args: argparse.Namespace) -> int:
     if path.exists() and not args.force:
         warn("%s already exists; pass --force to overwrite" % path)
         return 1
-    lines = [
-        "# nenpi config, written by `nenpi config --init`.",
-        "# Precedence: --claude-root/--codex-root flags > this file > defaults.",
-        "",
-    ]
+    existing = load_config(path) if path.is_file() else Config(path=path)
+    # --init reseeds `roots` only: the user's other settings, the UI's
+    # disabled/ignored bookkeeping, and any table this version does not know
+    # about all survive an --init --force.
+    fresh = Config(
+        path=path,
+        plan_claude=existing.plan_claude,
+        plan_codex=existing.plan_codex,
+        claude_disabled=existing.claude_disabled,
+        codex_disabled=existing.codex_disabled,
+        claude_ignored=existing.claude_ignored,
+        codex_ignored=existing.codex_ignored,
+        tables_present=existing.tables_present,
+        extras=existing.extras,
+    )
+    comments = {}  # type: Dict[str, str]
     for harness in ("claude", "codex"):
-        candidates = discover_candidate_roots(harness)
-        lines.append("[%s]" % harness)
-        lines.append("roots = [")
-        for root in candidates:
+        roots = fresh.roots(harness)
+        excluded = {
+            str(Path(item).expanduser())
+            for item in list(fresh.disabled(harness)) + list(fresh.ignored(harness))
+        }
+        for root in discover_candidate_roots(harness):
+            if str(root) in excluded:
+                continue
             label, _key = account_for_root(root, harness)
-            lines.append('    "%s",  # %s' % (_toml_escape(str(root)), label))
-        lines.append("]")
-        lines.append("")
-    lines.append("# [plan]  # optional, display only")
-    lines.append('# claude = "max_20x"')
-    lines.append('# codex = "pro"')
-    lines.append("")
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text("\n".join(lines), encoding="utf-8")
+            roots.append(str(root))
+            comments[str(root)] = label
+    save_config(
+        fresh,
+        path,
+        comments=comments,
+        header=[
+            "# nenpi config, written by `nenpi config --init`.",
+            "# Precedence: --claude-root/--codex-root flags > this file > defaults.",
+            "# The Sources screen reads and writes this same file.",
+        ],
+    )
     print("wrote %s" % path)
     return 0
 
@@ -5254,6 +5270,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # bytes moving before building the full parser.
     if arguments == ["snapshot", "--stdin"]:
         return snapshot_from_stdin(state_dir() / "snapshots.jsonl")
+    # The Sources screen's old store is imported here too, so a CLI-only
+    # user gets it as well (issue #23); it is a no-op once config.toml
+    # exists, and stays out of the statusline path above.
+    try:
+        from .settings import migrate_json_store
+    except ImportError:  # bench can load drain.py as a standalone module
+        from nenpi.settings import migrate_json_store  # type: ignore
+    migrate_json_store()
     parser = build_parser()
     args = parser.parse_args(arguments)
     if not getattr(args, "handler", None):

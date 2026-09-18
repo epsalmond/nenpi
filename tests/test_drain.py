@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import nenpi.config as QC
+from nenpi.settings import SourceSettings, migrate_json_store
 import nenpi.drain as QD
 
 DRAIN_COMMAND = [sys.executable, "-m", "nenpi.drain"]
@@ -3523,6 +3524,185 @@ class ClaudeAccountPools(Harness):
         raw = (self.root / "state" / "snapshots.jsonl").read_text(encoding="utf-8")
         self.assertNotIn("org-personal", raw)
         self.assertNotIn("org-arcade", raw)
+
+
+class UnifiedConfigStore(RootsAndConfig):
+    """One store for the CLI and the Sources screen (issue #23)."""
+
+    def test_toml_writer_round_trips_awkward_strings(self) -> None:
+        import tomllib
+
+        config = QC.Config(
+            claude_roots=['/tmp/we"ird', "/tmp/back\\slash", "/tmp/plain"],
+            codex_roots=[],
+            claude_disabled=["/tmp/off"],
+            codex_ignored=["/tmp/gone"],
+            plan_claude="max_20x",
+        )
+        data = tomllib.loads(QC.dump_config(config))
+        self.assertEqual(data["claude"]["roots"], config.claude_roots)
+        self.assertEqual(data["claude"]["disabled"], ["/tmp/off"])
+        self.assertEqual(data["codex"]["roots"], [])
+        self.assertEqual(data["codex"]["ignored"], ["/tmp/gone"])
+        self.assertEqual(data["plan"]["claude"], "max_20x")
+
+    def test_save_config_then_load_config_is_identity(self) -> None:
+        with self.env_applied():
+            written = QC.Config(
+                claude_roots=[str(self.home / ".claude")],
+                codex_roots=[str(self.home / ".codex")],
+                codex_disabled=[str(self.home / ".codex-off")],
+                plan_codex="pro",
+            )
+            QC.save_config(written, self.config_path())
+            loaded = QC.load_config(self.config_path())
+        self.assertEqual(loaded.claude_roots, written.claude_roots)
+        self.assertEqual(loaded.codex_roots, written.codex_roots)
+        self.assertEqual(loaded.codex_disabled, written.codex_disabled)
+        self.assertEqual(loaded.plan_codex, "pro")
+
+    def test_source_added_in_the_ui_is_visible_to_the_cli(self) -> None:
+        extra = self.make_extra_codex_root(".codex-extra")
+        with self.env_applied():
+            settings = SourceSettings.load(self.config_path(), self.home)
+            settings.add(extra, "codex")
+            settings.save()
+        payload = self.run_json("config", "--json")
+        codex_roots = [row["path"] for row in payload["roots"]
+                       if row["harness"] == "codex"]
+        self.assertIn(str(extra), codex_roots)
+        self.assertTrue(payload["config_present"])
+
+    def test_config_json_is_migrated_with_the_harness_corrected(self) -> None:
+        import tomllib
+
+        claude_extra = self.make_extra_claude_root(".claude-extra")
+        codex_extra = self.make_extra_codex_root(".codex-extra")
+        legacy = self.root / "config" / "config.json"
+        legacy.parent.mkdir(parents=True, exist_ok=True)
+        legacy.write_text(json.dumps({
+            "version": 1,
+            "sources": [
+                {"id": "a", "name": ".claude-extra", "harness": "claude",
+                 "path": str(claude_extra), "enabled": True},
+                # The Sources form saved this one with the wrong harness.
+                {"id": "b", "name": ".codex-extra", "harness": "claude",
+                 "path": str(codex_extra), "enabled": True},
+                {"id": "c", "name": ".claude", "harness": "claude",
+                 "path": str(self.home / ".claude"), "enabled": False},
+            ],
+            "ignored_discovered": [
+                {"harness": "codex", "path": str(self.home / ".codex")}
+            ],
+        }), encoding="utf-8")
+        with self.env_applied():
+            SourceSettings.load(self.config_path(), self.home)
+        data = tomllib.loads(self.config_path().read_text(encoding="utf-8"))
+        self.assertEqual(data["claude"]["roots"], [str(claude_extra)])
+        self.assertEqual(data["claude"]["disabled"], [str(self.home / ".claude")])
+        self.assertEqual(data["codex"]["roots"], [str(codex_extra)])
+        self.assertEqual(data["codex"]["ignored"], [str(self.home / ".codex")])
+        self.assertFalse(legacy.exists())
+        self.assertTrue(legacy.with_name("config.json.migrated").is_file())
+        payload = self.run_json("config", "--json")
+        paths = [row["path"] for row in payload["roots"]]
+        self.assertIn(str(codex_extra), paths)
+        self.assertNotIn(str(self.home / ".claude"), paths)
+
+    def test_disabled_roots_do_not_fall_back_to_the_defaults(self) -> None:
+        """An empty table the user wrote means "scan nothing" (review #1)."""
+
+        self.write_config(
+            '[claude]\nroots = []\ndisabled = ["%s"]\n' % (self.home / ".claude")
+        )
+        payload = self.run_json("config", "--json")
+        self.assertEqual(
+            [row["path"] for row in payload["roots"] if row["harness"] == "claude"], []
+        )
+        # The absent [codex] table still means "no opinion" -> defaults.
+        self.assertEqual(
+            [row["path"] for row in payload["roots"] if row["harness"] == "codex"],
+            [str(self.home / ".codex")],
+        )
+        with self.env_applied():
+            config = QC.load_config(self.config_path())
+            self.assertEqual(QC.resolve_roots("claude", [], config, quiet=True), [])
+
+    def test_source_disabled_in_the_ui_disappears_from_the_cli(self) -> None:
+        now = time.time() - 600
+        self.write_claude(
+            "default.jsonl",
+            [claude_assistant_line(now, "aaaa0001-1111-2222-3333-444444444444",
+                                   "msg_d", output_tokens=10)],
+        )
+        with self.env_applied():
+            settings = SourceSettings.load(self.config_path(), self.home)
+            for source in settings.sources:
+                settings.set_enabled(source.id, False)
+            settings.save()
+        payload = self.run_json("sessions", "--harness", "claude", "--json")
+        self.assertEqual(payload["sessions"], [])
+
+    def test_unknown_tables_and_keys_survive_a_save(self) -> None:
+        import tomllib
+
+        extra_root = self.make_extra_codex_root(".codex-extra")
+        self.write_config(
+            '[ui]\ntheme = "dark"\nrefresh = 30\n\n'
+            '[ui.colors]\naccent = "teal"\n\n'
+            '[claude]\nroots = ["%s"]\nfuture_key = true\n'
+            % (self.home / ".claude")
+        )
+        with self.env_applied():
+            settings = SourceSettings.load(self.config_path(), self.home)
+            settings.add(extra_root, "codex")
+            settings.save()
+        data = tomllib.loads(self.config_path().read_text(encoding="utf-8"))
+        self.assertEqual(data["ui"]["theme"], "dark")
+        self.assertEqual(data["ui"]["refresh"], 30)
+        self.assertEqual(data["ui"]["colors"]["accent"], "teal")
+        self.assertTrue(data["claude"]["future_key"])
+        self.assertIn(str(extra_root), data["codex"]["roots"])
+
+    def test_config_init_force_keeps_unknown_tables_and_ui_state(self) -> None:
+        import tomllib
+
+        disabled = self.make_extra_claude_root(".claude-off")
+        self.write_config(
+            '[ui]\ntheme = "dark"\n\n'
+            '[claude]\nroots = ["%s"]\ndisabled = ["%s"]\n'
+            % (self.home / ".claude", disabled)
+        )
+        result = self.run_tool("config", "--init", "--force")
+        self.assertEqual(result.returncode, 0, result.stderr.decode("utf-8", "replace"))
+        data = tomllib.loads(self.config_path().read_text(encoding="utf-8"))
+        self.assertEqual(data["ui"]["theme"], "dark")
+        self.assertEqual(data["claude"]["disabled"], [str(disabled)])
+        # A disabled root is not reseeded as an enabled one.
+        self.assertNotIn(str(disabled), data["claude"]["roots"])
+        self.assertIn(str(self.home / ".claude"), data["claude"]["roots"])
+
+    def test_cli_alone_migrates_config_json(self) -> None:
+        extra = self.make_extra_codex_root(".codex-extra")
+        legacy = self.root / "config" / "config.json"
+        legacy.parent.mkdir(parents=True, exist_ok=True)
+        legacy.write_text(json.dumps({"version": 1, "sources": [
+            {"id": "a", "name": ".codex-extra", "harness": "codex",
+             "path": str(extra), "enabled": True}]}), encoding="utf-8")
+        result = self.run_tool("config")
+        self.assertEqual(result.returncode, 0, result.stderr.decode("utf-8", "replace"))
+        self.assertIn("imported", result.stderr.decode("utf-8", "replace"))
+        self.assertIn(str(extra), result.stdout.decode("utf-8", "replace"))
+        self.assertTrue(self.config_path().is_file())
+        self.assertTrue(legacy.with_name("config.json.migrated").is_file())
+
+    def test_migration_is_skipped_when_config_toml_exists(self) -> None:
+        self.write_config('[claude]\nroots = ["%s"]\n' % (self.home / ".claude"))
+        legacy = self.root / "config" / "config.json"
+        legacy.write_text('{"version": 1, "sources": []}', encoding="utf-8")
+        with self.env_applied():
+            self.assertIsNone(migrate_json_store(self.config_path()))
+        self.assertTrue(legacy.is_file())
 
 
 if __name__ == "__main__":

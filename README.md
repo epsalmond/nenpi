@@ -64,8 +64,10 @@ nenpi-web --host 127.0.0.1 --port 8000
 Open `http://127.0.0.1:8000/` in your browser. `HOST` and `PORT` refer to the
 machine running nenpi, which can differ from the machine displaying the page.
 The browser discovers Claude and Codex transcript roots under that host's home
-directory and persists source choices in `~/.config/nenpi/config.json` (or
-`$NENPI_CONFIG`). Filter the session table with free text or
+directory and persists source choices in the same `~/.config/nenpi/config.toml`
+the CLI reads (or `$NENPI_CONFIG`; an older `config.json` is imported once and
+renamed to `config.json.migrated`). Switching every root of a harness off
+leaves the CLI scanning nothing for it, not the defaults. Filter the session table with free text or
 `harness:claude`, `project:name`, `since:YYYY-MM-DD`, and
 `until:YYYY-MM-DD`; use the sort button to change the ordering. A scan runs in
 a worker and cancellation keeps the previous result visible. Date filters

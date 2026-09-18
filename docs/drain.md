@@ -464,6 +464,8 @@ overrides the path):
 ```toml
 [claude]
 roots = ["~/.claude", "~/.claude-arcade"]
+disabled = ["~/.claude-old"]   # written by the UI; not scanned
+ignored = ["~/.claude-tmp"]    # written by the UI; not offered again
 
 [codex]
 roots = ["~/.codex", "~/.codex-arcade"]
@@ -472,6 +474,34 @@ roots = ["~/.codex", "~/.codex-arcade"]
 claude = "max_20x"
 codex = "pro"
 ```
+
+This one file is the whole store. The Textual Sources screen reads and
+writes it too: adding a source appends to `roots`, switching one off moves
+it to `disabled`, and removing a discovered one records it under `ignored`.
+An older `~/.config/nenpi/config.json` (the UI's previous store) is imported
+on first use — enabled state preserved, each source's harness re-derived
+from its layout, since the Sources form used to save `~/.codex-*` roots as
+Claude — and the old file is renamed to `config.json.migrated`. Nothing
+reads it afterwards. `$NENPI_CONFIG`, the UI's own override, still works and
+is now an alias of `$NENPI_CONFIG_FILE`; it names the TOML file, and a
+`.json` value is read as the `.toml` beside it, with a warning. The import
+also runs for a CLI-only user, on the first command after the upgrade. A
+`config.json` that listed sources for one harness only imports as an empty
+`roots = []` table for the other, which now means "scan nothing" rather than
+the defaults — run `nenpi config --init` afterwards, or add that harness's
+roots to the file (or delete its table) to get the defaults back.
+
+An empty `roots` in a `[claude]`/`[codex]` table the file actually has means
+"scan nothing for this harness": disabling every root in the UI keeps the
+CLI away from `~/.claude` too. The defaults below apply only when the
+harness has no table at all.
+
+Writing the file (the Sources screen, or `nenpi config --init --force`)
+preserves every table and key, including ones this version does not
+recognise, but not comments: `--init` re-seeds `roots` and rewrites the rest
+from what it parsed, so hand-written comments are lost. `--init --force`
+keeps `disabled`, `ignored`, `[plan]` and unknown tables, and never
+re-seeds a root that is listed as disabled or ignored.
 
 A missing file falls back to the defaults above. A malformed file is a hard
 error naming the file and the parse problem; an unknown key is a warning, not

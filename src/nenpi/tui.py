@@ -8,9 +8,9 @@ import argparse
 import shlex
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence
+from typing import Any, Callable, Dict, List, Optional, Sequence
 
-from .settings import Source, SourceSettings
+from .settings import Source, SourceSettings, infer_harness
 
 
 @dataclass
@@ -210,6 +210,14 @@ def build_app(settings: Optional[SourceSettings] = None, scanner: Callable[..., 
             elif event.button.id == "source-add":
                 path = self.query_one("#source-path", Input).value.strip()
                 harness = str(self.query_one("#source-harness", Select).value)
+                # The directory layout beats the dropdown: a root with
+                # sessions/ picked up while the Select still said "claude"
+                # used to be saved with the wrong harness (issue #23). Only
+                # layout counts here - a name says nothing on its own.
+                inferred = infer_harness(Path(path), use_name=False) if path else None
+                if inferred is not None and inferred != harness:
+                    harness = inferred
+                    self.query_one("#source-harness", Select).value = inferred
                 try:
                     app.source_settings.add(Path(path), harness)
                     app.source_settings.save()
@@ -355,7 +363,6 @@ def build_app(settings: Optional[SourceSettings] = None, scanner: Callable[..., 
                 self.query_one("#status", Static).update("Scan failed: %s" % worker.error)
 
         def render_sessions(self, query: str = "") -> None:
-            needle = query.strip().lower()
             rows = filter_sessions(self.result.sessions, query, self._sort)
             self._visible_sessions = rows
             view = self.query_one("#sessions", ListView)
