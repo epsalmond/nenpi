@@ -59,6 +59,11 @@ its default of 1.0), `--use-calibrated` prefers a stored fit,
 part inside the range, `--ascii` draws bars without block glyphs, and
 `--rebuild-cache` discards the parse cache.
 
+`--profile` (or `NENPI_PROFILE=1`) prints one line per phase — scan, totals,
+prompts, intervals, attribute, total — to stderr, so a run that got slower
+says which phase did it without reaching for cProfile. stdout is untouched,
+so `--json --profile` still pipes cleanly.
+
 `--since` and `--until` window the **events**, not just the session list. A
 session that started weeks ago and ran again this morning reports only this
 morning's tokens; `--whole-session` opts back into its lifetime totals.

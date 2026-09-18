@@ -3996,5 +3996,46 @@ class EventVectorEquivalence(unittest.TestCase):
         self.assertIsNone(self.weights.event_vector("claude", "not-a-real-model"))
 
 
+class ProfileFlag(Harness):
+    def test_profile_prints_phase_timings_to_stderr(self) -> None:
+        now = time.time() - 600
+        session = "77777777-aaaa-2222-3333-444444444444"
+        self.write_claude(
+            "profiled.jsonl",
+            [claude_assistant_line(now, session, "msg_1", output_tokens=100)],
+        )
+        result = self.run_tool("sessions", "--harness", "claude", "--profile")
+        self.assertEqual(result.returncode, 0, result.stderr.decode("utf-8", "replace"))
+        report = result.stderr.decode("utf-8")
+        for phase in ("scan", "totals", "prompts", "intervals", "attribute", "total"):
+            self.assertRegex(report, r"nenpi: %s +\d+\.\d+s" % phase)
+        # The report is stderr-only, so piping stdout to jq or a table stays clean.
+        self.assertNotIn("nenpi: total", result.stdout.decode("utf-8"))
+
+    def test_profile_is_silent_by_default(self) -> None:
+        now = time.time() - 600
+        session = "88888888-aaaa-2222-3333-444444444444"
+        self.write_claude(
+            "quiet.jsonl",
+            [claude_assistant_line(now, session, "msg_1", output_tokens=100)],
+        )
+        result = self.run_tool("sessions", "--harness", "claude")
+        self.assertEqual(result.returncode, 0, result.stderr.decode("utf-8", "replace"))
+        self.assertNotIn("nenpi: total", result.stderr.decode("utf-8"))
+
+    def test_nenpi_profile_env_var_turns_it_on(self) -> None:
+        now = time.time() - 600
+        session = "99999999-aaaa-2222-3333-444444444444"
+        self.write_claude(
+            "env.jsonl",
+            [claude_assistant_line(now, session, "msg_1", output_tokens=100)],
+        )
+        result = self.run_tool(
+            "sessions", "--harness", "claude", extra_env={"NENPI_PROFILE": "1"}
+        )
+        self.assertEqual(result.returncode, 0, result.stderr.decode("utf-8", "replace"))
+        self.assertIn("nenpi: total", result.stderr.decode("utf-8"))
+
+
 if __name__ == "__main__":
     unittest.main()

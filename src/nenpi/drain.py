@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import bisect
+import contextlib
 import hashlib
 import json
 import math
@@ -1304,6 +1305,55 @@ def snapshot_rows(limits: Mapping[str, Any], epoch: float) -> List[Dict[str, Any
             }
         )
     return rows
+
+
+# --------------------------------------------------------------------------
+# phase timing
+
+
+# `--profile` is a stderr-only stopwatch, not a profiler: it names the phases
+# a run spends its time in so a regression shows up without cProfile. Off by
+# default and free when off, so the TUI and the statusline path pay nothing.
+_PROFILE = {"on": False, "phases": []}  # type: Dict[str, Any]
+
+
+def profile_enabled(args: argparse.Namespace) -> bool:
+    return bool(getattr(args, "profile", False)) or os.environ.get("NENPI_PROFILE") == "1"
+
+
+def profile_start(enabled: bool) -> None:
+    """Arm the timer and drop whatever the previous run recorded.
+
+    The TUI calls `prepare` once per refresh in one long-lived process, so
+    the phase list has to be per-run; appending to a process-global list
+    would grow without bound and report every refresh since startup.
+    """
+    _PROFILE["on"] = enabled
+    _PROFILE["phases"] = []
+
+
+@contextlib.contextmanager
+def profile_phase(name: str) -> Iterator[None]:
+    if not _PROFILE["on"]:
+        yield
+        return
+    started = time.perf_counter()
+    try:
+        yield
+    finally:
+        _PROFILE["phases"].append((name, time.perf_counter() - started))
+
+
+def profile_report() -> None:
+    """Print this run's phases and clear them, so nothing accumulates."""
+    phases = _PROFILE["phases"]
+    _PROFILE["phases"] = []
+    if not _PROFILE["on"] or not phases:
+        return
+    width = max(len(name) for name, _ in phases)
+    for name, seconds in phases:
+        sys.stderr.write("nenpi: %-*s %8.3fs\n" % (width, name, seconds))
+    sys.stderr.flush()
 
 
 # --------------------------------------------------------------------------
@@ -3642,35 +3692,40 @@ def prepare(
         since = parse_since(args.since, now)
         until = parse_since(args.until, now) if getattr(args, "until", None) else None
         weights = load_weights(getattr(args, "use_calibrated", False))
-        scan = collect(args, since, run)
+        with profile_phase("scan"):
+            scan = collect(args, since, run)
         if getattr(args, "account", None):
             filter_by_account(scan, args.account)
         run.emit("analysis", message="building analysis")
         run.check()
-        if not getattr(args, "whole_session", False):
-            window_events(scan, since, until, cancellation)
-        rebuild_totals(scan, cancellation)
+        with profile_phase("totals"):
+            if not getattr(args, "whole_session", False):
+                window_events(scan, since, until, cancellation)
+            rebuild_totals(scan, cancellation)
         analysis = Analysis(scan, weights, since, until, args)
         # Prompt keys must exist before attribution so measured drain can be split
         # down to the prompt as well as the session.
-        analysis.prompts = assemble_prompts(scan, weights, args, cancellation)
+        with profile_phase("prompts"):
+            analysis.prompts = assemble_prompts(scan, weights, args, cancellation)
         run.check()
-        analysis.window = choose_window(scan.snapshots, args.window)
-        analysis.intervals = [
-            interval
-            for interval in build_intervals(scan.snapshots, analysis.window, cancellation)
-            if (since is None or interval.end >= since)
-            and (until is None or interval.start <= until)
-        ]
-        for interval in analysis.intervals:
-            run.check()
-            if since is not None and interval.start < since:
-                interval.start = since
+        with profile_phase("intervals"):
+            analysis.window = choose_window(scan.snapshots, args.window)
+            analysis.intervals = [
+                interval
+                for interval in build_intervals(scan.snapshots, analysis.window, cancellation)
+                if (since is None or interval.end >= since)
+                and (until is None or interval.start <= until)
+            ]
+            for interval in analysis.intervals:
+                run.check()
+                if since is not None and interval.start < since:
+                    interval.start = since
         # attribute()'s signature stays compatible with its account-aware
         # implementation; cancellation is an optional final argument.
         args._session_accounts = scan.session_accounts
-        attribute(analysis.intervals, scan.events["codex"], weights, args, cancellation)
-        apply_prompt_drain(analysis, cancellation)
+        with profile_phase("attribute"):
+            attribute(analysis.intervals, scan.events["codex"], weights, args, cancellation)
+            apply_prompt_drain(analysis, cancellation)
         run.emit("done", message="analysis ready")
         return analysis
     except (ScanCancelled, KeyboardInterrupt):
@@ -5140,6 +5195,11 @@ def add_common(parser: argparse.ArgumentParser) -> None:
         help="write the command result as indented JSON",
     )
     parser.add_argument(
+        "--profile", action="store_true",
+        help="print phase timings (scan, totals, prompts, intervals, attribute, "
+             "render) to stderr; NENPI_PROFILE=1 does the same",
+    )
+    parser.add_argument(
         "--no-color", action="store_true",
         help="disable ANSI colors, including the scan progress display",
     )
@@ -5482,10 +5542,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return 2
     if getattr(args, "harness", None) == "claude" and args.command == "windows":
         warn("windows are a Codex-only measurement")
+    profile_start(profile_enabled(args))
     try:
-        return args.handler(args)
+        with profile_phase("total"):
+            return args.handler(args)
     except ScanCancelled:
         return 130
+    finally:
+        profile_report()
 
 
 if __name__ == "__main__":
