@@ -12,9 +12,18 @@ requires-python = ">=3.11"
 authors = [{ name = "Eric Psalmond" }]
 dependencies = []
 
+[project.optional-dependencies]
+ui = ["textual>=0.50; python_version >= '3.11'"]
+browser = [
+    "textual>=0.50; python_version >= '3.11'",
+    "textual-serve>=1.1; python_version >= '3.11'",
+]
+
 [project.scripts]
 nenpi = "nenpi.drain:main"
 nenpi-bench = "nenpi.bench:main"
+nenpi-ui = "nenpi.tui:main"
+nenpi-web = "nenpi.tui:web_main"
 
 [project.urls]
 Homepage = "https://github.com/epsalmond/nenpi"

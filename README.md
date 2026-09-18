@@ -1,5 +1,39 @@
 # nenpi
 
+## Optional browser
+
+The terminal reports remain stdlib-only. Install the optional UI extra on
+Python 3.11 or newer and launch the local Textual browser:
+
+```sh
+python -m pip install 'nenpi[ui]'
+nenpi-ui
+```
+
+For the browser websocket server, install the browser extra and run:
+
+```sh
+python -m pip install 'nenpi[browser]'
+nenpi-ui --browser --host 127.0.0.1 --port 8000
+```
+
+`nenpi-web` is an alias for the same browser entry point. The server binds to
+localhost by default and serves the Textual websocket application, not only a
+static page.
+
+The browser discovers Claude and Codex transcript roots under the home
+directory and persists source choices in `~/.config/nenpi/config.json` (or
+`$NENPI_CONFIG`). Filter the session table with free text or
+`harness:claude`, `project:name`, `since:YYYY-MM-DD`, and
+`until:YYYY-MM-DD`; use the sort button to change the ordering. A scan runs in
+a worker and cancellation keeps the previous result visible. Date filters
+select sessions active in the range; the displayed session totals remain
+whole-session totals.
+
+The browser is a local view of the same transcript data and uses the same
+`config.toml` root and account resolution as the terminal reports. Account
+labels remain attached to the session payloads used by the browser.
+
 nenpi (燃費, fuel economy) reads Claude Code and Codex CLI transcripts on disk
 and reports which sessions drained how much **subscription-plan quota** — not
 API dollars. Codex quota is measured directly from the `rate_limits`
