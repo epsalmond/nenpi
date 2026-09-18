@@ -74,6 +74,9 @@ nenpi prompts --session 0123abcd --since 7d   # next: nenpi tools --session 0123
 nenpi tools --session 0123abcd --prompt 27 --since 7d
 ```
 
+Each suggested `--session` uses the shortest prefix that resolves to one
+session, and every value is shell-quoted, so the line runs as printed.
+
 Because the footer is on stderr, stdout stays pipeable. `--quiet`/`-q` or
 `NENPI_QUIET=1` turns it off; under `--json` nothing is written to stderr and
 the same suggestions ride along as the payload's `next` list of

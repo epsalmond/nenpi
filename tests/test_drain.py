@@ -11,6 +11,7 @@ import contextlib
 import io
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -5220,7 +5221,10 @@ class PromptRanking(Harness):
 class NextStepFooter(Harness):
     """Issue #27: every command ends with a data-driven stderr footer."""
 
+    # TWIN shares BIG's whole short_id: a suggestion that printed
+    # `short_id` would exit 1 as an ambiguous prefix (#27).
     BIG = "cc002701-1111-2222-3333-444444444444"
+    TWIN = "cc002701-1111-2222-3333-555555555555"
     SMALL = "dd002702-1111-2222-3333-444444444444"
 
     def write_corpus(self) -> float:
@@ -5242,6 +5246,16 @@ class NextStepFooter(Harness):
                 claude_assistant_line(
                     now + 11, self.BIG, "msg_big_3",
                     input_tokens=1000, cache_read=2000, output_tokens=20,
+                ),
+            ],
+        )
+        self.write_claude(
+            "twin.jsonl",
+            [
+                claude_user_prompt_line(now, self.TWIN),
+                claude_assistant_line(
+                    now + 1, self.TWIN, "msg_twin",
+                    input_tokens=100, cache_read=100, output_tokens=5,
                 ),
             ],
         )
@@ -5276,9 +5290,9 @@ class NextStepFooter(Harness):
             ("timeline",),
             ("windows",),
             ("prompts",),
-            ("prompts", "--session", "cc002701"),
+            ("prompts", "--session", self.big_prefix()),
             ("tools",),
-            ("tools", "--session", "cc002701"),
+            ("tools", "--session", self.big_prefix()),
             ("fanout",),
             ("reductions",),
             ("verify",),
@@ -5290,30 +5304,118 @@ class NextStepFooter(Harness):
             self.assertTrue(lines, "no footer for %s" % (command,))
             self.assertLessEqual(len(lines), 3, "%s footer is too long" % (command,))
 
+    def big_prefix(self) -> str:
+        return QD.pick_id(self.BIG, [self.BIG, self.TWIN, self.SMALL])
+
     def test_sessions_footer_names_the_top_sessions(self) -> None:
         self.write_corpus()
         lines = self.footer_lines("sessions", "--harness", "claude", "--no-color")
-        self.assertIn("top 2 by drain", lines[0])
-        self.assertIn(QD.short_id(self.BIG), lines[0])
+        prefix = self.big_prefix()
+        self.assertIn("top 3 by drain", lines[0])
+        self.assertIn(prefix, lines[0])
         self.assertTrue(
-            any("nenpi prompts --session %s" % QD.short_id(self.BIG) in line
-                for line in lines), lines)
+            any("nenpi prompts --session %s" % prefix in line for line in lines), lines)
         self.assertTrue(
-            any("nenpi tools --session %s" % QD.short_id(self.BIG) in line
-                for line in lines), lines)
+            any("nenpi tools --session %s" % prefix in line for line in lines), lines)
+
+    def test_suggested_prefix_is_unambiguous(self) -> None:
+        """A colliding short_id must never be what the footer prints."""
+        self.write_corpus()
+        prefix = self.big_prefix()
+        self.assertNotEqual(prefix, QD.short_id(self.BIG))
+        self.assertTrue(self.BIG.replace("-", "").startswith(prefix), prefix)
+        lines = self.footer_lines("sessions", "--harness", "claude", "--no-color")
+        for line in lines:
+            self.assertNotIn(" --session %s " % QD.short_id(self.BIG), line + " ")
+        payload = self.run_json("prompts", "--session", prefix, "--harness", "claude",
+                                "--json")
+        self.assertEqual(payload["session_id"], self.BIG)
+        # The ambiguous short id really is ambiguous, so the old footer was wrong.
+        ambiguous = self.run_tool(
+            "prompts", "--session", QD.short_id(self.BIG), "--harness", "claude", "--json")
+        self.assertEqual(ambiguous.returncode, 1)
+
+    def test_sort_start_relabels_the_note_and_keeps_the_drain_leader(self) -> None:
+        self.write_corpus()
+        lines = self.footer_lines(
+            "sessions", "--harness", "claude", "--sort", "start", "--no-color")
+        self.assertIn("top 3 by start", lines[0])
+        # The "Nx the median" claim is about drain, so it must name the drain
+        # leader even when the table is sorted by start.
+        if "drains" in lines[0]:
+            self.assertIn(self.big_prefix(), lines[0].split("drains")[0].split("(")[-1])
+
+    def test_median_is_taken_over_every_session_in_scope(self) -> None:
+        self.write_corpus()
+        # --top 1 shows one row; the median must still come from all three.
+        lines = self.footer_lines(
+            "sessions", "--harness", "claude", "--top", "1", "--no-color")
+        self.assertIn("top 1 by drain", lines[0])
+        self.assertIn("drains", lines[0])
+
+    def test_free_text_flags_are_shell_quoted(self) -> None:
+        namespace = argparse.Namespace(
+            since="2026-01-01 00:00", until=None, harness="claude",
+            account="pool;rm -rf /", sort="drain", json=False, quiet=False)
+        rendered = QD.suggest(namespace, "sessions", "--session", "abcd1234")
+        self.assertIn("'2026-01-01 00:00'", rendered)
+        self.assertIn("'pool;rm -rf /'", rendered)
+        self.assertNotIn("; rm", rendered.replace("'pool;rm -rf /'", ""))
+
+    def test_a_since_with_a_space_survives_the_round_trip(self) -> None:
+        self.write_corpus()
+        stamp = datetime.fromtimestamp(time.time() - 86400).strftime("%Y-%m-%d %H:%M")
+        lines = self.footer_lines(
+            "sessions", "--since", stamp, "--harness", "claude", "--no-color")
+        quoted = "--since '%s'" % stamp
+        for line in lines[1:]:
+            self.assertIn(quoted, line)
+        arguments = shlex.split(lines[1].split("#")[0].split(":", 1)[1])
+        result = self.run_tool(*arguments[1:], "--json")
+        self.assertEqual(result.returncode, 0, result.stderr.decode())
+
+    def test_fanout_json_stays_json_on_an_empty_range(self) -> None:
+        result = self.run_tool("fanout", "--harness", "claude", "--since", "1h", "--json")
+        self.assertEqual(result.returncode, 0, result.stderr.decode())
+        payload = json.loads(result.stdout.decode("utf-8"))
+        self.assertEqual(payload["prompts"], 0)
+        self.assertEqual(payload["top_prompts"], [])
+        self.assertTrue(payload["next"])
+        self.assertNotIn(b"next:", result.stderr)
+
+    def test_snapshot_failure_prints_no_footer(self) -> None:
+        result = self.run_tool("snapshot", "--oauth")
+        self.assertEqual(result.returncode, 1)
+        self.assertNotIn(b"next:", result.stderr)
+
+    def test_no_color_env_disables_footer_color(self) -> None:
+        namespace = argparse.Namespace(no_color=False)
+        saved_stderr, saved_env = sys.stderr, os.environ.get("NO_COLOR")
+        sys.stderr = TtyStringIO()
+        try:
+            os.environ.pop("NO_COLOR", None)
+            self.assertTrue(QD.footer_painter(namespace).enabled)
+            os.environ["NO_COLOR"] = "1"
+            self.assertFalse(QD.footer_painter(namespace).enabled)
+        finally:
+            sys.stderr = saved_stderr
+            if saved_env is None:
+                os.environ.pop("NO_COLOR", None)
+            else:
+                os.environ["NO_COLOR"] = saved_env
 
     def test_prompts_session_footer_points_at_the_busiest_prompt(self) -> None:
         self.write_corpus()
         lines = self.footer_lines(
-            "prompts", "--session", "cc002701", "--harness", "claude", "--no-color")
-        self.assertIn("nenpi tools --session %s --prompt 1" % QD.short_id(self.BIG),
+            "prompts", "--session", self.big_prefix(), "--harness", "claude", "--no-color")
+        self.assertIn("nenpi tools --session %s --prompt 1" % self.big_prefix(),
                       " ".join(lines))
 
     def test_tools_footer_names_the_top_tool_and_session(self) -> None:
         self.write_corpus()
         lines = self.footer_lines("tools", "--harness", "claude", "--no-color")
         self.assertIn("Bash", lines[0])
-        self.assertIn("nenpi tools --session %s" % QD.short_id(self.BIG), " ".join(lines))
+        self.assertIn("nenpi tools --session %s" % self.big_prefix(), " ".join(lines))
 
     def test_timeline_footer_suggests_the_busiest_bucket(self) -> None:
         self.write_corpus()
@@ -5346,7 +5448,7 @@ class NextStepFooter(Harness):
 
     def test_json_keeps_stdout_pure_and_carries_next(self) -> None:
         self.write_corpus()
-        for command in (("sessions",), ("prompts",), ("prompts", "--session", "cc002701"),
+        for command in (("sessions",), ("prompts",), ("prompts", "--session", self.big_prefix()),
                         ("tools",), ("fanout",), ("timeline",), ("windows",),
                         ("reductions",), ("verify",), ("config",)):
             scope = () if command == ("config",) else ("--harness", "claude")

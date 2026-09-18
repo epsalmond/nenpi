@@ -73,6 +73,12 @@ the `--since`, `--until`, `--harness`, and `--account` flags of the run that
 produced them, so each is runnable as printed and stays in the same scope; a
 flag the suggestion sets itself (the bucket's own `--since`) wins.
 
+A suggested `--session` carries the shortest prefix no other session in
+scope shares (eight characters unless that collides), so it resolves instead
+of failing as ambiguous, and every value is shell-quoted, so a `--since` or
+`--account` holding spaces pastes safely. Color is skipped when `NO_COLOR`
+is set.
+
 stdout is untouched, so `nenpi sessions | tee` stays clean. `--quiet`/`-q`
 and `NENPI_QUIET=1` suppress the footer. Under `--json` nothing goes to
 stderr and the same suggestions are the payload's additive `next` key, a list

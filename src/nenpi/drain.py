@@ -22,6 +22,7 @@ import json
 import math
 import os
 import re
+import shlex
 import shutil
 import statistics
 import sys
@@ -4314,11 +4315,40 @@ def suggest(args: argparse.Namespace, command: str, *flags: Any) -> str:
     for index in range(0, len(carried), 2):
         if carried[index] not in given:
             extra += [carried[index], carried[index + 1]]
-    return " ".join(["nenpi", command] + given + extra)
+    # Quoted because --since/--until/--account carry free text: a printed
+    # suggestion has to be safe to paste into a shell as it stands.
+    return " ".join(["nenpi", command] + [shlex.quote(part) for part in given + extra])
+
+
+def analysis_session_ids(analysis: "Analysis") -> List[str]:
+    """Every session id the run could resolve a `--session` prefix against."""
+    return sorted({session_id for _harness, session_id in analysis.scan.sessions})
+
+
+def pick_id(session_id: str, known: Sequence[str]) -> str:
+    """The shortest prefix of `session_id` no other session in scope shares.
+
+    `short_id`'s eight characters are fine to read but not to run: on a real
+    corpus several sessions share them and the suggested `--session` would
+    exit 1 as ambiguous (#27). Grows from eight characters, and falls back to
+    the full id when even that is only a prefix of another id.
+    """
+    flat = session_id.replace("-", "")
+    rivals = [
+        other.replace("-", "") for other in known
+        if other != session_id and other.replace("-", "") != flat
+    ]
+    for length in range(min(8, len(flat)), len(flat) + 1):
+        prefix = flat[:length]
+        if not any(rival.startswith(prefix) for rival in rivals):
+            return prefix
+    return session_id
 
 
 def footer_painter(args: argparse.Namespace) -> Painter:
     """Color the footer only when stderr is a tty of its own."""
+    if os.environ.get("NO_COLOR"):
+        return Painter(False)
     return Painter(sys.stderr.isatty() and not getattr(args, "no_color", False))
 
 
@@ -4355,18 +4385,27 @@ def session_weight(row: "Row") -> float:
     return row.relative
 
 
-def sessions_hints(args: argparse.Namespace, rows: Sequence["Row"]) -> List[Dict[str, str]]:
-    if not rows:
+def sessions_hints(
+    args: argparse.Namespace, shown: Sequence["Row"], scoped: Sequence["Row"],
+    known: Sequence[str]
+) -> List[Dict[str, str]]:
+    if not shown:
         return widen_hints(args, "sessions")
-    top = rows[:3]
-    lead = short_id(top[0].summary.session_id)
-    note = "top %d by drain: %s" % (
-        len(top), ", ".join(short_id(row.summary.session_id) for row in top))
-    weights = sorted(session_weight(row) for row in rows)
+    top = shown[:3]
+    lead = pick_id(top[0].summary.session_id, known)
+    # The note has to name the order actually on screen: --sort start ranks
+    # by recency, and calling that "by drain" would be a lie (#27).
+    note = "top %d by %s: %s" % (
+        len(top), getattr(args, "sort", "drain"),
+        ", ".join(pick_id(row.summary.session_id, known) for row in top))
+    # The median is over every session in scope, not the --top slice, and
+    # the multiple is always the drain leader's, whatever the sort is.
+    weights = sorted(session_weight(row) for row in scoped)
     median = weights[len(weights) // 2] if weights else 0.0
-    if median > 0 and session_weight(rows[0]) >= 3.0 * median:
+    leader = max(scoped, key=session_weight) if scoped else None
+    if leader is not None and median > 0 and session_weight(leader) >= 3.0 * median:
         note += " (%s drains %.1fx the median session here)" % (
-            lead, session_weight(rows[0]) / median)
+            pick_id(leader.summary.session_id, known), session_weight(leader) / median)
     return [
         hint("", note),
         hint(suggest(args, "prompts", "--session", lead), "which prompts drove %s" % lead),
@@ -4396,7 +4435,7 @@ def iso_arg(epoch: float) -> str:
 
 
 def windows_hints(
-    args: argparse.Namespace, ordered: Sequence[Mapping[str, Any]]
+    args: argparse.Namespace, ordered: Sequence[Mapping[str, Any]], known: Sequence[str]
 ) -> List[Dict[str, str]]:
     if not ordered:
         return widen_hints(args, "Codex quota windows")
@@ -4414,19 +4453,19 @@ def windows_hints(
     top = top_session_list(busiest["sessions"], 1)
     if top:
         hints.append(
-            hint(suggest(args, "prompts", "--session", top[0]["short_id"]),
+            hint(suggest(args, "prompts", "--session", pick_id(top[0]["session_id"], known)),
                  "its biggest session, prompt by prompt")
         )
     return hints
 
 
 def prompts_ranked_hints(
-    args: argparse.Namespace, shown: Sequence["Prompt"]
+    args: argparse.Namespace, shown: Sequence["Prompt"], known: Sequence[str]
 ) -> List[Dict[str, str]]:
     if not shown:
         return widen_hints(args, "prompts")
     lead = shown[0]
-    session = short_id(lead.session_id)
+    session = pick_id(lead.session_id, known)
     return [
         hint("", "#1 is prompt %d of session %s (%d turns, %s peak context)"
              % (lead.index, session, lead.turns, format_tokens(lead.context_peak))),
@@ -4438,11 +4477,12 @@ def prompts_ranked_hints(
 
 
 def prompts_session_hints(
-    args: argparse.Namespace, session_id: str, prompts: Sequence["Prompt"]
+    args: argparse.Namespace, session_id: str, prompts: Sequence["Prompt"],
+    known: Sequence[str]
 ) -> List[Dict[str, str]]:
     if not prompts:
         return widen_hints(args, "prompts")
-    session = short_id(session_id)
+    session = pick_id(session_id, known)
     busiest = max(prompts, key=lambda prompt: (prompt.turns, prompt.index))
     largest = max(prompts, key=lambda prompt: (prompt.context_peak, prompt.index))
     hints = [
@@ -4464,7 +4504,7 @@ def prompts_session_hints(
 
 def tools_hints(
     args: argparse.Namespace, session_id: str, calls: Sequence["ToolCall"],
-    shown: Sequence[Mapping[str, Any]]
+    shown: Sequence[Mapping[str, Any]], known: Sequence[str]
 ) -> List[Dict[str, str]]:
     if not calls or not shown:
         return widen_hints(args, "tool calls")
@@ -4472,7 +4512,7 @@ def tools_hints(
     note = hint("", "top tool by measured context: %s (%s over %d calls)"
                 % (top["tool"], format_tokens(top["measured_tokens"]), top["calls"]))
     if session_id:
-        session = short_id(session_id)
+        session = pick_id(session_id, known)
         busiest = max(calls, key=lambda call: (call.measured, call.prompt)).prompt
         return [
             note,
@@ -4481,8 +4521,7 @@ def tools_hints(
             hint(suggest(args, "prompts", "--session", session, "--tools"),
                  "which prompts those calls belong to"),
         ]
-    busiest_session = heaviest_session(calls)
-    session = short_id(busiest_session)
+    session = pick_id(heaviest_session(calls), known)
     return [
         note,
         hint(suggest(args, "tools", "--session", session),
@@ -4500,7 +4539,7 @@ def heaviest_session(calls: Sequence["ToolCall"]) -> str:
 
 
 def fanout_hints(
-    args: argparse.Namespace, prompts: Sequence["Prompt"]
+    args: argparse.Namespace, prompts: Sequence["Prompt"], known: Sequence[str]
 ) -> List[Dict[str, str]]:
     if not prompts:
         return widen_hints(args, "prompts")
@@ -4513,7 +4552,7 @@ def fanout_hints(
         why = "the session with the widest single prompt"
     else:
         why = "the session with the most sub-agent turns (%d)" % int(totals[busiest])
-    session = short_id(busiest)
+    session = pick_id(busiest, known)
     return [
         hint(suggest(args, "prompts", "--session", session), why),
         hint(suggest(args, "tools", "--session", session),
@@ -4522,7 +4561,7 @@ def fanout_hints(
 
 
 def reductions_hints(
-    args: argparse.Namespace, found: Sequence["Reduction"]
+    args: argparse.Namespace, found: Sequence["Reduction"], known: Sequence[str]
 ) -> List[Dict[str, str]]:
     if not found:
         return [
@@ -4530,7 +4569,7 @@ def reductions_hints(
                  "no reductions in range; see which prompts carry the most context"),
         ]
     biggest = max(found, key=lambda reduction: reduction.removed)
-    session = short_id(biggest.session_id)
+    session = pick_id(biggest.session_id, known)
     return [
         hint("", "largest drop: %s removed from %s at %s"
              % (format_tokens(biggest.removed), session, local_label(biggest.epoch))),
@@ -4540,7 +4579,7 @@ def reductions_hints(
 
 
 def verify_hints(
-    args: argparse.Namespace, report: Sequence[Mapping[str, Any]]
+    args: argparse.Namespace, report: Sequence[Mapping[str, Any]], known: Sequence[str]
 ) -> List[Dict[str, str]]:
     if not report:
         return widen_hints(args, "sessions to verify")
@@ -4552,9 +4591,10 @@ def verify_hints(
         return abs(summed - reported)
 
     worst = max(report, key=gap)
+    session = pick_id(worst["session_id"], known)
     return [
-        hint("", "largest gap between parsed and reported totals: %s" % worst["short_id"]),
-        hint(suggest(args, "prompts", "--session", worst["short_id"]),
+        hint("", "largest gap between parsed and reported totals: %s" % session),
+        hint(suggest(args, "prompts", "--session", session),
              "read that session prompt by prompt"),
     ]
 
@@ -4767,8 +4807,9 @@ def command_sessions(args: argparse.Namespace) -> int:
     dollars_per_percent = claude_dollars_per_percent(since, until)
     apply_claude_estimate(rows, dollars_per_percent)
     score_rows(rows)
-    rows = sort_rows(rows, args.sort)[: args.top]
-    hints = sessions_hints(args, rows)
+    scoped = sort_rows(rows, args.sort)
+    rows = scoped[: args.top]
+    hints = sessions_hints(args, rows, scoped, analysis_session_ids(analysis))
     if args.json:
         payload = {
             "schema": JSON_SCHEMA,
@@ -4966,7 +5007,7 @@ def command_windows(args: argparse.Namespace) -> int:
     # so `intervals`/`scan.snapshots` here hold only the selected account's
     # pool; no re-check against `args.account` is needed.
     ordered = codex_window_entries(scan, intervals, since, window)
-    hints = windows_hints(args, ordered)
+    hints = windows_hints(args, ordered, analysis_session_ids(analysis))
     if args.json:
         payload = {
             "schema": JSON_SCHEMA,
@@ -5410,7 +5451,7 @@ def command_prompts_ranked(args: argparse.Namespace, analysis: "Analysis") -> in
     """`prompts` with no --session: one row per prompt, across sessions."""
     top = args.top if args.top is not None else PROMPTS_RANK_TOP
     shown = rank_prompts(analysis, args.sort, top)
-    hints = prompts_ranked_hints(args, shown)
+    hints = prompts_ranked_hints(args, shown, analysis_session_ids(analysis))
     if args.json:
         print(
             json.dumps(
@@ -5487,7 +5528,8 @@ def command_prompts(args: argparse.Namespace) -> int:
     growth = fit_growth(prompts)
     top = args.top if args.top is not None else PROMPTS_SESSION_TOP
     shown = prompts[-top:] if top and len(prompts) > top else prompts
-    hints = prompts_session_hints(args, session_id, shown)
+    hints = prompts_session_hints(
+        args, session_id, shown, analysis_session_ids(analysis))
     if args.json:
         print(
             json.dumps(
@@ -5688,7 +5730,8 @@ def command_tools(args: argparse.Namespace) -> int:
     shown = rows[: args.top] if args.top else rows
     largest = sorted(calls, key=lambda call: call.chars, reverse=True)[:5]
     measured_total = sum(call.measured for call in calls)
-    hints = tools_hints(args, session_id, calls, shown)
+    hints = tools_hints(
+        args, session_id, calls, shown, analysis_session_ids(analysis))
     if args.json:
         print(
             json.dumps(
@@ -5791,13 +5834,28 @@ def command_fanout(args: argparse.Namespace) -> int:
         for prompt in prompts
         if analysis.in_range(prompt.start) or analysis.in_range(prompt.end)
     ]
+    sort = getattr(args, "sort", "tokens")
     if not prompts:
-        footer(args, widen_hints(args, "prompts"))
+        hints = widen_hints(args, "prompts")
+        if args.json:
+            print(json.dumps(
+                {
+                    "schema": JSON_SCHEMA,
+                    "command": "fanout",
+                    "next": hints,
+                    "prompts": 0,
+                    "sort": sort,
+                    "turns_histogram": [],
+                    "context_histogram": [],
+                    "top_prompts": [],
+                },
+                indent=2, sort_keys=True))
+            return 0
         print("no prompts in range")
+        footer(args, hints)
         return 0
     turns = [float(prompt.turns) for prompt in prompts]
     contexts = [float(prompt.context_peak) for prompt in prompts]
-    sort = getattr(args, "sort", "tokens")
     top = sorted(prompts, key=PROMPT_RANK_KEYS[sort], reverse=True)[:15]
     cwds = {}  # type: Dict[Tuple[str, str], str]
     for (harness, session_id), summary in analysis.scan.sessions.items():
@@ -5825,7 +5883,7 @@ def command_fanout(args: argparse.Namespace) -> int:
             dict(prompt.to_json(), cwd=cwds.get((prompt.harness, prompt.session_id), "-"))
             for prompt in top
         ],
-        "next": fanout_hints(args, prompts),
+        "next": fanout_hints(args, prompts, analysis_session_ids(analysis)),
     }
     if args.json:
         print(json.dumps(summary_json, indent=2, sort_keys=True))
@@ -5915,7 +5973,7 @@ def command_reductions(args: argparse.Namespace) -> int:
         for reduction in detect_reductions_cached(analysis)
         if analysis.in_range(reduction.epoch)
     ][: args.top]
-    hints = reductions_hints(args, found)
+    hints = reductions_hints(args, found, analysis_session_ids(analysis))
     if args.json:
         print(
             json.dumps(
@@ -6027,7 +6085,7 @@ def command_verify(args: argparse.Namespace) -> int:
                     "thread_token_usage": thread,
                 }
             )
-    hints = verify_hints(args, report)
+    hints = verify_hints(args, report, analysis_session_ids(analysis))
     if args.json:
         print(json.dumps(
             {"schema": JSON_SCHEMA, "command": "verify", "next": hints, "rows": report},
@@ -6313,7 +6371,8 @@ def command_snapshot(args: argparse.Namespace) -> int:
         code = snapshot_from_oauth(destination, args)
     else:
         code = snapshot_from_configs(destination)
-    footer(args, snapshot_hints(args))
+    if code == 0:
+        footer(args, snapshot_hints(args))
     return code
 
 
@@ -6830,6 +6889,8 @@ def build_parser() -> argparse.ArgumentParser:
         "-q", "--quiet", action="store_true",
         help="drop the stderr \"what to run next\" footer",
     )
+    snapshot.add_argument("--no-color", action="store_true",
+                          help="disable ANSI colors")
     snapshot.add_argument(
         "--config-dir", action="append", default=[], metavar="PATH",
         help="Claude config directory for --oauth; repeatable (default: discovered configs)",
@@ -6851,6 +6912,8 @@ def build_parser() -> argparse.ArgumentParser:
         "-q", "--quiet", action="store_true",
         help="drop the stderr \"what to run next\" footer",
     )
+    config_cmd.add_argument("--no-color", action="store_true",
+                            help="disable ANSI colors")
     config_cmd.set_defaults(handler=command_config)
 
     return parser
