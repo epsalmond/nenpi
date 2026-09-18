@@ -1284,6 +1284,11 @@ class Scan:
         self.compactions = {}  # type: Dict[Tuple[str, str], List[float]]
         self.claimed = {}  # type: Dict[Tuple[str, str], str]
         self.forks = {}  # type: Dict[Tuple[str, str], Dict[str, int]]
+        # (account key, account label) for every session seen, keyed the same
+        # as `sessions`. Populated in `absorb` from the resolved root, never
+        # from anything cached on disk - see the module docstring's note on
+        # why account identity is not part of the per-file cache schema.
+        self.session_accounts = {}  # type: Dict[Tuple[str, str], Tuple[str, str]]
         self.files_read = 0
         self.files_seen = 0
         self.bytes_read = 0
@@ -1326,6 +1331,9 @@ def collect(args: argparse.Namespace, since: Optional[float]) -> Scan:
     scan.files_seen = len(targets)
     progress = Progress(sys.stderr.isatty() and not getattr(args, "no_color", False),
                         len(stamped), "scanning")
+    # One (label, key) lookup per root, however many files it holds - a
+    # session's account never opens a second `auth.json`/`.claude.json` read.
+    account_cache = {}  # type: Dict[Tuple[str, Path], Tuple[str, str]]
     for _, _, path, kind, root, stat in stamped:
         progress.step()
         entry, stale = cache.entry_for(path, kind, stat)
@@ -1342,7 +1350,11 @@ def collect(args: argparse.Namespace, since: Optional[float]) -> Scan:
             entry.stamp(path, stat)
             cache.mark(path)
             scan.files_read += 1
-        absorb(scan, entry, kind)
+        account_key = (kind, root)
+        if account_key not in account_cache:
+            account_cache[account_key] = account_for_root(root, kind)
+        account_label, account = account_cache[account_key]
+        absorb(scan, entry, kind, account, account_label)
         try:
             cache.flush()
         except OSError as error:
@@ -1356,7 +1368,14 @@ def collect(args: argparse.Namespace, since: Optional[float]) -> Scan:
     return scan
 
 
-def absorb(scan: Scan, entry: FileIndex, harness: str) -> None:
+def absorb(scan: Scan, entry: FileIndex, harness: str, account: str, account_label: str) -> None:
+    """Merge one parsed (possibly cached) file into the scan.
+
+    `account`/`account_label` come from the resolved root this file lives
+    under, detected once per root in `collect` and never persisted to the
+    per-file cache: a moved or relabelled root cannot leave a stale account
+    behind, and a cache shard shared across users never leaks either.
+    """
     for session_id, summary in entry.sessions.items():
         key = (harness, session_id)
         existing = scan.sessions.get(key)
@@ -1364,6 +1383,7 @@ def absorb(scan: Scan, entry: FileIndex, harness: str) -> None:
             scan.sessions[key] = SessionSummary.from_json(summary.to_json())
         else:
             existing.merge(summary)
+        scan.session_accounts[key] = (account, account_label)
     claimed = scan.claimed
     kept = scan.events[harness]
     for row in entry.events:
@@ -1379,7 +1399,11 @@ def absorb(scan: Scan, entry: FileIndex, harness: str) -> None:
                 continue
             claimed[call_id] = row[EVENT_SESSION]
         kept.append(row)
-    scan.snapshots.extend(entry.snapshots)
+    for row in entry.snapshots:
+        stamped_row = dict(row)
+        stamped_row["account"] = account
+        stamped_row["account_label"] = account_label
+        scan.snapshots.append(stamped_row)
     for row in entry.boundaries:
         scan.boundaries.setdefault((harness, str(row[0])), []).append(float(row[1]))
     for row in entry.compactions:
@@ -1438,9 +1462,15 @@ def rebuild_totals(scan: Scan) -> None:
 
 
 class Interval:
-    def __init__(self, key: Tuple[str, str, Any], start: float, end: float, drain: float,
+    def __init__(self, key: Tuple[str, str, str, Any], start: float, end: float, drain: float,
                  resets_at: Any, rollover: bool):
+        # key = (account, limit_id, plan_type, window_minutes); keying the
+        # timeline by account is what keeps two quota pools that share a
+        # limit_id/plan_type/window (two Codex or two Claude roots) from
+        # being read as one pool alternating readings, which used to be
+        # charged as a window rollover on every alternation (#9).
         self.key = key
+        self.account = key[0]
         self.start = start
         self.end = end
         self.drain = drain
@@ -1487,11 +1517,18 @@ def resets_epoch(value: Any) -> Optional[float]:
 
 def snapshot_windows(
     snapshots: Sequence[Mapping[str, Any]]
-) -> Dict[Tuple[str, str, Any], List[Mapping[str, Any]]]:
-    grouped = {}  # type: Dict[Tuple[str, str, Any], List[Mapping[str, Any]]]
+) -> Dict[Tuple[str, str, str, Any], List[Mapping[str, Any]]]:
+    """Group snapshot rows into one timeline per quota pool.
+
+    Keyed by account first: two roots on different accounts can report the
+    same limit_id/plan_type/window_minutes (two Codex Pro seats, two Claude
+    orgs on the same tier) and are still different pools whose readings must
+    never be read as one timeline rolling over (#9).
+    """
+    grouped = {}  # type: Dict[Tuple[str, str, str, Any], List[Mapping[str, Any]]]
     for row in snapshots:
-        key = (row.get("limit_id") or "codex", row.get("plan_type") or "unknown",
-               row.get("window_minutes"))
+        key = (row.get("account") or "default", row.get("limit_id") or "codex",
+               row.get("plan_type") or "unknown", row.get("window_minutes"))
         grouped.setdefault(key, []).append(row)
     for rows in grouped.values():
         rows.sort(key=lambda item: item["ts"])
@@ -1552,7 +1589,7 @@ def build_intervals(snapshots: Sequence[Mapping[str, Any]], window: Any) -> List
     intervals = []
     groups = snapshot_windows(snapshots)
     for key, rows in groups.items():
-        if not window_matches(key[2], window):
+        if not window_matches(key[3], window):
             continue
         current = UNSET  # type: Any
         running = 0.0
@@ -1621,7 +1658,17 @@ def attribute(
     intervals: Sequence[Interval], events: Sequence[Sequence[Any]], weights: Weights,
     args: argparse.Namespace
 ) -> None:
-    """Split each interval's measured drain across the sessions active in it."""
+    """Split each interval's measured drain across the sessions active in it.
+
+    An interval belongs to one account's quota pool (`interval.account`); an
+    event whose session is known to be on a *different* account is skipped so
+    one pool's drain is never split across another account's sessions. The
+    session -> (account, label) map is looked up from `args._session_accounts`,
+    set by `prepare` just before this call - the signature stays
+    `(intervals, events, weights, args)` and the EVENT_* tuple stays
+    positional and unwidened; args is the one place with room for it.
+    """
+    session_accounts = getattr(args, "_session_accounts", None) or {}
     ordered = sorted((event for event in events if event[EVENT_TS] is not None),
                      key=lambda event: event[EVENT_TS])
     if not ordered:
@@ -1634,6 +1681,9 @@ def attribute(
         shares = {}  # type: Dict[str, float]
         prompt_shares = {}  # type: Dict[Tuple[str, Any], float]
         for event in ordered[low:high]:
+            account = session_accounts.get(("codex", event[EVENT_SESSION]))
+            if account is not None and account[0] != interval.account:
+                continue
             tokens = event_tokens(event, CODEX_KINDS)
             units = weighted_units(
                 "codex", event[EVENT_MODEL], tokens, weights, args, bool(event[EVENT_LONG])
@@ -2336,6 +2386,8 @@ class Row:
         self.turns_p90 = 0.0
         self.peak_context = 0
         self.resent_units = 0.0
+        self.account = ""
+        self.account_label = ""
 
 
 def session_rows(
@@ -2368,6 +2420,9 @@ def session_rows(
         if not summary.models and not summary.sub_models:
             continue
         row = Row(summary)
+        account = scan.session_accounts.get((harness, session_id))
+        if account is not None:
+            row.account, row.account_label = account
         kinds = CLAUDE_KINDS if harness == "claude" else CODEX_KINDS
         row.tokens = empty_tokens(kinds)
         row.sub_tokens = empty_tokens(kinds)
@@ -2427,7 +2482,10 @@ def apply_codex_drain(rows: Sequence[Row], intervals: Sequence[Interval]) -> Non
     session_window = {}  # type: Dict[str, Dict[Any, float]]
     labels = {}  # type: Dict[Any, Any]
     for interval in intervals:
-        bucket = resets_bucket(interval.resets_at)
+        # The account is part of the bucket key so two pools whose
+        # `resets_at` happens to round to the same minute never share a
+        # window total.
+        bucket = (interval.account, resets_bucket(interval.resets_at))
         labels[bucket] = interval.resets_at
         window_totals[bucket] = window_totals.get(bucket, 0.0) + interval.drain
         for session_id, share in interval.sessions.items():
@@ -2566,16 +2624,18 @@ def header_lines(
         config,
         quiet=getattr(args, "harness", "all") == "codex",
     )
-    claude_tier = "/".join(sorted(set(read_claude_tier(claude_roots).values())))
-    if not claude_tier and config.plan_claude:
-        claude_tier = config.plan_claude
-    if claude_tier:
-        tiers.append("claude=%s" % claude_tier)
-    codex_plan = latest_codex_plan(scan.snapshots)
-    if not codex_plan and config.plan_codex:
-        codex_plan = config.plan_codex
-    if codex_plan:
-        tiers.append("codex=%s" % codex_plan)
+    claude_tiers = read_claude_tier(claude_roots)
+    if claude_tiers:
+        for label in sorted(claude_tiers):
+            tiers.append("claude[%s]=%s" % (label, claude_tiers[label]))
+    elif config.plan_claude:
+        tiers.append("claude=%s" % config.plan_claude)
+    codex_plans = latest_codex_plan(scan.snapshots)
+    if codex_plans:
+        for label in sorted(codex_plans):
+            tiers.append("codex[%s]=%s" % (label, codex_plans[label]))
+    elif config.plan_codex:
+        tiers.append("codex=%s" % config.plan_codex)
     lines.append(
         "plan: %s | weights: %s | codex window: %s | zone: %s"
         % (", ".join(tiers) or "unknown", weights.source_label, window_label(window),
@@ -2659,14 +2719,15 @@ def read_claude_config(path: Path) -> Optional[Dict[str, Any]]:
     return payload if isinstance(payload, dict) else None
 
 
-def latest_codex_plan(snapshots: Sequence[Mapping[str, Any]]) -> str:
-    latest = None
+def latest_codex_plan(snapshots: Sequence[Mapping[str, Any]]) -> Dict[str, str]:
+    """Map each account label to its most recently observed Codex plan_type."""
+    latest = {}  # type: Dict[str, Mapping[str, Any]]
     for row in snapshots:
-        if latest is None or row["ts"] > latest["ts"]:
-            latest = row
-    if latest is None:
-        return ""
-    return str(latest.get("plan_type") or "")
+        label = str(row.get("account_label") or "default")
+        current = latest.get(label)
+        if current is None or row["ts"] > current["ts"]:
+            latest[label] = row
+    return dict((label, str(row.get("plan_type") or "")) for label, row in latest.items())
 
 
 def render_sessions(rows: Sequence[Row], args: argparse.Namespace, paint: Painter,
@@ -2685,6 +2746,7 @@ def render_sessions(rows: Sequence[Row], args: argparse.Namespace, paint: Painte
         header += " " + "share".ljust(bar_width)[:bar_width]
     lines = [paint(header, "bold")]
 
+    multi_account = len({row.account_label for row in rows if row.account_label}) > 1
     for row in rows:
         summary = row.summary
         harness_glyph = "C" if summary.harness == "claude" else "X"
@@ -2728,6 +2790,8 @@ def render_sessions(rows: Sequence[Row], args: argparse.Namespace, paint: Painte
             detail.append(
                 "subagents %d requests / %.2f units" % (summary.sub_requests, row.sub_units)
             )
+        if multi_account and row.account_label:
+            detail.append("account %s" % row.account_label)
         if detail:
             lines.append(paint(" " * 10 + "; ".join(detail), "dim"))
     return lines
@@ -2799,6 +2863,8 @@ def row_json(row: Row) -> Dict[str, Any]:
         "resent_share": resent_share(row),
         "share_of_window_percent": row.share_of_window,
         "window_resets_at": row.resets_at,
+        "account": row.account,
+        "account_label": row.account_label,
     }
 
 
@@ -2832,12 +2898,43 @@ class Analysis:
         return True
 
 
+def filter_by_account(scan: Scan, label: str) -> None:
+    """Restrict a scan to one account label's sessions, events, and quota rows.
+
+    Filtering here, once, covers every report command that goes through
+    `prepare` (sessions/prompts/fanout/windows/timeline/verify/calibrate)
+    instead of adding a per-command re-check.
+    """
+    keep = {
+        key for key, (_, account_label) in scan.session_accounts.items()
+        if account_label == label
+    }
+    if not keep:
+        warn("no sessions found for account %r; see `nenpi config`" % label)
+    scan.sessions = dict(
+        (key, value) for key, value in scan.sessions.items() if key in keep
+    )
+    for harness, events in scan.events.items():
+        scan.events[harness] = [
+            row for row in events if (harness, row[EVENT_SESSION]) in keep
+        ]
+    scan.snapshots = [row for row in scan.snapshots if row.get("account_label") == label]
+    scan.boundaries = dict(
+        (key, value) for key, value in scan.boundaries.items() if key in keep
+    )
+    scan.compactions = dict(
+        (key, value) for key, value in scan.compactions.items() if key in keep
+    )
+
+
 def prepare(args: argparse.Namespace) -> Analysis:
     now = time.time()
     since = parse_since(args.since, now)
     until = parse_since(args.until, now) if getattr(args, "until", None) else None
     weights = load_weights(getattr(args, "use_calibrated", False))
     scan = collect(args, since)
+    if getattr(args, "account", None):
+        filter_by_account(scan, args.account)
     if not getattr(args, "whole_session", False):
         window_events(scan, since, until)
     rebuild_totals(scan)
@@ -2855,6 +2952,10 @@ def prepare(args: argparse.Namespace) -> Analysis:
     for interval in analysis.intervals:
         if since is not None and interval.start < since:
             interval.start = since
+    # attribute()'s signature stays (intervals, events, weights, args); the
+    # session -> account map rides on args, the one place with room for it
+    # without widening the positional EVENT_* tuple.
+    args._session_accounts = scan.session_accounts
     attribute(analysis.intervals, scan.events["codex"], weights, args)
     apply_prompt_drain(analysis)
     return analysis
@@ -2987,16 +3088,22 @@ def command_windows(args: argparse.Namespace) -> int:
     scan = analysis.scan
     since = analysis.since
     window, intervals = analysis.window, analysis.intervals
-    windows = {}  # type: Dict[Tuple[Any, Any], Dict[str, Any]]
+    windows = {}  # type: Dict[Tuple[Any, Any, Any], Dict[str, Any]]
     for row in scan.snapshots:
         if since is not None and row["ts"] < since:
             continue
         if not window_matches(row.get("window_minutes"), window):
             continue
-        key = (row.get("window_minutes"), resets_bucket(row.get("resets_at")))
+        # Account first: two pools reporting the same window_minutes and
+        # rounding to the same resets_bucket must not be merged into one
+        # window (#9).
+        key = (row.get("account") or "default", row.get("window_minutes"),
+               resets_bucket(row.get("resets_at")))
         entry = windows.setdefault(
             key,
             {
+                "account": row.get("account") or "default",
+                "account_label": row.get("account_label") or "default",
                 "window_minutes": row.get("window_minutes"),
                 "resets_at": row.get("resets_at"),
                 "start": row["ts"],
@@ -3007,19 +3114,23 @@ def command_windows(args: argparse.Namespace) -> int:
         entry["start"] = min(entry["start"], row["ts"])
         entry["peak_used_percent"] = max(entry["peak_used_percent"], row["used_percent"])
     for interval in intervals:
-        key = (interval.key[2], resets_bucket(interval.resets_at))
+        key = (interval.account, interval.key[3], resets_bucket(interval.resets_at))
         entry = windows.get(key)
         if entry is None:
             continue
         for session_id, share in interval.sessions.items():
             entry["sessions"][session_id] = entry["sessions"].get(session_id, 0.0) + share
     ordered = sorted(windows.values(), key=lambda item: item["start"], reverse=True)
+    if getattr(args, "account", None):
+        ordered = [entry for entry in ordered if entry["account_label"] == args.account]
     if args.json:
         payload = {
             "schema": JSON_SCHEMA,
             "command": "windows",
             "windows": [
                 {
+                    "account": entry["account"],
+                    "account_label": entry["account_label"],
                     "window_minutes": entry["window_minutes"],
                     "resets_at": entry["resets_at"],
                     "start": entry["start"],
@@ -3040,9 +3151,10 @@ def command_windows(args: argparse.Namespace) -> int:
         resets_text = local_label(float(resets)) if isinstance(resets, (int, float)) else "-"
         print(
             paint(
-                "window %s min  start %s  resets %s  peak %.1f%%"
+                "window %s min  account %s  start %s  resets %s  peak %.1f%%"
                 % (
                     entry["window_minutes"],
+                    entry["account_label"],
                     local_label(entry["start"]),
                     resets_text,
                     entry["peak_used_percent"],
@@ -3176,13 +3288,31 @@ def iter_snapshots(
 
 
 def load_claude_snapshots(
-    window: str, since: Optional[float] = None, until: Optional[float] = None
+    window: str, since: Optional[float] = None, until: Optional[float] = None,
+    claude_roots: Optional[Sequence[Path]] = None,
 ) -> List[Dict[str, Any]]:
     """Read logged Claude utilisation observations as snapshot rows.
 
     Shaped like the Codex `rate_limits` rows so the same interval builder and
-    NNLS fit apply to both harnesses.
+    NNLS fit apply to both harnesses. Each record only ever carries
+    `config_dir` (a root's basename, per the privacy note on
+    `oauth_snapshot_record`'s docstring - it never stores an account id or
+    org identifier); `account`/`account_label` are resolved here, in memory,
+    by mapping that label through the currently resolved Claude roots.
+    `plan_type` is the LIVE detected rate-limit tier for that root, not
+    whatever tier was in effect when the record was written - `account` is
+    what actually separates the pools now, so a present-tense tier label is
+    enough, and there is no tier field to read out of the record itself.
     """
+    roots = list(claude_roots) if claude_roots is not None else resolve_roots(
+        "claude", [], load_config()
+    )
+    tiers = read_claude_tier(roots)
+    accounts = {}  # type: Dict[str, str]
+    for root in roots:
+        label, key = account_for_root(root, "claude")
+        accounts[label] = key
+    default_label = roots[0].name if roots else "default"
     rows = []
     for record in iter_snapshots(since, until):
         entry = (record.get("windows") or {}).get(window)
@@ -3191,16 +3321,19 @@ def load_claude_snapshots(
         used = entry.get("utilization_percent")
         if not isinstance(used, (int, float)):
             continue
+        label = str(record.get("config_dir") or default_label)
         rows.append(
             {
                 "ts": float(record["ts"]),
                 "limit_id": "claude",
-                "plan_type": str(record.get("config_dir") or "default"),
+                "plan_type": tiers.get(label) or "unknown",
                 "window_minutes": CLAUDE_WINDOW_MINUTES.get(window, 300),
                 "used_percent": float(used),
                 "resets_at": entry.get("resets_at"),
                 "limit_dollars": entry.get("limit_dollars"),
                 "used_dollars": entry.get("used_dollars"),
+                "account": accounts.get(label, label),
+                "account_label": label,
             }
         )
     rows.sort(key=lambda row: row["ts"])
@@ -3227,10 +3360,13 @@ def collect_claude_features(intervals: Sequence[Interval], events: Sequence[Sequ
 
 def calibrate_claude(args: argparse.Namespace, analysis: "Analysis") -> int:
     results = {}
+    claude_roots = resolve_roots("claude", getattr(args, "claude_root", None) or [], load_config())
     for window in ("five_hour", "seven_day"):
         rows = [
             row
-            for row in load_claude_snapshots(window, analysis.since, analysis.until)
+            for row in load_claude_snapshots(
+                window, analysis.since, analysis.until, claude_roots
+            )
         ]
         if len(rows) < 2:
             continue
@@ -3982,9 +4118,16 @@ def snapshot_from_stdin(destination: Path) -> int:
         if windows == last_statusline_windows(destination):
             # The statusline runs on every prompt; only a change is news.
             return 0
+        config_env = os.environ.get("CLAUDE_CONFIG_DIR")
+        config_label = Path(config_env).expanduser().name if config_env else ".claude"
         append_snapshot(
             destination,
-            {"source": "statusline", "ts": time.time(), "windows": windows},
+            {
+                "source": "statusline",
+                "ts": time.time(),
+                "windows": windows,
+                "config_dir": config_label,
+            },
         )
     except Exception:  # never break the statusline pipeline
         return 0
@@ -4147,6 +4290,9 @@ def add_common(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--codex-root", action="append", default=[], metavar="PATH",
                         help="a Codex home dir (holds auth.json and sessions/); "
                              "repeatable, replaces config.toml and the defaults")
+    parser.add_argument("--account", default=None, metavar="LABEL",
+                        help="limit to one account's pool, by root basename "
+                             "(e.g. .codex-arcade); see `nenpi config`")
     parser.add_argument("--rebuild-cache", action="store_true")
     parser.add_argument("--json", action="store_true")
     parser.add_argument("--no-color", action="store_true")
