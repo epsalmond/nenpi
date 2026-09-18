@@ -420,11 +420,49 @@ def serve_browser(host: str = "127.0.0.1", port: int = 8000) -> int:
     return 0
 
 
-def main(argv: Optional[Sequence[str]] = None) -> int:
-    parser = argparse.ArgumentParser(description="Browse nenpi reports")
-    parser.add_argument("--browser", action="store_true", help="serve a browser app")
-    parser.add_argument("--host", default="127.0.0.1", help="browser bind host")
-    parser.add_argument("--port", default=8000, type=int, help="browser port")
+def main(argv: Optional[Sequence[str]] = None, *, prog: str = "nenpi-ui") -> int:
+    browser_alias = prog == "nenpi-web"
+    parser = argparse.ArgumentParser(
+        prog=prog,
+        description=(
+            "Serve the nenpi Textual UI over a local browser connection."
+            if browser_alias else
+            "Browse nenpi transcript reports in a terminal, or serve the same "
+            "Textual UI over a local browser connection."
+        ),
+        epilog=(
+            "Examples:\n"
+            "  nenpi-web --host 127.0.0.1 --port 8000\n"
+            "  Open http://127.0.0.1:8000/ in your browser.\n"
+            "  HOST and PORT refer to the machine running nenpi."
+            if browser_alias else
+            "Examples:\n"
+            "  nenpi-ui\n"
+            "  nenpi-ui --browser --host 127.0.0.1 --port 8000\n"
+            "  nenpi-web --host 127.0.0.1 --port 8000\n"
+            "\n"
+            "Terminal mode requires the optional nenpi[ui] extra.\n"
+            "--browser requires the optional nenpi[browser] extra and serves\n"
+            "http://HOST:PORT/; HOST and PORT refer to the machine running nenpi."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument(
+        "--browser", action="store_true",
+        help=(
+            "browser mode; always enabled for nenpi-web"
+            if browser_alias else
+            "serve the UI for a browser with textual-serve (default: terminal UI)"
+        ),
+    )
+    parser.add_argument(
+        "--host", default="127.0.0.1", metavar="HOST",
+        help="browser bind address (default: 127.0.0.1)",
+    )
+    parser.add_argument(
+        "--port", default=8000, type=int, metavar="PORT",
+        help="browser TCP port (default: 8000)",
+    )
     args = parser.parse_args(argv)
     if args.browser:
         return serve_browser(args.host, args.port)
@@ -438,7 +476,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
 
 def web_main(argv: Optional[Sequence[str]] = None) -> int:
-    return main(["--browser"] + list(argv or []))
+    arguments = list(sys.argv[1:] if argv is None else argv)
+    return main(["--browser"] + arguments, prog="nenpi-web")
 
 
 if __name__ == "__main__":  # pragma: no cover - exercised by the console script
