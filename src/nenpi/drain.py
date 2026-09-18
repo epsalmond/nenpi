@@ -515,7 +515,7 @@ def load_weights(use_calibrated: bool) -> Weights:
     if use_calibrated:
         fit_file = state_dir() / "codex-weights.json"
         if not fit_file.is_file():
-            warn("--use-calibrated: no fit at %s; run `quota-drain calibrate`" % fit_file)
+            warn("--use-calibrated: no fit at %s; run `nenpi calibrate`" % fit_file)
             return Weights(table, sources)
         try:
             fit = json.loads(fit_file.read_text(encoding="utf-8"))
@@ -1710,7 +1710,7 @@ class Progress:
         if now - self.last < PROGRESS_INTERVAL_SECONDS and self.done < self.total:
             return
         self.last = now
-        line = "quota-drain: %s %d/%d" % (self.label, self.done, self.total)
+        line = "nenpi: %s %d/%d" % (self.label, self.done, self.total)
         self.width = max(self.width, len(line))
         sys.stderr.write("\r" + line)
         sys.stderr.flush()
@@ -3025,6 +3025,7 @@ class Reduction:
     def to_json(self) -> Dict[str, Any]:
         return {
             "harness": self.harness,
+            "session_id": self.session_id,
             "short_id": short_id(self.session_id),
             "time": self.epoch,
             "kind": self.kind,
@@ -4407,7 +4408,10 @@ def command_windows(args: argparse.Namespace) -> int:
 
 def top_session_list(sessions: Mapping[str, float], top: int) -> List[Dict[str, Any]]:
     ordered = sorted(sessions.items(), key=lambda item: item[1], reverse=True)[:top]
-    return [{"short_id": short_id(key), "drain_percent": value} for key, value in ordered]
+    return [
+        {"session_id": key, "short_id": short_id(key), "drain_percent": value}
+        for key, value in ordered
+    ]
 
 
 def command_calibrate(args: argparse.Namespace) -> int:
@@ -4445,6 +4449,8 @@ def command_calibrate(args: argparse.Namespace) -> int:
     unattributed_share = (total_unattributed / total_drain) if total_drain > 0 else 0.0
     payload = {
         "schema": JSON_SCHEMA,
+        "command": "calibrate",
+        "harness": "codex",
         "version": 1,
         "fitted_at": time.time(),
         "samples": fit["samples"],
@@ -4643,7 +4649,7 @@ def calibrate_claude(args: argparse.Namespace, analysis: "Analysis") -> int:
     if not results:
         warn(
             "no usable Claude snapshot intervals; sample utilisation with "
-            "`quota-drain snapshot --oauth` (see docs/drain.md) and retry"
+            "`nenpi snapshot --oauth` (see docs/drain.md) and retry"
         )
         return 1
     payload = {
@@ -4704,24 +4710,58 @@ def session_prefix_match(session_id: str, prefix: str) -> bool:
     ) or session_id.startswith(prefix)
 
 
+def resolve_session_prefix(
+    candidates: Mapping[Tuple[str, str], float], prefix: str, first: bool
+) -> Tuple[Optional[Tuple[str, str]], int]:
+    """Resolve one `--session` prefix against `{(harness, id): weight}`.
+
+    Shared by `prompts` and `tools` so a scripted drill-down never reads a
+    different session in one command than in the other. A full id (with or
+    without dashes) wins outright; an ambiguous prefix is an error listing
+    the candidates, unless `--first` asks for the busiest of them.
+    Returns the chosen key, or `None` and the exit code to return.
+    """
+    matches = [key for key in candidates if session_prefix_match(key[1], prefix)]
+    if not matches:
+        warn("no session matching %r; run `nenpi sessions` for ids" % prefix)
+        return None, 1
+    wanted = prefix.replace("-", "")
+    exact = [key for key in matches if key[1].replace("-", "") == wanted]
+    if len(exact) == 1:
+        return exact[0], 0
+    if len(matches) > 1 and not first:
+        warn(
+            "%r matches %d sessions (%s); pass a longer prefix, a full id, "
+            "or --first for the busiest"
+            % (prefix, len(matches),
+               ", ".join(short_id(key[1]) for key in sorted(matches)[:5]))
+        )
+        return None, 1
+    return max(matches, key=lambda key: (candidates[key], key)), 0
+
+
+def session_unit_totals(analysis: "Analysis") -> Dict[Tuple[str, str], float]:
+    """Weighted units per session, the `--first` tie-break over ALL sessions."""
+    totals = {}  # type: Dict[Tuple[str, str], float]
+    for key, summary in analysis.scan.sessions.items():
+        totals[key] = sum(
+            weighted_units(summary.harness, model, tokens, analysis.weights, analysis.args)
+            for model, tokens in summary.models.items()
+        )
+    return totals
+
+
 def command_prompts(args: argparse.Namespace) -> int:
     analysis = prepare(args)
-    matches = [
-        (key, prompts)
+    candidates = dict(
+        (key, sum(prompt.units for prompt in prompts))
         for key, prompts in analysis.prompts.items()
-        if session_prefix_match(key[1], args.session)
-    ]
-    if not matches:
-        warn("no session matching %r; run `quota-drain sessions` for ids" % args.session)
-        return 1
-    if len(matches) > 1:
-        warn(
-            "%r matches %d sessions (%s); using the busiest"
-            % (args.session, len(matches), ", ".join(short_id(key[1]) for key, _ in matches[:5]))
-        )
-    (harness, session_id), prompts = max(
-        matches, key=lambda item: sum(prompt.units for prompt in item[1])
     )
+    key, code = resolve_session_prefix(candidates, args.session, args.first)
+    if key is None:
+        return code
+    harness, session_id = key
+    prompts = analysis.prompts[key]
     mark_reductions(prompts, analysis)
     growth = fit_growth(prompts)
     shown = prompts[-args.top:] if args.top and len(prompts) > args.top else prompts
@@ -4732,6 +4772,7 @@ def command_prompts(args: argparse.Namespace) -> int:
                     "schema": JSON_SCHEMA,
                     "command": "prompts",
                     "harness": harness,
+                    "session_id": session_id,
                     "short_id": short_id(session_id),
                     "growth": growth,
                     "prompts": [prompt.to_json() for prompt in shown],
@@ -4898,27 +4939,12 @@ def command_tools(args: argparse.Namespace) -> int:
     calls = analysis.tool_calls
     session_id = ""
     if getattr(args, "session", None):
-        matched = sorted({
-            call.session_id for call in calls
-            if session_prefix_match(call.session_id, args.session)
-        })
-        if not matched:
-            warn("no session matching %r with tool calls; run `nenpi sessions` for ids"
-                 % args.session)
-            return 1
-        if len(matched) > 1:
-            warn(
-                "%r matches %d sessions (%s); using the busiest"
-                % (args.session, len(matched),
-                   ", ".join(short_id(value) for value in matched[:5]))
-            )
-            counts = {}  # type: Dict[str, int]
-            for call in calls:
-                if call.session_id in matched:
-                    counts[call.session_id] = counts.get(call.session_id, 0) + call.chars
-            session_id = max(matched, key=lambda value: counts.get(value, 0))
-        else:
-            session_id = matched[0]
+        key, code = resolve_session_prefix(
+            session_unit_totals(analysis), args.session, args.first
+        )
+        if key is None:
+            return code
+        session_id = key[1]
         calls = [call for call in calls if call.session_id == session_id]
     if getattr(args, "prompt", None):
         calls = [call for call in calls if call.prompt == args.prompt]
@@ -4938,6 +4964,7 @@ def command_tools(args: argparse.Namespace) -> int:
                     "command": "tools",
                     "generated_at": time.time(),
                     "session": short_id(session_id) if session_id else "",
+                    "session_id": session_id,
                     "tool_calls": len(calls),
                     "result_chars": sum(call.chars for call in calls),
                     "est_tokens": sum(call.est_tokens for call in calls),
@@ -5190,9 +5217,12 @@ def command_verify(args: argparse.Namespace) -> int:
     analysis = prepare(args)
     scan = analysis.scan
     since = analysis.since
+    until = analysis.until
     report = []
     for (harness, session_id), summary in sorted(scan.sessions.items()):
         if since is not None and (summary.end or 0) < since:
+            continue
+        if until is not None and (summary.start or 0) > until:
             continue
         if harness == "claude":
             cost_state = summary.cost_state
@@ -5204,6 +5234,7 @@ def command_verify(args: argparse.Namespace) -> int:
                 report.append(
                     {
                         "harness": "claude",
+                        "session_id": session_id,
                         "short_id": short_id(session_id),
                         "model": normalized,
                         "deduped": {
@@ -5232,6 +5263,7 @@ def command_verify(args: argparse.Namespace) -> int:
             report.append(
                 {
                     "harness": "codex",
+                    "session_id": session_id,
                     "short_id": short_id(session_id),
                     "model": "-",
                     "deduped": observed,
@@ -5843,7 +5875,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     sessions = sub.add_parser(
         "sessions", help="rank sessions by quota drain",
-        description="Show one row per session, with fan-out and quota-drain details.",
+        description="Show one row per session, with fan-out and drain details.",
         epilog="Example:\n  nenpi sessions --since 7d --sort tokens --top 20",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -5899,7 +5931,11 @@ def build_parser() -> argparse.ArgumentParser:
     add_common(prompts)
     prompts.add_argument(
         "--session", required=True, metavar="ID_PREFIX",
-        help="required session ID prefix; if several match, use the busiest",
+        help="required session ID prefix; an ambiguous prefix is an error",
+    )
+    prompts.add_argument(
+        "--first", action="store_true",
+        help="with an ambiguous --session prefix, use the busiest match instead of failing",
     )
     prompts.add_argument(
         "--tools", action="store_true",
@@ -5920,7 +5956,11 @@ def build_parser() -> argparse.ArgumentParser:
     add_common(tools)
     tools.add_argument(
         "--session", default=None, metavar="ID_PREFIX",
-        help="limit to one session by ID prefix; if several match, use the busiest",
+        help="limit to one session by ID prefix; an ambiguous prefix is an error",
+    )
+    tools.add_argument(
+        "--first", action="store_true",
+        help="with an ambiguous --session prefix, use the busiest match instead of failing",
     )
     tools.add_argument(
         "--prompt", type=int, default=None, metavar="N",

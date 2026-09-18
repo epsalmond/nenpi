@@ -791,6 +791,16 @@ class MeasuredAttribution(Harness):
             window["top_sessions"][1]["drain_percent"],
         )
 
+    def test_windows_json_carries_full_session_ids(self) -> None:
+        resets_at = int(time.time()) + 7200
+        self.write_two_concurrent_sessions(resets_at, resets_at)
+        payload = self.run_json("windows", "--harness", "codex", "--json")
+        top = payload["windows"][0]["top_sessions"]
+        self.assertEqual(sorted(row["session_id"] for row in top),
+                         ["codex-conc-aaaa", "codex-conc-bbbb"])
+        self.assertEqual([QD.short_id(row["session_id"]) for row in top],
+                         [row["short_id"] for row in top])
+
 
 class DrainIntervalRules(Harness):
     """Unit-level coverage of build_intervals rules (a)/(b)/(c), #16/#17."""
@@ -1315,6 +1325,15 @@ class Calibration(Harness):
                 0.05,
                 "%s/%s fitted %.4f, expected %.4f" % (model, kind, actual, expected),
             )
+
+    def test_codex_calibrate_json_names_its_command(self) -> None:
+        """Every other --json payload carries `command`; codex calibrate must too."""
+        self.build_rollouts()
+        payload = self.run_json(
+            "calibrate", "--harness", "codex", "--json", "--calibrate-bucket-hours", "0.01"
+        )
+        self.assertEqual(payload["command"], "calibrate")
+        self.assertEqual(payload["harness"], "codex")
 
     def test_calibrate_persists_and_use_calibrated_reads_it(self) -> None:
         self.build_rollouts()
@@ -2153,6 +2172,17 @@ class ContextReductions(Harness):
         self.assertGreater(rows[0]["saved_units"], 0.0)
         self.assertGreater(rows[0]["saved_units_upper_bound"], rows[0]["saved_units"])
 
+    def test_reductions_json_carries_the_full_session_id(self) -> None:
+        self.codex_run(
+            "codex-red-0003",
+            [100_000, 200_000, 300_000, 40_000, 45_000, 50_000, 55_000],
+            compact_after=3,
+        )
+        payload = self.run_json("reductions", "--harness", "codex", "--json")
+        row = payload["reductions"][0]
+        self.assertEqual(row["session_id"], "codex-red-0003")
+        self.assertEqual(row["short_id"], QD.short_id("codex-red-0003"))
+
     def test_unmarked_drop_is_reported(self) -> None:
         self.codex_run(
             "codex-red-0002", [100_000, 200_000, 300_000, 40_000, 45_000, 50_000, 55_000]
@@ -2711,6 +2741,132 @@ class RangeWindowing(Harness):
             bucket["claude"] + bucket["codex"] for bucket in timeline["buckets"]
         )
         self.assertAlmostEqual(session_units, timeline_units, places=6)
+
+
+class SessionSelection(Harness):
+    PREFIX = "dddd000"
+
+    def build_two_matching_sessions(self) -> Tuple[str, str]:
+        # `second` starts with the whole of `first`, so the full id of `first`
+        # is both an exact match and a prefix of another session.
+        now = time.time() - 1800
+        first = "dddd0001-1111-2222"
+        second = "dddd0001-1111-2222-3333-444444444444"
+        for name, session, output in (
+            ("busy.jsonl", first, 100_000), ("quiet.jsonl", second, 10),
+        ):
+            self.write_claude(
+                name,
+                [
+                    claude_user_prompt_line(now, session),
+                    claude_assistant_line(now + 1, session, "msg_" + name,
+                                          output_tokens=output),
+                ],
+            )
+        return first, second
+
+    def test_ambiguous_session_prefix_fails_with_the_candidates(self) -> None:
+        first, second = self.build_two_matching_sessions()
+        result = self.run_tool("prompts", "--session", self.PREFIX, "--json")
+        self.assertEqual(result.returncode, 1)
+        stderr = result.stderr.decode("utf-8")
+        self.assertIn("matches 2 sessions", stderr)
+        self.assertIn(QD.short_id(first), stderr)
+        self.assertIn(QD.short_id(second), stderr)
+        self.assertEqual(result.stdout.decode("utf-8"), "")
+
+    def test_first_opts_back_into_the_busiest_match(self) -> None:
+        first, _second = self.build_two_matching_sessions()
+        payload = self.run_json("prompts", "--session", self.PREFIX, "--first", "--json")
+        self.assertEqual(payload["session_id"], first)
+
+    def test_full_id_beats_a_shared_prefix(self) -> None:
+        first, _second = self.build_two_matching_sessions()
+        payload = self.run_json("prompts", "--session", first, "--json")
+        self.assertEqual(payload["session_id"], first)
+
+    def test_de_dashed_full_id_still_takes_the_exact_path(self) -> None:
+        first, _second = self.build_two_matching_sessions()
+        payload = self.run_json("prompts", "--session", first.replace("-", ""), "--json")
+        self.assertEqual(payload["session_id"], first)
+
+    def test_one_id_under_two_harnesses_is_still_ambiguous(self) -> None:
+        now = time.time() - 1800
+        session = "ffff0001-1111-2222-3333-444444444444"
+        self.write_claude(
+            "shared.jsonl",
+            [
+                claude_user_prompt_line(now, session),
+                claude_assistant_line(now + 1, session, "msg_shared", output_tokens=100),
+            ],
+        )
+        self.write_codex(
+            "rollout-shared.jsonl",
+            [
+                codex_session_meta_line(now, session, "/shared"),
+                codex_turn_context_line(now, "gpt-5.6-sol"),
+                codex_usage_record_line(now + 2, session, input_tokens=100,
+                                        cached_input_tokens=0, output_tokens=10,
+                                        turn_id="turn-0"),
+            ],
+            day=now,
+        )
+        result = self.run_tool("prompts", "--session", session, "--json")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("matches 2 sessions", result.stderr.decode("utf-8"))
+
+    def test_prompts_json_carries_the_full_session_id(self) -> None:
+        _first, second = self.build_two_matching_sessions()
+        payload = self.run_json("prompts", "--session", second, "--json")
+        self.assertEqual(payload["session_id"], second)
+        self.assertEqual(payload["short_id"], QD.short_id(second))
+
+    def test_no_match_warning_names_the_current_command(self) -> None:
+        self.build_two_matching_sessions()
+        result = self.run_tool("prompts", "--session", "eeee9999", "--json")
+        self.assertEqual(result.returncode, 1)
+        stderr = result.stderr.decode("utf-8")
+        self.assertIn("run `nenpi sessions` for ids", stderr)
+        self.assertNotIn("quota-drain", stderr)
+
+
+class VerifyRange(Harness):
+    def build_two_sessions(self) -> Tuple[str, str]:
+        old_session = "eeee0001-1111-2222-3333-444444444444"
+        new_session = "eeee0002-1111-2222-3333-444444444444"
+        for session, epoch in ((old_session, time.time() - 30 * 86400),
+                               (new_session, time.time() - 600)):
+            self.write_claude(
+                "verify-%s.jsonl" % session[:8],
+                [
+                    claude_assistant_line(epoch, session, "msg_" + session[:8],
+                                          input_tokens=100, output_tokens=200),
+                    claude_cost_state_line(
+                        session,
+                        "claude-opus-5",
+                        {
+                            "inputTokens": 100,
+                            "outputTokens": 200,
+                            "cacheReadInputTokens": 0,
+                            "cacheCreationInputTokens": 0,
+                            "costUSD": 1.0,
+                        },
+                    ),
+                ],
+            )
+        return old_session, new_session
+
+    def test_verify_applies_until(self) -> None:
+        old_session, new_session = self.build_two_sessions()
+        everything = self.run_json("verify", "--harness", "claude", "--json")
+        self.assertEqual(
+            sorted(row["short_id"] for row in everything["rows"]),
+            sorted([QD.short_id(old_session), QD.short_id(new_session)]),
+        )
+        windowed = self.run_json("verify", "--harness", "claude", "--json", "--until", "3d")
+        self.assertEqual([row["short_id"] for row in windowed["rows"]],
+                         [QD.short_id(old_session)])
+        self.assertEqual(windowed["rows"][0]["session_id"], old_session)
 
 
 class CacheIntegrity(Harness):
@@ -4164,6 +4320,48 @@ class ToolAttribution(Harness):
             ],
         )
         return now
+
+    def two_matching_tool_sessions(self) -> Tuple[str, str]:
+        """Two sessions with tool calls, one id a strict prefix of the other."""
+        busy = "20000000-1111-2222"
+        quiet = "20000000-1111-2222-3333-444444444444"
+        now = time.time() - 3600
+        for tag, session, output in (("busy", busy, 100_000), ("quiet", quiet, 10)):
+            self.write_claude(
+                "tools-%s.jsonl" % tag,
+                [
+                    claude_user_prompt_line(now, session),
+                    claude_tool_use_line(
+                        now + 1, session, "msg_%s_1" % tag, [("toolu_%s" % tag, "Bash")],
+                        input_tokens=100, cache_read=1000, output_tokens=output,
+                    ),
+                    claude_tool_output_line(now + 2, session, "toolu_%s" % tag, "x" * 400),
+                    claude_assistant_line(
+                        now + 3, session, "msg_%s_2" % tag,
+                        input_tokens=100, cache_read=2200, output_tokens=30,
+                    ),
+                ],
+            )
+        return busy, quiet
+
+    def test_tools_ambiguous_session_prefix_fails(self) -> None:
+        busy, _quiet = self.two_matching_tool_sessions()
+        result = self.run_tool("tools", "--harness", "claude", "--session", "2000000", "--json")
+        self.assertEqual(result.returncode, 1)
+        stderr = result.stderr.decode("utf-8")
+        self.assertIn("matches 2 sessions", stderr)
+        self.assertEqual(result.stdout.decode("utf-8"), "")
+        # The full id still resolves, even though it prefixes the other one.
+        payload = self.run_json("tools", "--harness", "claude", "--session", busy, "--json")
+        self.assertEqual(payload["session_id"], busy)
+        self.assertEqual(payload["session"], QD.short_id(busy))
+
+    def test_tools_first_picks_the_busiest_match(self) -> None:
+        busy, _quiet = self.two_matching_tool_sessions()
+        payload = self.run_json(
+            "tools", "--harness", "claude", "--session", "2000000", "--first", "--json"
+        )
+        self.assertEqual(payload["session_id"], busy)
 
     def test_claude_tool_names_and_sizes_are_parsed(self) -> None:
         session = "10000000-1111-2222-3333-444444444444"
