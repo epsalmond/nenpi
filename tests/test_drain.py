@@ -6,9 +6,12 @@ data and must never be copied into this repository.
 
 from __future__ import annotations
 
+import argparse
 import contextlib
+import io
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -18,6 +21,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+import nenpi.config as QC
 import nenpi.drain as QD
 
 DRAIN_COMMAND = [sys.executable, "-m", "nenpi.drain"]
@@ -277,12 +281,16 @@ class Harness(unittest.TestCase):
         self.claude_projects.mkdir(parents=True)
         self.codex_sessions.mkdir(parents=True)
         self.environment = dict(os.environ)
+        # A host that happens to export these would otherwise change which
+        # root the default resolution picks, out from under the fixture.
+        self.environment.pop("CLAUDE_CONFIG_DIR", None)
+        self.environment.pop("CODEX_HOME", None)
         self.environment.update(
             {
-                "QUOTA_DRAIN_HOME_DIR": str(self.home),
-                "QUOTA_DRAIN_CACHE_DIR": str(self.root / "cache"),
-                "QUOTA_DRAIN_STATE_DIR": str(self.root / "state"),
-                "QUOTA_DRAIN_CONFIG_DIR": str(self.root / "config"),
+                "NENPI_HOME_DIR": str(self.home),
+                "NENPI_CACHE_DIR": str(self.root / "cache"),
+                "NENPI_STATE_DIR": str(self.root / "state"),
+                "NENPI_CONFIG_DIR": str(self.root / "config"),
                 "TZ": "UTC",
             }
         )
@@ -313,11 +321,13 @@ class Harness(unittest.TestCase):
         ~/.claude, ~/.cache and ~/.local/state of whoever runs the tests.
         """
         saved = dict(os.environ)
+        os.environ.pop("CLAUDE_CONFIG_DIR", None)
+        os.environ.pop("CODEX_HOME", None)
         os.environ.update(
             dict(
                 (key, value)
                 for key, value in self.environment.items()
-                if key.startswith("QUOTA_DRAIN_")
+                if key.startswith("NENPI_") or key.startswith("QUOTA_DRAIN_")
             )
         )
         try:
@@ -326,13 +336,18 @@ class Harness(unittest.TestCase):
             os.environ.clear()
             os.environ.update(saved)
 
-    def run_tool(self, *arguments: str, stdin: Optional[bytes] = None) -> subprocess.CompletedProcess:
+    def run_tool(self, *arguments: str, stdin: Optional[bytes] = None,
+                extra_env: Optional[Dict[str, str]] = None) -> subprocess.CompletedProcess:
+        env = self.environment
+        if extra_env:
+            env = dict(self.environment)
+            env.update(extra_env)
         return subprocess.run(
             DRAIN_COMMAND + list(arguments),
             check=False,
             input=stdin,
             capture_output=True,
-            env=self.environment,
+            env=env,
             timeout=120,
         )
 
@@ -673,6 +688,433 @@ class MeasuredAttribution(Harness):
             window["top_sessions"][0]["drain_percent"],
             window["top_sessions"][1]["drain_percent"],
         )
+
+
+class DrainIntervalRules(Harness):
+    """Unit-level coverage of build_intervals rules (a)/(b)/(c), #16/#17."""
+
+    def make_row(self, ts: float, used: float, resets_at: Any,
+                window_minutes: int = 300) -> Dict[str, Any]:
+        return {
+            "ts": ts, "used_percent": used, "resets_at": resets_at,
+            "window_minutes": window_minutes, "account": "acct",
+            "limit_id": "codex", "plan_type": "pro",
+        }
+
+    def test_decrease_then_rise_starts_the_interval_at_the_low_reading(self) -> None:
+        # 40 -> 30 -> 35: the interval is the 5-point rise from the 30
+        # reading, not 0 (stuck at the old high-water mark) and not 5
+        # measured back from the 40 reading.
+        now = time.time() - 3600
+        resets = int(now) + 7200
+        rows = [
+            self.make_row(now, 40.0, resets),
+            self.make_row(now + 600, 30.0, resets),
+            self.make_row(now + 1200, 35.0, resets),
+        ]
+        intervals = QD.build_intervals(rows, 300)
+        self.assertEqual(len(intervals), 1)
+        self.assertAlmostEqual(intervals[0].drain, 5.0, places=6)
+        self.assertEqual(intervals[0].start, now + 600)
+        self.assertEqual(intervals[0].end, now + 1200)
+        self.assertFalse(intervals[0].rollover)
+
+    def test_jitter_within_tolerance_is_not_a_new_baseline(self) -> None:
+        # 40 -> 39 -> 41: the 1-point dip is vendor jitter (<= JITTER_TOLERANCE)
+        # and must not become the new baseline - if it did, the following
+        # rise would be measured as 39 -> 41 (+2) on top of the 40 already
+        # attributed, over-charging by 2. Keeping the baseline at 40 across
+        # the dip means the rise to 41 is correctly +1 over the 40 already
+        # attributed, and the interval reaches back to the ORIGINAL anchor.
+        now = time.time() - 3600
+        resets = int(now) + 7200
+        rows = [
+            self.make_row(now, 40.0, resets),
+            self.make_row(now + 600, 39.0, resets),
+            self.make_row(now + 1200, 41.0, resets),
+        ]
+        intervals = QD.build_intervals(rows, 300)
+        self.assertEqual(len(intervals), 1)
+        self.assertAlmostEqual(intervals[0].drain, 1.0, places=6)
+        self.assertEqual(intervals[0].start, now)
+        self.assertEqual(intervals[0].end, now + 1200)
+
+    def test_decrease_beyond_tolerance_is_not_jitter(self) -> None:
+        now = time.time() - 3600
+        resets = int(now) + 7200
+        rows = [
+            self.make_row(now, 40.0, resets),
+            # A drop of 10 is well past JITTER_TOLERANCE (2): a real decrease.
+            self.make_row(now + 600, 30.0, resets),
+        ]
+        intervals = QD.build_intervals(rows, 300)
+        self.assertEqual(len(intervals), 0)
+
+    def test_slide_with_unchanged_used_is_not_a_rollover(self) -> None:
+        # resets_at drifts (an idle pool re-stamping resets_at = now + 7d)
+        # but used_percent does not: no drain evidence, so no interval,
+        # regardless of the resets_at churn.
+        now = time.time() - 3600
+        resets = int(now) + 7200
+        rows = [
+            self.make_row(now, 40.0, resets),
+            self.make_row(now + 600, 40.0, resets + 70),
+            self.make_row(now + 1200, 40.0, resets + 140),
+        ]
+        intervals = QD.build_intervals(rows, 300)
+        self.assertEqual(len(intervals), 0)
+
+    def test_idle_zero_used_slide_produces_no_interval(self) -> None:
+        now = time.time() - 3600
+        resets = int(now) + 604800
+        rows = [
+            self.make_row(now + index * 70, 0.0, resets + index * 70)
+            for index in range(5)
+        ]
+        intervals = QD.build_intervals(rows, 300)
+        self.assertEqual(len(intervals), 0)
+
+
+class AttributionCap(Harness):
+    """CLI-level coverage of the attribution cap and the #17 windows fix."""
+
+    def write_dense_phase(self, base: int, session: str, resets: int) -> None:
+        """Three non-rollover intervals at a known 0.1%/unit rate.
+
+        `gpt-5.6-sol` prices `input` at 100.0 credit units per Mtok, so
+        100_000 tokens is 10.0 weighted units; each interval's drain is 1.0,
+        so drain/units == 0.1 for every one of them - enough samples
+        (>= MIN_RATE_INTERVALS) and enough coverage (>= MIN_RATE_UNITS) for
+        the pool to measure its own rate instead of falling back.
+        """
+        lines = [
+            codex_session_meta_line(base, session, "/home/agent/dense"),
+            codex_turn_context_line(base, "gpt-5.6-sol"),
+            codex_token_count_line(base + 5, rate_limits=rate_limits(10.0, resets)),
+        ]
+        used = 10.0
+        for step in range(3):
+            offset = 10 + step * 10
+            lines.append(
+                codex_usage_record_line(
+                    base + offset, session, input_tokens=100_000, cached_input_tokens=0,
+                    output_tokens=0
+                )
+            )
+            used += 1.0
+            lines.append(
+                codex_token_count_line(
+                    base + offset + 5, rate_limits=rate_limits(used, resets)
+                )
+            )
+        self.write_codex("rollout-dense.jsonl", lines)
+
+    def write_jump(self, tiny_start: int, tiny_session: str, tiny_model: str,
+                   tiny_tokens: int, resets: int, used: float) -> None:
+        """One rollover interval, far later, with only a tiny session active."""
+        self.write_codex(
+            "rollout-tiny.jsonl",
+            [
+                codex_session_meta_line(tiny_start, tiny_session, "/home/agent/tiny"),
+                codex_turn_context_line(tiny_start, tiny_model),
+                codex_usage_record_line(
+                    tiny_start + 5, tiny_session, input_tokens=tiny_tokens,
+                    cached_input_tokens=0, output_tokens=0
+                ),
+                codex_token_count_line(tiny_start + 10, rate_limits=rate_limits(used, resets)),
+            ],
+        )
+
+    def test_sparse_reading_drain_is_capped_and_the_rest_unattributed(self) -> None:
+        # Reproduces #16's 01a09886: a handful of turns land inside a big,
+        # far-later jump and would otherwise absorb the whole thing.
+        base = int(time.time()) - 4 * 3600
+        dense_session = "dddddddd-dense-0000-0000-000000000000"
+        resets_a = base + 7200
+        self.write_dense_phase(base, dense_session, resets_a)
+
+        tiny_start = base + 3600
+        opened = tiny_start - 60
+        resets_b = opened + 18000
+        tiny_session = "tttttttt-tiny0-0000-0000-000000000000"
+        self.write_jump(tiny_start, tiny_session, "gpt-5.6-sol", 6_000, resets_b, 29.0)
+
+        payload = self.run_json("sessions", "--harness", "codex", "--json", "--top", "20")
+        tiny_row = self.session_by_short_id(payload, QD.short_id(tiny_session))
+        dense_row = self.session_by_short_id(payload, QD.short_id(dense_session))
+        # allowed = CAP_FACTOR(3) * rate(0.1) * units(0.6) = 0.18
+        self.assertAlmostEqual(tiny_row["drain_percent"], 0.18, places=6)
+        self.assertLessEqual(tiny_row["drain_percent"], 3.0 * 0.1 * 0.6 + 1e-9)
+        self.assertAlmostEqual(dense_row["drain_percent"], 3.0, places=6)
+        # share_of_window's denominator stays interval.drain (29.0), not the
+        # sum of what was actually attributed (0.18): the gap between them
+        # IS the unattributed figure, not renormalized away.
+        self.assertAlmostEqual(
+            tiny_row["share_of_window_percent"], 100.0 * 0.18 / 29.0, places=4
+        )
+        pools = payload["pools"]
+        jump_pool = max(pools, key=lambda item: item["peak"])
+        self.assertAlmostEqual(jump_pool["peak"], 29.0, places=6)
+        self.assertAlmostEqual(jump_pool["unattributed"], 29.0 - 0.18, places=6)
+
+        text = self.run_tool("sessions", "--harness", "codex")
+        self.assertEqual(text.returncode, 0, text.stderr.decode("utf-8", "replace"))
+        self.assertIn(b"unattributed: ", text.stdout)
+        self.assertIn(b"clients not in the scanned roots", text.stdout)
+
+        windows_text = self.run_tool("windows", "--harness", "codex")
+        self.assertEqual(windows_text.returncode, 0)
+        self.assertIn(b"unattributed 28.8%", windows_text.stdout)
+
+    def test_raw_token_fallback_is_exempt_from_the_cap(self) -> None:
+        # A model with no weight prices at ~1e-9 units/token, nowhere near
+        # the weighted-unit scale the cap is calibrated against; capping it
+        # would zero out a session that really did the work.
+        base = int(time.time()) - 4 * 3600
+        dense_session = "dddddddd-dense-1111-1111-111111111111"
+        resets_a = base + 7200
+        self.write_dense_phase(base, dense_session, resets_a)
+
+        tiny_start = base + 3600
+        opened = tiny_start - 60
+        resets_b = opened + 18000
+        exotic_session = "eeeeeeee-exotic-000-000-000000000000"
+        self.write_jump(tiny_start, exotic_session, "gpt-9000-nonexistent", 6_000, resets_b, 29.0)
+
+        payload = self.run_json("sessions", "--harness", "codex", "--json", "--top", "20")
+        exotic_row = self.session_by_short_id(payload, QD.short_id(exotic_session))
+        # Uncapped: the sole session in the interval gets its whole drain.
+        self.assertAlmostEqual(exotic_row["drain_percent"], 29.0, places=6)
+
+    def test_rate_fallback_with_too_little_coverage_warns_once(self) -> None:
+        # Only one non-rollover interval - below MIN_RATE_INTERVALS - and no
+        # calibrated or fitted rate on disk: the pool is left uncapped and
+        # warns exactly once.
+        base = int(time.time()) - 4 * 3600
+        dense_session = "dddddddd-sparse-00-0000-000000000000"
+        resets_a = base + 7200
+        thin_lines = [
+            codex_session_meta_line(base, dense_session, "/home/agent/thin"),
+            codex_turn_context_line(base, "gpt-5.6-sol"),
+            codex_token_count_line(base + 5, rate_limits=rate_limits(10.0, resets_a)),
+            codex_usage_record_line(
+                base + 10, dense_session, input_tokens=100_000, cached_input_tokens=0,
+                output_tokens=0
+            ),
+            codex_token_count_line(base + 15, rate_limits=rate_limits(11.0, resets_a)),
+        ]
+        self.write_codex("rollout-thin.jsonl", thin_lines)
+
+        tiny_start = base + 3600
+        opened = tiny_start - 60
+        resets_b = opened + 18000
+        tiny_session = "tttttttt-fallback-0-0000-000000000000"
+        self.write_jump(tiny_start, tiny_session, "gpt-5.6-sol", 6_000, resets_b, 29.0)
+
+        result = self.run_tool("sessions", "--harness", "codex", "--json", "--top", "20")
+        self.assertEqual(result.returncode, 0, result.stderr.decode("utf-8", "replace"))
+        payload = json.loads(result.stdout.decode("utf-8"))
+        tiny_row = self.session_by_short_id(payload, QD.short_id(tiny_session))
+        # Uncapped: not enough non-rollover coverage to trust a measured rate.
+        self.assertAlmostEqual(tiny_row["drain_percent"], 29.0, places=6)
+        stderr = result.stderr.decode("utf-8", "replace")
+        self.assertEqual(stderr.count("no attribution cap"), 1)
+
+    def test_zero_peak_windows_with_drifting_resets_at_collapse(self) -> None:
+        # #17: an idle pool re-stamps resets_at by roughly a minute per
+        # reading; minute-rounding alone still yields one window per
+        # reading. Clustering resets_at within tolerance collapses the
+        # whole drifting, always-zero run into one window.
+        base = int(time.time()) - 4 * 3600
+        session = "iiiiiiii-idle0-0-0000-000000000000"
+        lines = [
+            codex_session_meta_line(base, session, "/home/agent/idle"),
+            codex_turn_context_line(base, "gpt-5.6-sol"),
+        ]
+        resets = base + 604800
+        for index in range(12):
+            lines.append(
+                codex_token_count_line(
+                    base + index * 70, rate_limits=rate_limits(0.0, resets + index * 70)
+                )
+            )
+        self.write_codex("rollout-idle.jsonl", lines)
+        payload = self.run_json("windows", "--harness", "codex", "--json")
+        self.assertLessEqual(len(payload["windows"]), 1)
+        if payload["windows"]:
+            self.assertAlmostEqual(payload["windows"][0]["peak_used_percent"], 0.0, places=6)
+
+    def test_prompt_drain_respects_the_session_cap(self) -> None:
+        # Follow-on to #16: `attribute()` caps a session's INTERVAL share,
+        # but `apply_prompt_drain`'s per-prompt split still multiplied the
+        # interval's raw drain, so `prompts --session X` kept showing the
+        # uncapped figure even after `sessions` capped it. Two prompts split
+        # a capped 0.18% share 2/3-1/3 by their own tokens - never 29.0%.
+        base = int(time.time()) - 4 * 3600
+        dense_session = "dddddddd-dense-2222-2222-222222222222"
+        resets_a = base + 7200
+        self.write_dense_phase(base, dense_session, resets_a)
+
+        tiny_start = base + 3600
+        opened = tiny_start - 60
+        resets_b = opened + 18000
+        tiny_session = "tttttttt-tinyp-0000-0000-000000000000"
+        self.write_codex(
+            "rollout-tiny-prompts.jsonl",
+            [
+                codex_session_meta_line(tiny_start, tiny_session, "/home/agent/tiny"),
+                codex_task_started_line(tiny_start),
+                codex_turn_context_line(tiny_start, "gpt-5.6-sol"),
+                codex_usage_record_line(
+                    tiny_start + 5, tiny_session, input_tokens=4_000,
+                    cached_input_tokens=0, output_tokens=0
+                ),
+                codex_task_started_line(tiny_start + 30),
+                codex_turn_context_line(tiny_start + 30, "gpt-5.6-sol"),
+                codex_usage_record_line(
+                    tiny_start + 35, tiny_session, input_tokens=2_000,
+                    cached_input_tokens=0, output_tokens=0
+                ),
+                codex_token_count_line(tiny_start + 40, rate_limits=rate_limits(29.0, resets_b)),
+            ],
+        )
+
+        payload = self.run_json("prompts", "--session", QD.short_id(tiny_session), "--json")
+        shares = [prompt["drain_percent"] for prompt in payload["prompts"]]
+        self.assertEqual(len(shares), 2)
+        # allowed = CAP_FACTOR(3) * rate(0.1) * units(0.6) = 0.18, split
+        # 4000:2000 by each prompt's own tokens.
+        self.assertAlmostEqual(sum(shares), 0.18, places=6)
+        self.assertAlmostEqual(shares[0], 0.12, places=6)
+        self.assertAlmostEqual(shares[1], 0.06, places=6)
+
+    def test_interval_with_no_local_sessions_is_fully_unattributed(self) -> None:
+        # A pool can take a reading with no local session active at all (a
+        # client nas cannot see did the work). `attribute()`'s early
+        # per-interval bailout (total <= 0) must still record the whole
+        # drain as unattributed, or sum(shares) + unattributed == drain
+        # breaks for that interval.
+        base = int(time.time()) - 4 * 3600
+        dense_session = "dddddddd-dense-3333-3333-333333333333"
+        resets_a = base + 7200
+        self.write_dense_phase(base, dense_session, resets_a)
+
+        ghost_start = base + 3600
+        opened = ghost_start - 60
+        resets_b = opened + 18000
+        self.write_codex(
+            "rollout-ghost.jsonl",
+            [codex_token_count_line(ghost_start + 10, rate_limits=rate_limits(40.0, resets_b))],
+        )
+
+        payload = self.run_json("sessions", "--harness", "codex", "--json", "--top", "20")
+        pools = payload["pools"]
+        ghost_pool = max(pools, key=lambda item: item["peak"])
+        self.assertAlmostEqual(ghost_pool["peak"], 40.0, places=6)
+        self.assertAlmostEqual(ghost_pool["attributed"], 0.0, places=6)
+        self.assertAlmostEqual(ghost_pool["unattributed"], 40.0, places=6)
+
+        text = self.run_tool("sessions", "--harness", "codex")
+        self.assertEqual(text.returncode, 0, text.stderr.decode("utf-8", "replace"))
+        self.assertIn(b"unattributed: ", text.stdout)
+
+    def test_exempt_session_does_not_absorb_a_capped_sessions_overflow(self) -> None:
+        # #16 could still reproduce if the tiny session ran an unweighted
+        # (raw-token-fallback) model: water_fill used to let any session
+        # with `allowed is None` sit in the unclamped pool, so it absorbed
+        # every clamped session's freed drain instead of `unattributed`.
+        base = int(time.time()) - 4 * 3600
+        dense_session = "dddddddd-dense-4444-4444-444444444444"
+        resets_a = base + 7200
+        self.write_dense_phase(base, dense_session, resets_a)
+
+        tiny_start = base + 3600
+        opened = tiny_start - 60
+        resets_b = opened + 18000
+        capped_session = "cccccccc-capped-0000-0000-00000000000"
+        exempt_session = "eeeeeeee-exempt-0000-0000-00000000000"
+        self.write_codex(
+            "rollout-mixed.jsonl",
+            [
+                codex_session_meta_line(tiny_start, capped_session, "/home/agent/capped"),
+                codex_turn_context_line(tiny_start, "gpt-5.6-sol"),
+                codex_usage_record_line(
+                    tiny_start + 5, capped_session, input_tokens=6_000,
+                    cached_input_tokens=0, output_tokens=0
+                ),
+                codex_session_meta_line(tiny_start + 6, exempt_session, "/home/agent/exempt"),
+                codex_turn_context_line(tiny_start + 6, "gpt-9000-nonexistent"),
+                codex_usage_record_line(
+                    tiny_start + 10, exempt_session, input_tokens=6_000,
+                    cached_input_tokens=0, output_tokens=0
+                ),
+                codex_token_count_line(tiny_start + 15, rate_limits=rate_limits(29.0, resets_b)),
+            ],
+        )
+
+        payload = self.run_json("sessions", "--harness", "codex", "--json", "--top", "20")
+        capped_row = self.session_by_short_id(payload, QD.short_id(capped_session))
+        exempt_row = self.session_by_short_id(payload, QD.short_id(exempt_session))
+        # capped_session's raw share is 29.0 * 0.6/(0.6 + exempt_units); its
+        # cap is 0.18. exempt_session keeps its own raw proportional share
+        # (never touched by water-fill); the capped session's freed drain
+        # becomes unattributed, not a top-up for the exempt session.
+        self.assertAlmostEqual(capped_row["drain_percent"], 0.18, places=6)
+        exempt_units = 6_000 * 1e-9
+        exempt_raw_share = 29.0 * exempt_units / (0.6 + exempt_units)
+        self.assertAlmostEqual(exempt_row["drain_percent"], exempt_raw_share, places=6)
+
+        pools = payload["pools"]
+        jump_pool = max(pools, key=lambda item: item["peak"])
+        self.assertAlmostEqual(
+            jump_pool["unattributed"], 29.0 - 0.18 - exempt_raw_share, places=6
+        )
+
+    def test_no_codex_events_at_all_leaves_every_interval_fully_unattributed(self) -> None:
+        # `attribute()` used to `return` before the per-interval loop when
+        # there were no Codex usage events at all (not just none active in
+        # a given interval), leaving `interval.unattributed` at its 0.0
+        # default even though real drain was measured. That breaks
+        # sum(shares) + unattributed == drain for every interval.
+        intervals = [
+            QD.Interval(("acct", "lim", "plan", 300), 0.0, 100.0, 12.5, None, False),
+            QD.Interval(("acct", "lim", "plan", 300), 100.0, 200.0, 7.0, None, False),
+        ]
+        weights = QD.Weights({}, [])
+        args = argparse.Namespace(long_context_multiplier=1.0, claude_cache_read_weight=None)
+        QD.attribute(intervals, [], weights, args)
+        for interval in intervals:
+            self.assertAlmostEqual(interval.unattributed, interval.drain, places=6)
+            self.assertEqual(interval.sessions, {})
+
+    def test_prompt_shares_sum_to_the_whole_session_share(self) -> None:
+        # Only main-thread rows carry a prompt key (assigned by
+        # `assemble_prompts` before `attribute()` runs); a row that never
+        # joined a prompt group still counts toward the session's `shares`
+        # total. Dividing a prompt's units by the session's ALL-EVENT units
+        # (including that unkeyed row) used to leave the prompt's share
+        # short of the session's own attributed share. The denominator must
+        # be the session's PROMPT-KEYED units instead.
+        interval = QD.Interval(("acct", "lim", "plan", 300), 0.0, 100.0, 10.0, None, False)
+        session_id = "sess-1"
+        # event without a prompt key (e.g. a sub-thread row outside any
+        # prompt group): row length 13, no EVENT_PROMPT slot at all.
+        no_prompt_event = [session_id, "m", 10.0, 100_000, 0, 0, 0, 0, 0, 0, "", "", ""]
+        # event with a prompt key: row length 14, EVENT_PROMPT set.
+        with_prompt_event = (
+            [session_id, "m", 20.0, 200_000, 0, 0, 0, 0, 0, 0, "", "", ""] + [1]
+        )
+        self.assertEqual(len(no_prompt_event), QD.EVENT_PROMPT)
+        self.assertEqual(len(with_prompt_event), QD.EVENT_PROMPT + 1)
+        weights = QD.Weights({"codex": {"models": {"m": {"input": 1.0}}}}, ["test"])
+        args = argparse.Namespace(long_context_multiplier=1.0, claude_cache_read_weight=None)
+        QD.attribute([interval], [no_prompt_event, with_prompt_event], weights, args)
+        session_share = interval.sessions[session_id]
+        self.assertAlmostEqual(session_share, 10.0, places=6)
+        prompt_total = sum(
+            value for key, value in interval.prompts.items() if key[0] == session_id
+        )
+        self.assertAlmostEqual(prompt_total, session_share, places=6)
 
 
 class Calibration(Harness):
@@ -1158,6 +1600,67 @@ class Snapshots(Harness):
         self.run_tool("snapshot", "--stdin", stdin=moved)
         logged = (self.root / "state" / "snapshots.jsonl").read_text(encoding="utf-8")
         self.assertEqual(len(logged.strip().splitlines()), 2)
+
+    def _statusline_payload(self, used_percentage: float) -> bytes:
+        return json.dumps(
+            {"rate_limits": {"five_hour": {"used_percentage": used_percentage,
+                                           "resets_at": "2026-09-16T21:30:00Z"}}}
+        ).encode("utf-8")
+
+    def test_statusline_dedup_is_per_config_dir(self) -> None:
+        # Dedup that ignores the account (#9): comparing only against the
+        # newest record regardless of `config_dir` drops a genuine change
+        # from one account whenever it coincides with the other account's
+        # last-seen value. A: 10% -> B: 30% -> A: 30% (a REAL change for A,
+        # from 10% to 30%, that happens to equal B's last reading) -> B: 10%
+        # (a real change for B). All four are distinct per-account readings
+        # and must all be kept.
+        claude_root = self.home / ".claude"
+        arcade_root = self.home / ".claude-arcade"
+        arcade_root.mkdir(parents=True, exist_ok=True)
+        sequence = [
+            (claude_root, 10.0),
+            (arcade_root, 30.0),
+            (claude_root, 30.0),
+            (arcade_root, 10.0),
+        ]
+        for root, used in sequence:
+            result = self.run_tool(
+                "snapshot", "--stdin", stdin=self._statusline_payload(used),
+                extra_env={"CLAUDE_CONFIG_DIR": str(root)},
+            )
+            self.assertEqual(result.returncode, 0)
+        logged = (self.root / "state" / "snapshots.jsonl").read_text(encoding="utf-8")
+        records = [json.loads(line) for line in logged.strip().splitlines()]
+        self.assertEqual(len(records), len(sequence))
+        seen = [
+            (record["config_dir"], record["windows"]["five_hour"]["utilization_percent"])
+            for record in records
+        ]
+        self.assertEqual(
+            seen,
+            [(".claude", 10.0), (".claude-arcade", 30.0), (".claude", 30.0),
+             (".claude-arcade", 10.0)],
+        )
+
+    def test_statusline_label_falls_back_to_first_resolved_root(self) -> None:
+        # With no $CLAUDE_CONFIG_DIR, the fallback label must come from the
+        # first resolved Claude root, not a hardcoded ".claude" - here the
+        # only configured root is renamed, so the record must carry that
+        # root's own basename.
+        renamed = self.home / ".claude-only"
+        renamed.mkdir(parents=True, exist_ok=True)
+        config_path = self.root / "config" / "config.toml"
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        config_path.write_text(
+            '[claude]\nroots = ["%s"]\n' % str(renamed).replace("\\", "\\\\"),
+            encoding="utf-8",
+        )
+        result = self.run_tool("snapshot", "--stdin", stdin=self._statusline_payload(12.0))
+        self.assertEqual(result.returncode, 0)
+        logged = (self.root / "state" / "snapshots.jsonl").read_text(encoding="utf-8")
+        record = json.loads(logged.strip().splitlines()[-1])
+        self.assertEqual(record["config_dir"], ".claude-only")
 
     def test_compact_drops_repeats_and_stale_entries(self) -> None:
         path = self.root / "state" / "snapshots.jsonl"
@@ -1867,6 +2370,72 @@ class ClaudeCalibration(Harness):
         self.assertEqual([interval.rollover for interval in intervals], [False, False])
         self.assertEqual([interval.drain for interval in intervals], [2.0, 3.0])
 
+    def write_claude_snapshots(self, rows: Sequence[Tuple[float, float, str]]) -> None:
+        path = self.root / "state" / "snapshots.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as handle:
+            for ts, percent, resets_at in rows:
+                handle.write(
+                    json.dumps(
+                        {
+                            "source": "oauth",
+                            "config_dir": ".claude",
+                            "ts": ts,
+                            "windows": {
+                                "five_hour": {
+                                    "utilization_percent": percent,
+                                    "resets_at": resets_at,
+                                }
+                            },
+                        }
+                    )
+                    + "\n"
+                )
+
+    def test_claude_rollover_with_a_rise_stays_a_rollover(self) -> None:
+        # build_intervals also serves the Claude path (calibrate_claude, over
+        # load_claude_snapshots rows with ANY_WINDOW): a rise across a bucket
+        # change must still be classified as a real rollover (rule a) - the
+        # narrowing of rule (b) to "no drain evidence" must not swallow this
+        # case, the same shape as test_rollover_when_resets_at_changes for
+        # Codex.
+        now = time.time() - 4 * 3600
+        window_a = now + 200
+        window_b = window_a + 18000  # a genuinely new five-hour window
+        self.write_claude_snapshots(
+            [
+                (now, 10.0, iso(window_a)),
+                (now + 600, 10.0, iso(window_a)),  # same window, unchanged: no interval
+                (now + 1200, 14.0, iso(window_b)),  # new window, a rise: rollover
+            ]
+        )
+        with self.env_applied():
+            rows = QD.load_claude_snapshots("five_hour")
+        intervals = QD.build_intervals(rows, QD.ANY_WINDOW)
+        self.assertEqual(len(intervals), 1)
+        self.assertTrue(intervals[0].rollover)
+        self.assertAlmostEqual(intervals[0].drain, 14.0, places=6)
+
+    def test_claude_same_bucket_decrease_then_rise(self) -> None:
+        # Same shape as the Codex decrease test: the interval starts at the
+        # low reading, not at 0 and not measured back from the high reading.
+        now = time.time() - 4 * 3600
+        window_a = now + 200
+        self.write_claude_snapshots(
+            [
+                (now, 40.0, iso(window_a)),
+                (now + 600, 30.0, iso(window_a)),
+                (now + 1200, 35.0, iso(window_a)),
+            ]
+        )
+        with self.env_applied():
+            rows = QD.load_claude_snapshots("five_hour")
+        intervals = QD.build_intervals(rows, QD.ANY_WINDOW)
+        self.assertEqual(len(intervals), 1)
+        self.assertFalse(intervals[0].rollover)
+        self.assertAlmostEqual(intervals[0].drain, 5.0, places=6)
+        self.assertEqual(intervals[0].start, now + 600)
+
     def test_collinear_models_are_flagged_unidentified(self) -> None:
         # Two models that only ever run together cannot be told apart, and a
         # confident zero for either would price it as free.
@@ -2229,6 +2798,731 @@ class WindowSelection(Harness):
         result = self.run_tool("sessions", "--harness", "codex", "--no-color")
         self.assertEqual(result.returncode, 0)
         self.assertIn(b"none produced a measurable interval", result.stderr)
+
+
+class TtyStringIO(io.StringIO):
+    """Stands in for a real UTF-8 terminal so the painter turns colors on."""
+
+    encoding = "utf-8"
+
+    def isatty(self) -> bool:  # noqa: D102 - stdlib override
+        return True
+
+
+class PromptsBarLegendColor(Harness):
+    """Issue #12: the legend must match the bar cells and the harness color."""
+
+    def render_prompts(self, *arguments: str) -> str:
+        stdout = sys.stdout
+        sys.stdout = TtyStringIO()
+        try:
+            with self.env_applied():
+                QD.main(["prompts", "--width", "120"] + list(arguments))
+            return sys.stdout.getvalue()
+        finally:
+            sys.stdout = stdout
+
+    def test_legend_glyphs_match_bar_glyphs(self) -> None:
+        now = time.time() - 1800
+        session = "cccc9999-aaaa-2222-3333-444444444444"
+        lines = [claude_user_prompt_line(now, session)]
+        lines.append(
+            claude_assistant_line(
+                now + 1, session, "msg_p0", input_tokens=1000, cache_read=500,
+                output_tokens=50
+            )
+        )
+        self.write_claude("legend.jsonl", lines)
+        text = self.render_prompts("--session", "cccc9999")
+
+        legend_line = next(
+            line for line in text.splitlines() if "input tokens sent per prompt" in line
+        )
+        bar_line = next(
+            line for line in text.splitlines() if line.strip().startswith("1 ") and "█" in line
+        )
+
+        legend_filled = QD.ANSI["claude"] + "█" + QD.ANSI["reset"]
+        legend_cached = QD.ANSI["dim"] + "▒" + QD.ANSI["reset"]
+        self.assertIn(legend_filled, legend_line)
+        self.assertIn(legend_cached, legend_line)
+
+        # The legend glyphs must carry the same escape sequence prefix as the
+        # bar's glyphs: same color for the filled cell, "dim" for cached.
+        self.assertIn(QD.ANSI["claude"] + "█", bar_line)
+        self.assertIn(QD.ANSI["dim"] + "▒", bar_line)
+
+    def test_claude_session_uses_claude_color(self) -> None:
+        now = time.time() - 1800
+        session = "dddd9999-aaaa-2222-3333-444444444444"
+        lines = [claude_user_prompt_line(now, session)]
+        lines.append(
+            claude_assistant_line(
+                now + 1, session, "msg_p0", input_tokens=1000, output_tokens=50
+            )
+        )
+        self.write_claude("claude_color.jsonl", lines)
+        text = self.render_prompts("--session", "dddd9999")
+        self.assertIn(QD.ANSI["claude"] + "█", text)
+        self.assertNotIn(QD.ANSI["codex"] + "█", text)
+
+
+class RootsAndConfig(Harness):
+    """`config.toml`, root precedence, `nenpi config`, and the dir rename."""
+
+    def config_path(self) -> Path:
+        return self.root / "config" / "config.toml"
+
+    def write_config(self, text: str) -> Path:
+        path = self.config_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+        return path
+
+    def make_extra_claude_root(self, name: str = ".claude-extra") -> Path:
+        root = self.home / name
+        (root / "projects" / "proj").mkdir(parents=True, exist_ok=True)
+        return root
+
+    def make_extra_codex_root(self, name: str = ".codex-extra") -> Path:
+        root = self.home / name
+        (root / "sessions").mkdir(parents=True, exist_ok=True)
+        return root
+
+    def test_default_roots_scan_only_dot_claude_and_dot_codex(self) -> None:
+        extra = self.make_extra_claude_root()
+        now = time.time() - 600
+        self.write_claude(
+            "default.jsonl",
+            [claude_assistant_line(now, "aaaa0001-1111-2222-3333-444444444444", "msg_d",
+                                   output_tokens=10)],
+        )
+        (extra / "projects" / "proj" / "extra.jsonl").write_text(
+            claude_assistant_line(
+                now, "bbbb0002-1111-2222-3333-444444444444", "msg_e", output_tokens=10
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        payload = self.run_json("sessions", "--harness", "claude", "--json")
+        ids = {row["short_id"] for row in payload["sessions"]}
+        self.assertIn("aaaa0001", ids)
+        self.assertNotIn("bbbb0002", ids)
+
+    def test_config_toml_adds_a_root(self) -> None:
+        extra = self.make_extra_claude_root()
+        now = time.time() - 600
+        (extra / "projects" / "proj" / "extra.jsonl").write_text(
+            claude_assistant_line(
+                now, "bbbb0002-1111-2222-3333-444444444444", "msg_e", output_tokens=10
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        self.write_config(
+            '[claude]\nroots = ["%s", "%s"]\n' % (self.home / ".claude", extra)
+        )
+        payload = self.run_json("sessions", "--harness", "claude", "--json")
+        ids = {row["short_id"] for row in payload["sessions"]}
+        self.assertIn("bbbb0002", ids)
+
+    def test_flags_replace_config_and_defaults(self) -> None:
+        extra = self.make_extra_claude_root()
+        now = time.time() - 600
+        self.write_claude(
+            "default.jsonl",
+            [claude_assistant_line(now, "aaaa0001-1111-2222-3333-444444444444", "msg_d",
+                                   output_tokens=10)],
+        )
+        (extra / "projects" / "proj" / "extra.jsonl").write_text(
+            claude_assistant_line(
+                now, "bbbb0002-1111-2222-3333-444444444444", "msg_e", output_tokens=10
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        self.write_config('[claude]\nroots = ["%s"]\n' % (self.home / ".claude"))
+        payload = self.run_json(
+            "sessions", "--harness", "claude", "--json", "--claude-root", str(extra)
+        )
+        ids = {row["short_id"] for row in payload["sessions"]}
+        self.assertIn("bbbb0002", ids)
+        self.assertNotIn("aaaa0001", ids)
+
+    def test_claude_root_flag_accepts_the_old_projects_leaf(self) -> None:
+        extra = self.make_extra_claude_root()
+        now = time.time() - 600
+        (extra / "projects" / "proj" / "extra.jsonl").write_text(
+            claude_assistant_line(
+                now, "bbbb0002-1111-2222-3333-444444444444", "msg_e", output_tokens=10
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        result = self.run_tool(
+            "sessions", "--harness", "claude", "--claude-root", str(extra / "projects")
+        )
+        self.assertEqual(result.returncode, 0)
+        self.assertIn(b"deprecated", result.stderr)
+        self.assertIn(b"bbbb0002", result.stdout)
+
+    def test_malformed_toml_errors(self) -> None:
+        self.write_config("not [ valid toml")
+        result = self.run_tool("config")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(b"nenpi: config", result.stderr)
+
+    def test_unknown_key_warns_but_does_not_fail(self) -> None:
+        self.write_config('[claude]\nroots = ["%s"]\nbogus = true\n' % (self.home / ".claude"))
+        result = self.run_tool("config")
+        self.assertEqual(result.returncode, 0)
+        self.assertIn(b"unknown key", result.stderr)
+
+    def test_config_command_shows_roots_and_account(self) -> None:
+        (self.home / ".codex" / "auth.json").write_text(
+            json.dumps({"tokens": {"account_id": "acct-codex-123", "access_token": "must-not-print"}}),
+            encoding="utf-8",
+        )
+        payload = self.run_json("config", "--json")
+        codex_rows = [row for row in payload["roots"] if row["harness"] == "codex"]
+        self.assertTrue(codex_rows)
+        self.assertEqual(codex_rows[0]["account_key"], "acct-codex-123")
+        self.assertNotIn("must-not-print", json.dumps(payload))
+
+    def test_config_command_falls_back_to_label_without_auth_json(self) -> None:
+        payload = self.run_json("config", "--json")
+        claude_rows = [row for row in payload["roots"] if row["harness"] == "claude"]
+        self.assertTrue(claude_rows)
+        self.assertEqual(claude_rows[0]["account_label"], ".claude")
+        self.assertEqual(claude_rows[0]["account_key"], ".claude")
+
+    def test_config_init_writes_starter_and_refuses_overwrite(self) -> None:
+        first = self.run_tool("config", "--init")
+        self.assertEqual(first.returncode, 0)
+        text = self.config_path().read_text(encoding="utf-8")
+        self.assertIn("[claude]", text)
+        self.assertIn("[codex]", text)
+        second = self.run_tool("config", "--init")
+        self.assertNotEqual(second.returncode, 0)
+        third = self.run_tool("config", "--init", "--force")
+        self.assertEqual(third.returncode, 0)
+
+    def test_legacy_quota_drain_env_still_honoured(self) -> None:
+        environment = dict(self.environment)
+        for name in ("HOME_DIR", "CACHE_DIR", "STATE_DIR", "CONFIG_DIR"):
+            value = environment.pop("NENPI_" + name)
+            environment["QUOTA_DRAIN_" + name] = value
+        result = subprocess.run(
+            DRAIN_COMMAND + ["config"],
+            check=False,
+            capture_output=True,
+            env=environment,
+            timeout=120,
+        )
+        self.assertEqual(result.returncode, 0)
+        self.assertIn(b"deprecated", result.stderr)
+
+    def test_migration_moves_old_dir_to_new_name(self) -> None:
+        environment = dict(self.environment)
+        environment.pop("NENPI_CACHE_DIR")
+        old_cache = self.home / ".cache" / "quota-drain"
+        old_cache.mkdir(parents=True)
+        (old_cache / "marker.txt").write_text("old", encoding="utf-8")
+        result = subprocess.run(
+            DRAIN_COMMAND + ["config"],
+            check=False,
+            capture_output=True,
+            env=environment,
+            timeout=120,
+        )
+        self.assertEqual(result.returncode, 0)
+        self.assertIn(b"moved", result.stderr)
+        new_cache = self.home / ".cache" / "nenpi"
+        self.assertTrue((new_cache / "marker.txt").is_file())
+        self.assertFalse(old_cache.exists())
+
+    def test_migration_leaves_both_when_new_dir_already_exists(self) -> None:
+        environment = dict(self.environment)
+        environment.pop("NENPI_CACHE_DIR")
+        old_cache = self.home / ".cache" / "quota-drain"
+        old_cache.mkdir(parents=True)
+        (old_cache / "marker.txt").write_text("old", encoding="utf-8")
+        new_cache = self.home / ".cache" / "nenpi"
+        new_cache.mkdir(parents=True)
+        (new_cache / "marker.txt").write_text("new", encoding="utf-8")
+        result = subprocess.run(
+            DRAIN_COMMAND + ["config"],
+            check=False,
+            capture_output=True,
+            env=environment,
+            timeout=120,
+        )
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual((new_cache / "marker.txt").read_text(encoding="utf-8"), "new")
+        self.assertEqual((old_cache / "marker.txt").read_text(encoding="utf-8"), "old")
+
+    def test_resolve_roots_in_process_precedence(self) -> None:
+        """Direct unit check of the precedence rule, independent of the CLI."""
+        with self.env_applied():
+            default_config = QC.Config()
+            claude_default = QC.resolve_roots("claude", [], default_config)
+            self.assertEqual(claude_default, [self.home / ".claude"])
+
+            configured = QC.Config(claude_roots=[str(self.home / ".claude-extra")])
+            (self.home / ".claude-extra").mkdir()
+            claude_configured = QC.resolve_roots("claude", [], configured)
+            self.assertEqual(claude_configured, [self.home / ".claude-extra"])
+
+            flagged = QC.resolve_roots("claude", [str(self.home / ".claude")], configured)
+            self.assertEqual(flagged, [self.home / ".claude"])
+
+    def test_codex_only_harness_emits_no_claude_roots_warning(self) -> None:
+        shutil.rmtree(self.home / ".claude")
+        now = time.time() - 600
+        session = "codex-only-0001"
+        self.write_codex(
+            "rollout-1-aaa.jsonl",
+            [
+                codex_session_meta_line(now, session, "/home/agent/repo"),
+                codex_turn_context_line(now, "gpt-5.6-sol"),
+                codex_usage_record_line(
+                    now + 10, session, input_tokens=1_000, cached_input_tokens=0,
+                    output_tokens=100
+                ),
+            ],
+        )
+        result = self.run_tool("sessions", "--harness", "codex")
+        self.assertEqual(result.returncode, 0, result.stderr.decode("utf-8", "replace"))
+        self.assertNotIn(b"no claude roots found", result.stderr)
+
+    def test_config_command_shows_missing_root(self) -> None:
+        missing = self.home / ".claude-typo"
+        self.write_config('[claude]\nroots = ["%s"]\n' % missing)
+        result = self.run_tool("config")
+        self.assertEqual(result.returncode, 0)
+        self.assertIn(b"exists=no", result.stdout)
+        payload = self.run_json("config", "--json")
+        claude_rows = [row for row in payload["roots"] if row["harness"] == "claude"]
+        self.assertTrue(
+            any(row["path"] == str(missing) and row["exists"] is False for row in claude_rows)
+        )
+
+    def test_plan_config_labels_the_header_when_nothing_measured(self) -> None:
+        self.write_config('[plan]\nclaude = "max_20x"\n')
+        now = time.time() - 600
+        self.write_claude(
+            "s.jsonl",
+            [claude_assistant_line(now, "aaaa0001-1111-2222-3333-444444444444", "msg",
+                                   output_tokens=10)],
+        )
+        result = self.run_tool("sessions", "--harness", "claude")
+        self.assertEqual(result.returncode, 0)
+        self.assertIn(b"claude=max_20x", result.stdout)
+
+    def test_plan_config_never_overrides_a_measured_tier(self) -> None:
+        self.write_config('[plan]\nclaude = "max_20x"\n')
+        (self.home / ".claude" / ".claude.json").write_text(
+            json.dumps({"oauthAccount": {"organizationRateLimitTier": "pro_5x"}}),
+            encoding="utf-8",
+        )
+        now = time.time() - 600
+        self.write_claude(
+            "s.jsonl",
+            [claude_assistant_line(now, "aaaa0001-1111-2222-3333-444444444444", "msg",
+                                   output_tokens=10)],
+        )
+        result = self.run_tool("sessions", "--harness", "claude")
+        self.assertEqual(result.returncode, 0)
+        self.assertIn(b"claude[.claude]=pro_5x", result.stdout)
+        self.assertNotIn(b"max_20x", result.stdout)
+
+    def test_config_init_escapes_special_characters_in_root_path(self) -> None:
+        tricky = self.home / '.claude-weird"name\\dir'
+        (tricky / "projects").mkdir(parents=True)
+        result = self.run_tool("config", "--init")
+        self.assertEqual(result.returncode, 0, result.stderr.decode("utf-8", "replace"))
+        text = self.config_path().read_text(encoding="utf-8")
+        self.assertIn('\\"', text)
+        self.assertIn('\\\\', text)
+        # A malformed escape would make this an invalid TOML string, or would
+        # not round-trip to the same path; loading it back must recover it.
+        with self.env_applied():
+            loaded = QC.load_config()
+        self.assertIn(str(tricky), loaded.claude_roots)
+
+    def test_config_init_refuses_when_target_is_a_directory(self) -> None:
+        directory_path = self.config_path()
+        directory_path.mkdir(parents=True)
+        result = self.run_tool("config", "--init")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(b"directory", result.stderr)
+
+    def test_discover_candidate_roots_includes_env_var_outside_home(self) -> None:
+        outside = self.root / "outside-codex"
+        (outside / "sessions").mkdir(parents=True)
+        environment = dict(self.environment)
+        environment["CODEX_HOME"] = str(outside)
+        result = subprocess.run(
+            DRAIN_COMMAND + ["config", "--init"],
+            check=False,
+            capture_output=True,
+            env=environment,
+            timeout=120,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr.decode("utf-8", "replace"))
+        text = self.config_path().read_text(encoding="utf-8")
+        self.assertIn(str(outside), text)
+
+    def test_legacy_config_file_env_has_no_fallback(self) -> None:
+        environment = dict(self.environment)
+        legacy_path = self.root / "legacy-config.toml"
+        legacy_path.parent.mkdir(parents=True, exist_ok=True)
+        legacy_path.write_text('[claude]\nroots = ["%s"]\n' % (self.home / ".claude"),
+                               encoding="utf-8")
+        environment["QUOTA_DRAIN_CONFIG_FILE"] = str(legacy_path)
+        result = subprocess.run(
+            DRAIN_COMMAND + ["config"],
+            check=False,
+            capture_output=True,
+            env=environment,
+            timeout=120,
+        )
+        self.assertEqual(result.returncode, 0)
+        self.assertNotIn(b"deprecated", result.stderr)
+        self.assertNotEqual(
+            self.config_path(), legacy_path, "legacy CONFIG_FILE must not relocate config_path"
+        )
+
+    def test_warn_once_registry_is_shared_between_drain_and_config(self) -> None:
+        self.assertIs(QD.warn_once, QC.warn_once)
+        self.assertIs(QD.warn, QC.warn)
+
+
+class AccountPools(Harness):
+    """Per-account quota pools (#9).
+
+    Two roots on different accounts must never be read as one alternating
+    timeline (each gets its own pool, its own drain, its own window); two
+    roots on the SAME account must still merge into one pool.
+    """
+
+    def write_codex_root(self, root_name: str, filename: str, lines: Sequence[str],
+                         day: Optional[float] = None) -> Path:
+        stamp = datetime.fromtimestamp(day or time.time(), timezone.utc)
+        path = self.home / root_name / "sessions" / stamp.strftime("%Y/%m/%d") / filename
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "a", encoding="utf-8") as handle:
+            for line in lines:
+                handle.write(line + "\n")
+        return path
+
+    def write_auth(self, root_name: str, account_id: str) -> None:
+        root = self.home / root_name
+        root.mkdir(parents=True, exist_ok=True)
+        (root / "auth.json").write_text(
+            json.dumps(
+                {"tokens": {"account_id": account_id, "access_token": "must-not-print"}}
+            ),
+            encoding="utf-8",
+        )
+
+    def test_two_accounts_no_rollover_and_separate_drain(self) -> None:
+        # Reproduces #9: two Codex roots on different accounts, same
+        # limit_id/plan_type/window_minutes, readings interleaved every few
+        # seconds, and the Arcade pool's resets_at is hours after the
+        # personal pool's - exactly the shape that used to be read as one
+        # timeline rolling over.
+        self.write_auth(".codex", "acct-personal")
+        self.write_auth(".codex-arcade", "acct-arcade")
+        now = time.time() - 3600
+        resets_a = int(now) + 7 * 86400
+        resets_b = resets_a + 4 * 3600
+
+        session_a = "aaaaaaaa-personal-2222-3333-444444444444"
+        lines_a = [
+            codex_session_meta_line(now, session_a, "/home/agent/personal"),
+            codex_turn_context_line(now, "gpt-5.6-sol"),
+            codex_token_count_line(now + 5, rate_limits=rate_limits(27.0, resets_a, 10080)),
+            codex_usage_record_line(
+                now + 20, session_a, input_tokens=100_000, cached_input_tokens=0,
+                output_tokens=0,
+            ),
+            codex_token_count_line(now + 35, rate_limits=rate_limits(42.0, resets_a, 10080)),
+        ]
+        self.write_codex_root(".codex", "rollout-personal.jsonl", lines_a)
+
+        session_b = "bbbbbbbb-arcade-2222-3333-444444444444"
+        lines_b = [
+            codex_session_meta_line(now, session_b, "/home/agent/arcade"),
+            codex_turn_context_line(now, "gpt-5.6-sol"),
+            codex_token_count_line(now + 10, rate_limits=rate_limits(33.0, resets_b, 10080)),
+            codex_usage_record_line(
+                now + 25, session_b, input_tokens=100_000, cached_input_tokens=0,
+                output_tokens=0,
+            ),
+            codex_token_count_line(now + 40, rate_limits=rate_limits(90.0, resets_b, 10080)),
+        ]
+        self.write_codex_root(".codex-arcade", "rollout-arcade.jsonl", lines_b)
+
+        root_args = [
+            "--codex-root", str(self.home / ".codex"),
+            "--codex-root", str(self.home / ".codex-arcade"),
+        ]
+        payload = self.run_json(
+            "sessions", "--harness", "codex", "--json", "--window", "weekly", *root_args
+        )
+        row_a = self.session_by_short_id(payload, "aaaaaaaa")
+        row_b = self.session_by_short_id(payload, "bbbbbbbb")
+        # 15 = 42 - 27 (personal pool's own delta); 57 = 90 - 33 (Arcade's).
+        # A merged timeline would instead charge one session the other
+        # pool's whole used_percent as a bogus rollover.
+        self.assertAlmostEqual(row_a["drain_percent"], 15.0, places=6)
+        self.assertAlmostEqual(row_b["drain_percent"], 57.0, places=6)
+        self.assertEqual(row_a["account_label"], ".codex")
+        self.assertEqual(row_b["account_label"], ".codex-arcade")
+        self.assertEqual(row_a["account"], "acct-personal")
+        self.assertEqual(row_b["account"], "acct-arcade")
+
+        windows_payload = self.run_json(
+            "windows", "--harness", "codex", "--json", "--window", "weekly", *root_args
+        )
+        by_label = dict(
+            (entry["account_label"], entry) for entry in windows_payload["windows"]
+        )
+        self.assertEqual(sorted(by_label), [".codex", ".codex-arcade"])
+        self.assertAlmostEqual(by_label[".codex"]["peak_used_percent"], 42.0, places=6)
+        self.assertAlmostEqual(by_label[".codex-arcade"]["peak_used_percent"], 90.0, places=6)
+
+    def test_same_account_two_roots_merge_into_one_pool(self) -> None:
+        # Two roots that happen to share the same account (a re-pointed
+        # $CODEX_HOME, say) must still read as one continuous pool.
+        self.write_auth(".codex", "acct-shared")
+        self.write_auth(".codex-mirror", "acct-shared")
+        now = time.time() - 3600
+        resets_at = int(now) + 7 * 86400
+
+        session_a = "cccccccc-shared-2222-3333-444444444444"
+        self.write_codex_root(
+            ".codex", "rollout-a.jsonl",
+            [
+                codex_session_meta_line(now, session_a, "/home/agent/shared"),
+                codex_turn_context_line(now, "gpt-5.6-sol"),
+                codex_token_count_line(
+                    now + 5, rate_limits=rate_limits(10.0, resets_at, 10080)
+                ),
+                codex_usage_record_line(
+                    now + 20, session_a, input_tokens=50_000, cached_input_tokens=0,
+                    output_tokens=0,
+                ),
+            ],
+        )
+        session_b = "dddddddd-shared-2222-3333-444444444444"
+        self.write_codex_root(
+            ".codex-mirror", "rollout-b.jsonl",
+            [
+                codex_session_meta_line(now, session_b, "/home/agent/shared"),
+                codex_turn_context_line(now, "gpt-5.6-sol"),
+                codex_token_count_line(
+                    now + 30, rate_limits=rate_limits(18.0, resets_at, 10080)
+                ),
+                codex_usage_record_line(
+                    now + 25, session_b, input_tokens=50_000, cached_input_tokens=0,
+                    output_tokens=0,
+                ),
+            ],
+        )
+        root_args = [
+            "--codex-root", str(self.home / ".codex"),
+            "--codex-root", str(self.home / ".codex-mirror"),
+        ]
+        windows_payload = self.run_json(
+            "windows", "--harness", "codex", "--json", "--window", "weekly", *root_args
+        )
+        # One merged pool, not two: a single 10% -> 18% timeline split
+        # between whichever session had events since the previous reading.
+        self.assertEqual(len(windows_payload["windows"]), 1)
+        self.assertAlmostEqual(
+            windows_payload["windows"][0]["peak_used_percent"], 18.0, places=6
+        )
+
+    def test_cached_shard_keeps_the_right_account_after_reresolve(self) -> None:
+        # A shard cached under a root on one run must still stamp the right
+        # account on a later run that resolves the same root again - account
+        # identity is never part of the per-file cache payload.
+        self.write_auth(".codex", "acct-personal")
+        now = time.time() - 3600
+        session = "eeeeeeee-cache-2222-3333-444444444444"
+        self.write_codex_root(
+            ".codex", "rollout-cache.jsonl",
+            [
+                codex_session_meta_line(now, session, "/home/agent/personal"),
+                codex_turn_context_line(now, "gpt-5.6-sol"),
+                codex_usage_record_line(
+                    now + 5, session, input_tokens=10_000, cached_input_tokens=0,
+                    output_tokens=0,
+                ),
+            ],
+        )
+        first = self.run_json("sessions", "--harness", "codex", "--json")
+        row = self.session_by_short_id(first, "eeeeeeee")
+        self.assertEqual(row["account_label"], ".codex")
+        self.assertEqual(row["account"], "acct-personal")
+        # Second run reads the same file from cache (mtime/size unchanged);
+        # the account still has to come from the root, not a stale copy.
+        second = self.run_json("sessions", "--harness", "codex", "--json")
+        row = self.session_by_short_id(second, "eeeeeeee")
+        self.assertEqual(row["account_label"], ".codex")
+        self.assertEqual(row["account"], "acct-personal")
+
+    def test_account_filter_limits_the_report_to_one_pool(self) -> None:
+        self.write_auth(".codex", "acct-personal")
+        self.write_auth(".codex-arcade", "acct-arcade")
+        now = time.time() - 3600
+        resets_at = int(now) + 7 * 86400
+        session_a = "ffffffff-filt-a222-3333-444444444444"
+        session_b = "11111111-filt-b222-3333-444444444444"
+        # Distinct offsets per root: the usage record's epoch feeds a
+        # synthetic call id (`resp-%f`), and two roots sharing one would
+        # collide in the corpus-wide dedup and silently drop one session.
+        for root_name, session_id, offset in (
+            (".codex", session_a, 5), (".codex-arcade", session_b, 7)
+        ):
+            self.write_codex_root(
+                root_name, "rollout-r.jsonl",
+                [
+                    codex_session_meta_line(now, session_id, "/home/agent/x"),
+                    codex_turn_context_line(now, "gpt-5.6-sol"),
+                    codex_usage_record_line(
+                        now + offset, session_id, input_tokens=10_000,
+                        cached_input_tokens=0, output_tokens=0,
+                    ),
+                    codex_token_count_line(
+                        now + 10, rate_limits=rate_limits(10.0, resets_at, 10080)
+                    ),
+                ],
+                day=now,
+            )
+        payload = self.run_json(
+            "sessions", "--harness", "codex", "--json",
+            "--codex-root", str(self.home / ".codex"),
+            "--codex-root", str(self.home / ".codex-arcade"),
+            "--account", ".codex-arcade",
+        )
+        short_ids = [row["short_id"] for row in payload["sessions"]]
+        self.assertEqual(short_ids, ["11111111"])
+
+    def test_account_filter_by_either_label_returns_the_shared_key_pool(self) -> None:
+        # Two roots sharing one account key (a re-pointed root, or the same
+        # login copied to a second config dir) must merge into one pool
+        # (`test_same_account_two_roots_merge_into_one_pool` above) - and
+        # `--account` on EITHER root's label must resolve to that shared key
+        # and return sessions from BOTH roots, not just the labelled one.
+        self.write_auth(".codex", "acct-shared")
+        self.write_auth(".codex-mirror", "acct-shared")
+        now = time.time() - 3600
+        resets_at = int(now) + 7 * 86400
+        session_a = "22222222-share-a222-3333-444444444444"
+        session_b = "33333333-share-b222-3333-444444444444"
+        for root_name, session_id, offset in (
+            (".codex", session_a, 5), (".codex-mirror", session_b, 7)
+        ):
+            self.write_codex_root(
+                root_name, "rollout-shared.jsonl",
+                [
+                    codex_session_meta_line(now, session_id, "/home/agent/x"),
+                    codex_turn_context_line(now, "gpt-5.6-sol"),
+                    codex_usage_record_line(
+                        now + offset, session_id, input_tokens=10_000,
+                        cached_input_tokens=0, output_tokens=0,
+                    ),
+                    codex_token_count_line(
+                        now + 10, rate_limits=rate_limits(10.0, resets_at, 10080)
+                    ),
+                ],
+                day=now,
+            )
+        root_args = [
+            "--codex-root", str(self.home / ".codex"),
+            "--codex-root", str(self.home / ".codex-mirror"),
+        ]
+        for label in (".codex", ".codex-mirror"):
+            payload = self.run_json(
+                "sessions", "--harness", "codex", "--json", "--account", label, *root_args
+            )
+            short_ids = sorted(row["short_id"] for row in payload["sessions"])
+            self.assertEqual(short_ids, ["22222222", "33333333"])
+
+
+class ClaudeAccountPools(Harness):
+    """Two Claude `config_dir`s map to two accounts (#9, Claude side)."""
+
+    def write_claude_config(self, root_name: str, org_uuid: str) -> None:
+        root = self.home / root_name
+        root.mkdir(parents=True, exist_ok=True)
+        (root / ".claude.json").write_text(
+            json.dumps(
+                {
+                    "oauthAccount": {
+                        "organizationUuid": org_uuid,
+                        "organizationRateLimitTier": "max_20x",
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    def write_snapshots(self, records: Sequence[Dict[str, Any]]) -> None:
+        path = self.root / "state" / "snapshots.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "a", encoding="utf-8") as handle:
+            for record in records:
+                handle.write(json.dumps(record) + "\n")
+
+    def test_two_config_dirs_map_to_two_accounts(self) -> None:
+        self.write_claude_config(".claude", "org-personal")
+        self.write_claude_config(".claude-arcade", "org-arcade")
+        now = time.time() - 3600
+        self.write_snapshots(
+            [
+                {
+                    "source": "oauth",
+                    "config_dir": ".claude",
+                    "ts": now,
+                    "windows": {
+                        "five_hour": {
+                            "utilization_percent": 10.0,
+                            "resets_at": "2026-09-16T21:30:00+00:00",
+                        }
+                    },
+                },
+                {
+                    "source": "oauth",
+                    "config_dir": ".claude-arcade",
+                    "ts": now + 60,
+                    "windows": {
+                        "five_hour": {
+                            "utilization_percent": 40.0,
+                            "resets_at": "2026-09-16T21:30:00+00:00",
+                        }
+                    },
+                },
+            ]
+        )
+        with self.env_applied():
+            roots = [self.home / ".claude", self.home / ".claude-arcade"]
+            rows = QD.load_claude_snapshots("five_hour", claude_roots=roots)
+        by_label = dict((row["account_label"], row) for row in rows)
+        self.assertEqual(by_label[".claude"]["account"], "org-personal")
+        self.assertEqual(by_label[".claude-arcade"]["account"], "org-arcade")
+        self.assertEqual(by_label[".claude"]["plan_type"], "max_20x")
+        self.assertEqual(by_label[".claude-arcade"]["plan_type"], "max_20x")
+        # The account key (an org uuid, resolved in memory from `.claude.json`)
+        # is never written back to the snapshot record itself - only
+        # `config_dir` (the label) is, per `oauth_snapshot_record`'s privacy
+        # note. This asserts the file on disk still holds no org uuid.
+        raw = (self.root / "state" / "snapshots.jsonl").read_text(encoding="utf-8")
+        self.assertNotIn("org-personal", raw)
+        self.assertNotIn("org-arcade", raw)
 
 
 if __name__ == "__main__":

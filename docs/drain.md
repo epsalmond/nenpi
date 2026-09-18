@@ -8,7 +8,7 @@ read-when: Attributing subscription-plan quota to agent sessions, tuning nenpi w
 
 `nenpi` reads Claude Code and Codex CLI transcripts on disk and
 reports which sessions drained how much **subscription-plan quota** — not API
-dollars. It is standalone: Python standard library only, Python 3.9 or newer,
+dollars. It is standalone: Python standard library only, Python 3.11 or newer,
 Linux and macOS.
 
 Two harnesses, two very different evidence bases:
@@ -41,11 +41,18 @@ nenpi windows     [--harness codex]
 nenpi calibrate   [--harness codex|claude] [--since ...]
 nenpi verify      [--since ...]
 nenpi snapshot    [--stdin | --oauth [--config-dir PATH] | --compact]
+nenpi config      [--claude-root PATH] [--codex-root PATH] [--json]
+nenpi config      --init [--force]
 ```
 
 Common flags on every reporting subcommand: `--claude-root PATH` and
-`--codex-root PATH` (both repeatable) add transcript roots,
-`--claude-cache-read-weight FLOAT` overrides the disputed cache-read price,
+`--codex-root PATH` (both repeatable) *replace* the resolved roots for that
+harness — see [Roots and config.toml](#roots-and-configtoml) for how they are
+resolved when omitted. `--account LABEL` limits sessions, events, and quota
+windows to one account's pool, by root basename (e.g. `.codex-arcade`; see
+`nenpi config` for the labels in use). `--claude-cache-read-weight FLOAT`
+overrides the
+disputed cache-read price,
 `--long-context-multiplier FLOAT` scales requests over 200K tokens (a no-op at
 its default of 1.0), `--use-calibrated` prefers a stored fit,
 `--whole-session` reports each selected session's whole life rather than the
@@ -105,8 +112,13 @@ Points where a session's context shrank sharply — see
 
 ### windows
 
-Each observed Codex quota window: start, `resets_at`, peak `used_percent`, and
-the sessions that drained it.
+Each observed Codex quota window: account, start, `resets_at`, peak
+`used_percent`, and the sessions that drained it. Two roots on different
+accounts always get separate windows, even when they share the same
+`limit_id`/`plan_type`/`window_minutes` - see
+[Roots and config.toml](#roots-and-configtoml) for how a root's account is
+detected. Pass `--account LABEL` (a root's basename, e.g. `.codex-arcade`) to
+any report command to see one pool at a time.
 
 ### verify
 
@@ -154,7 +166,7 @@ Claude has no rate card for and does not require. Otherwise it is stored with
 `--use-calibrated`.
 
 `--harness codex` writes the fit to
-`~/.local/state/quota-drain/codex-weights.json`; `--use-calibrated` then
+`~/.local/state/nenpi/codex-weights.json`; `--use-calibrated` then
 prefers it. `--harness claude` needs sampled snapshots and reports the
 measured cache-read rate beside the uncached-input rate, so the disputed 0.1x
 list ratio can be tested against observation.
@@ -169,15 +181,38 @@ and optional `secondary` window with `used_percent`, `window_minutes`
 (300 = five-hour, 10080 = weekly) and `resets_at` (Unix seconds).
 
 Observations from every Codex root are merged into one timeline per
-`(limit_id, plan_type, window_minutes)`. Within a timeline the tool walks
-forward, keeping a running maximum:
+`(account, limit_id, plan_type, window_minutes)`. Within a timeline the tool
+walks forward, keeping a running maximum:
 
-- A reading whose `resets_at` moves forward starts a new window; its
-  `used_percent` is that window's drain so far and is attributed as a
-  `rollover` interval.
+- **(a) A bucket change with drain evidence** (`used_percent` dropped, or rose
+  by more than nothing) **is a rollover.** Its own `used_percent` is that
+  window's drain so far, attributed as a `rollover` interval that never
+  reaches back past the moment the window opened (`resets_at` minus its
+  length).
+- **(b) A bucket change with no drain evidence is not a rollover.** Both
+  vendors re-stamp `resets_at` on every poll even for an idle pool - Codex
+  slides an untouched window's stamp toward `now + 7d`, drifting by roughly a
+  minute per reading - so a bucket change where `used_percent` is unchanged,
+  or an always-zero pool, carries no evidence anything reset. No interval is
+  emitted, and the running maximum and its anchor timestamp carry forward
+  unchanged, so the next real rise still spans back to the last reading that
+  actually moved.
+- **(c) Within one bucket, a decrease is bounded jitter, not a reset.** A
+  same-bucket decrease of `JITTER_TOLERANCE` (2 points) or less is vendor
+  jitter and is ignored, keeping the running maximum and its anchor; a larger
+  decrease is a real drop and becomes the new baseline (but still emits no
+  interval - a same-bucket reset cannot happen), so the next rise is not
+  re-charged against percent already attributed to the old high-water mark.
 - A reading from a window that has already rolled over is a stale poll from a
   concurrent session and is dropped.
-- Otherwise drain is the increase over the running maximum.
+- Otherwise (same bucket, a rise past the running maximum) drain is the
+  increase over it.
+
+`windows` and `sessions --json`'s `pools` group readings by `resets_at`,
+clustered within a five-minute tolerance per `(account, window_minutes)`
+rather than rounded to the minute: the same continuous drift that rule (b)
+keeps from creating phantom intervals would otherwise still fragment one
+idle window's `windows` output into dozens of near-identical, zero-peak rows.
 
 Exactly one `window_minutes` value is ever used — whichever the snapshots
 report most often, or the one `--window` names — because a five-hour percent
@@ -189,9 +224,70 @@ minute count.
 Each interval's drain is split across the sessions that recorded token deltas
 inside it, in proportion to their weighted tokens. A session's measured drain
 is the sum of its shares; `share_of_window` is its share of everything
-attributed to the same window instance. A rolled-over window's interval starts
+attributed to the same window instance - the denominator is the interval's
+*measured* drain, not the sum of what got attributed, so a capped window's
+shares do not have to sum to 100%. A rolled-over window's interval starts
 no earlier than the moment that window opened (`resets_at` minus its length),
 so its drain is never charged to sessions that had already finished.
+
+**The attribution cap.** Sparse readings can still make a proportional split
+implausible: the whole jump between two readings is split only across the
+sessions with a token delta inside that interval, so a handful of turns that
+happened to land inside a big jump can outrank a session that did a thousand
+times the work in a smaller one. After the proportional split, each session's
+share is capped at `CAP_FACTOR` (3) times its *plausible cost* - a per-account
+rate, in measured percent per weighted unit, times its own weighted units in
+that interval. A session over its cap is clamped to it; the freed drain is
+redistributed proportionally among the *other capped* sessions still under
+their own cap, which can repeat until none are over. Whatever the cap will
+not let any session absorb becomes `interval.unattributed` - usage from a
+client of *this* account that was never scanned (another machine, another
+login copy of the same credentials). It is never another account's drain: an
+interval only ever holds events from its own account's sessions
+(`account_for_root`), so this is not the cross-account bleed a per-account
+pool key already rules out. An interval with drain but no local session at
+all (every byte of it came from a client nas never saw) reports its whole
+drain as `unattributed` rather than silently dropping it - the invariant
+`sum(session shares) + unattributed == interval drain` holds for every
+interval, not only the ones with local activity. `nenpi prompts --session`
+splits a session's own turns out of its *capped* share, so a session's
+prompts always sum to the same figure `sessions` reports for it, never the
+interval's uncapped drain.
+
+The rate is the median of each qualifying interval's own drain/units ratio
+(not a pooled sum/sum, which one foreign-contaminated interval could drag
+up), taken over that account's own non-rollover intervals whose units are all
+on the weighted-unit scale. A pool needs at least 3 such intervals and at
+least 1 weighted unit of coverage before its own rate is trusted; short of
+that, `--use-calibrated`'s implied rate (1.0 - a calibrated table is already
+percent per weighted unit) or a usable stored fit's `fallback_scale` is used
+instead, and with neither, capping is skipped for that pool with a single
+warning. A session whose weighted units came from the raw-token fallback (a
+model with no weight, or a zeroed fitted coefficient) is exempt from the cap
+in either direction - that fallback's scale is not the weighted-unit scale, so
+capping against it would silently zero out a session that really did the
+work. That exemption also keeps such a session out of the water-fill
+redistribution pool: it always keeps its own raw proportional share (never
+more, even when another session's overflow is freed alongside it), and a
+capped session's freed drain goes only to other sessions with a finite,
+unmet cap, or to `unattributed` when none remain - an exempt session must
+never become an uncapped sink for everyone else's overflow. The one
+exception is a fallback session with no other session to share the interval
+with: there is nothing to cap it against, so it keeps its raw (i.e. full)
+share, which is what falls out of the loop naturally rather than a special
+case.
+
+Surfaced wherever drain is: the `sessions` header adds a line per account with
+measurable unattributed drain (`unattributed: .codex 14.2% (usage from
+clients not in the scanned roots)`); `windows` prints an `unattributed N%`
+line under any window that has one; `sessions --json` adds a top-level
+`pools` array, one entry per (account, window instance), with
+`account_label`, `window_resets_at`, `peak`, `attributed`, and `unattributed`.
+`calibrate --harness codex` fits weights against measured drain unchanged -
+the cap only reshuffles one interval's drain across its own sessions and
+never reaches the fit, and subtracting `unattributed` from the fit target
+would be circular - but reports the corpus's overall unattributed share as a
+diagnostic, since a large one means a contaminated corpus.
 
 Two details matter and are easy to get wrong:
 
@@ -339,10 +435,74 @@ hits) with the uncached rate printed as an upper bound.
 fork would make this exact.** It should carry `kind`, `before`, `after`,
 `timestamp`, and `turn_id`.
 
+## Roots and config.toml
+
+A **root** is a harness home dir: `~/.claude`, `~/.codex`, or a differently
+named one such as `~/.claude-arcade`. It holds the transcripts (`projects/`
+for Claude, `sessions/` for Codex) and the credentials (`.claude.json` /
+`.credentials.json` for Claude, `auth.json` for Codex).
+
+Roots are resolved per harness, in this order, and each source *replaces*
+rather than adds to the ones after it:
+
+1. `--claude-root PATH` / `--codex-root PATH` (repeatable). A path ending in
+   `projects` or `sessions` is still accepted, with the leaf stripped and a
+   deprecation warning — before this change the flags took that leaf path,
+   not the home dir.
+2. `[claude].roots` / `[codex].roots` in `config.toml` (below).
+3. Defaults: `[$CLAUDE_CONFIG_DIR, ~/.claude]` for Claude,
+   `[$CODEX_HOME, ~/.codex]` for Codex, with the environment variable first.
+
+At every step, missing directories are dropped silently and the list is
+deduplicated; a harness that resolves to zero roots gets one warning. There is
+no implicit `~/.claude*` / `~/.codex*` glob any more — a root that is not the
+default location has to be named, in a flag or in `config.toml`.
+
+`config.toml` lives at `~/.config/nenpi/config.toml` (`NENPI_CONFIG_FILE`
+overrides the path):
+
+```toml
+[claude]
+roots = ["~/.claude", "~/.claude-arcade"]
+
+[codex]
+roots = ["~/.codex", "~/.codex-arcade"]
+
+[plan]            # optional, display only
+claude = "max_20x"
+codex = "pro"
+```
+
+A missing file falls back to the defaults above. A malformed file is a hard
+error naming the file and the parse problem; an unknown key is a warning, not
+an error. `[plan]` is cosmetic — it never overrides a measured tier or the
+`plan_type` snapshots are grouped by; use it to label the header when nothing
+has been sampled yet.
+
+`nenpi config` prints the config file in use (or that none was found) and,
+for every resolved root, its harness, path, whether it exists, and the
+account it authenticates as: a label (the root's basename) and a key (Codex:
+`auth.json`'s `tokens.account_id`; Claude: `.claude.json`'s
+`oauthAccount.organizationUuid`, falling back to `accountUuid`, then to the
+label). Tokens are never read or printed. `nenpi config --init` writes a
+starter `config.toml`, seeded with every root the old glob would have found
+on this host (refuses to overwrite an existing file without `--force`).
+
+**Breaking change:** with defaults narrowed to one location per harness, a
+host that relied on the old glob picking up e.g. `~/.codex-arcade` or
+`~/.claude-work` needs those roots added to `config.toml` (or run
+`nenpi config --init` once, before upgrading further) — otherwise they drop
+out of every report silently.
+
+Per-account Claude statusline snapshots (`nenpi snapshot --stdin`, wired into
+the statusline command) need `$CLAUDE_CONFIG_DIR` set in the statusline's own
+environment, not just the shell that launches Claude — otherwise every
+account's statusline reads and dedups as the default root.
+
 ## Snapshots
 
 `nenpi snapshot` logs Claude quota observations to
-`~/.local/state/quota-drain/snapshots.jsonl`. Three sources:
+`~/.local/state/nenpi/snapshots.jsonl`. Three sources:
 
 ### `--oauth` (recommended)
 
@@ -355,8 +515,9 @@ using the CLI.
 nenpi snapshot --oauth [--config-dir ~/.claude]
 ```
 
-`--config-dir` is repeatable; with none given, every `~/.claude*` directory
-holding a `.credentials.json` with a `claudeAiOauth` block is sampled. **On
+`--config-dir` is repeatable; with none given, every resolved Claude root
+(see [Roots and config.toml](#roots-and-configtoml)) holding a
+`.credentials.json` with a `claudeAiOauth` block is sampled. **On
 macOS the CLI keeps these credentials in the login Keychain instead of on
 disk**, so `--oauth` finds nothing there and says so; reading the Keychain is
 deliberately not implemented. The
@@ -368,7 +529,7 @@ Guards: one attempt per invocation, a 15 s timeout, a minimum of 60 s between
 calls per config dir, a 10-minute backoff after an HTTP 429, and a private
 opener that refuses redirects — urllib would otherwise forward the bearer
 token to whatever host answered. Poll state
-lives in `~/.local/state/quota-drain/oauth-poll.json` and holds timestamps
+lives in `~/.local/state/nenpi/oauth-poll.json` and holds timestamps
 only.
 
 Stored per observation: `utilization` and `resets_at` for `five_hour`,
@@ -429,14 +590,15 @@ range.
 
 ### no flag
 
-Reads `cachedUsageUtilization` from every `~/.claude*/.claude.json` and appends
-when `fetchedAtMs` is newer than the last logged value for that config dir.
+Reads `cachedUsageUtilization` from every resolved Claude root's
+`.claude.json` and appends when `fetchedAtMs` is newer than the last logged
+value for that root.
 `accountUuid` is never stored. This source is stale by design — it is whatever
 the CLI last cached.
 
 ## Weights
 
-`~/.config/quota-drain/weights.json` overrides any built-in weight, per model,
+`~/.config/nenpi/weights.json` overrides any built-in weight, per model,
 merged over the defaults:
 
 ```json
@@ -479,7 +641,7 @@ unrecognised is left unweighted.
 ## Performance and state
 
 Roughly 10 GB of rollouts. Files stream line by line with a byte-offset cache
-of one JSON shard per transcript under `~/.cache/quota-drain/`, keyed by path
+of one JSON shard per transcript under `~/.cache/nenpi/`, keyed by path
 with `size`, `mtime` and `offset`. Each shard also stores a hash of the file's
 first 4 KiB and of the 256 bytes before the resume offset: size and mtime
 alone miss an in-place rewrite that happens to grow the file, which would
@@ -514,11 +676,17 @@ Only the structural fields are read: `type`, `message.usage`, `message.id`,
 printed. Claude user lines carrying tool results are screened out on the raw
 bytes before `json.loads` ever sees them.
 
-State lives in `~/.local/state/quota-drain/` (`snapshots.jsonl`,
+State lives in `~/.local/state/nenpi/` (`snapshots.jsonl`,
 `codex-weights.json`, `oauth-poll.json`), config in
-`~/.config/quota-drain/weights.json`, cache in `~/.cache/quota-drain/`. The
-`QUOTA_DRAIN_HOME_DIR`, `QUOTA_DRAIN_CACHE_DIR`, `QUOTA_DRAIN_STATE_DIR` and
-`QUOTA_DRAIN_CONFIG_DIR` environment variables relocate all four for tests.
+`~/.config/nenpi/` (`weights.json`, `config.toml`), cache in
+`~/.cache/nenpi/`. The `NENPI_HOME_DIR`, `NENPI_CACHE_DIR`,
+`NENPI_STATE_DIR` and `NENPI_CONFIG_DIR` environment variables relocate all
+four for tests; `NENPI_CONFIG_FILE` relocates `config.toml` on its own. The
+old `~/.cache/quota-drain` (and the matching state/config dirs) and
+`QUOTA_DRAIN_*` names still work for one release: on first run, an old
+default dir is moved to its new name if the new one does not already exist,
+and each `QUOTA_DRAIN_*` variable still honoured prints one deprecation
+warning.
 
 ## What is known
 
@@ -545,9 +713,15 @@ applied above 200K tokens so it can be tested later.
 
 ## Known limitations
 
-Three known-wrong behaviours, none of them blocking, each with the fix it
+Four known-wrong behaviours, none of them blocking, each with the fix it
 wants:
 
+- **The attribution cap's rate is per account, not per model or session.** A
+  pool that mixes a cheap, chatty model with an expensive, quiet one measures
+  one blended rate; a session on the expensive model in a sparse interval
+  could still be capped tighter than its real cost. The fix is a per-model
+  rate, which needs enough non-rollover coverage per model to be worth
+  fitting - most pools do not have it yet.
 - **An interval that straddles `--since` keeps its whole drain, but only the
   in-range events share it.** The interval's start is clamped to the range
   while its measured percent is not, so at most one interval per window group
@@ -572,9 +746,11 @@ wants:
 - Codex `used_percent` arrives in whole percent, which caps how finely drain
   can be attributed; calibration needs multi-day ranges and time bucketing
   before it means anything.
-- Attribution assumes one Codex account per `(limit_id, plan_type)`. Separate
-  accounts under different roots are separated by `plan_type` and by their
-  distinct `resets_at`, but two accounts on the same plan would be merged.
+- Quota timelines are keyed by account first (root's detected `auth.json`
+  `tokens.account_id` / `.claude.json` `oauthAccount.organizationUuid`,
+  falling back to the root's basename), then `limit_id`/`plan_type`/
+  `window_minutes`; two roots on the same account still merge into one pool,
+  which is correct.
 - `unmarked` reductions are heuristic until the Codex fork writes a shake
   marker.
 - A green parse is not proof of a correct model: `nenpi verify` compares
@@ -584,7 +760,7 @@ wants:
 ## Verification
 
 ```sh
-uv run --python 3.9 python -m unittest discover -s tests -v  # 3.9 floor
+uv run --python 3.11 python -m unittest discover -s tests -v  # 3.11 floor
 uv run --python 3.13 python -m unittest discover -s tests -v
 ```
 

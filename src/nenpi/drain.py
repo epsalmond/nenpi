@@ -6,8 +6,10 @@ modelled as API list-price dollars and reported as a share of the observed
 total; see docs/drain.md for what is official, community-sourced, and
 unknown.
 
-Test path overrides use the ``QUOTA_DRAIN_*`` environment variables:
-``HOME_DIR``, ``CACHE_DIR``, ``STATE_DIR``, and ``CONFIG_DIR``.
+Test path overrides use the ``NENPI_*`` environment variables: ``HOME_DIR``,
+``CACHE_DIR``, ``STATE_DIR``, ``CONFIG_DIR``, and ``CONFIG_FILE`` (the old
+``QUOTA_DRAIN_*`` names still work for all but ``CONFIG_FILE``, with a
+deprecation warning). See nenpi.config for root resolution and config.toml.
 """
 
 from __future__ import annotations
@@ -20,6 +22,7 @@ import math
 import os
 import re
 import shutil
+import statistics
 import sys
 import textwrap
 import time
@@ -29,8 +32,20 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, List, Mapping, Optional, Sequence, Tuple
 
+from nenpi.config import (
+    account_for_root,
+    cache_dir,
+    config_dir,
+    config_path,
+    discover_candidate_roots,
+    load_config,
+    migrate_dirs,
+    resolve_roots,
+    state_dir,
+    warn,
+    warn_once,
+)
 
-PREFIX = "QUOTA_DRAIN_"
 CACHE_SCHEMA = 3
 JSON_SCHEMA = 1
 LONG_CONTEXT_THRESHOLD = 200_000
@@ -48,6 +63,16 @@ OAUTH_TIMEOUT_SECONDS = 15.0
 OAUTH_WINDOWS = ("five_hour", "seven_day", "seven_day_opus", "seven_day_sonnet")
 SNAPSHOT_RETENTION_DAYS = 60
 FALLBACK_CLAUDE_VERSION = "unknown"
+JITTER_TOLERANCE = 2.0  # percent; a same-bucket decrease this small or smaller
+# is vendor jitter, not a real drop, and must not become a new baseline (#16).
+RESET_CLUSTER_TOLERANCE_SECONDS = 300.0  # 5 minutes; collapses a resets_at that
+# drifts continuously (an idle pool re-stamping resets_at = now + 7d) into one
+# window instead of one entry per drifting reading (#17).
+CAP_FACTOR = 3.0  # a session's attributed share of an interval's drain is
+# capped at this multiple of its plausible cost (rate * weighted units, #16).
+MIN_RATE_INTERVALS = 3  # a pool needs at least this many non-rollover
+# intervals before its own measured rate is trusted for capping.
+MIN_RATE_UNITS = 1.0  # ...and at least this much weighted-unit coverage.
 DEDUP_CARRY_IDS = 64
 PROGRESS_INTERVAL_SECONDS = 0.5
 
@@ -125,26 +150,6 @@ ASCII_GLYPHS = {
     "█": "#", "▄": "=", "▀": "-", "▒": ":", "▁": ".",
     "▏": "|", "▎": "|", "▍": "|", "▌": "|", "▋": "|", "▊": "|", "▉": "|",
 }
-
-
-def env_path(name: str, default: Path) -> Path:
-    return Path(os.environ.get(PREFIX + name, str(default))).expanduser()
-
-
-def home_dir() -> Path:
-    return env_path("HOME_DIR", Path.home())
-
-
-def cache_dir() -> Path:
-    return env_path("CACHE_DIR", home_dir() / ".cache" / "quota-drain")
-
-
-def state_dir() -> Path:
-    return env_path("STATE_DIR", home_dir() / ".local" / "state" / "quota-drain")
-
-
-def config_dir() -> Path:
-    return env_path("CONFIG_DIR", home_dir() / ".config" / "quota-drain")
 
 
 # --------------------------------------------------------------------------
@@ -435,43 +440,19 @@ def calibrated_codex_table(rate_card: Mapping[str, Any], fit: Mapping[str, Any]
     return {"unit": "percent_per_mtok", "models": models}
 
 
-_WARNED = set()  # type: set
-
-
-def warn(message: str) -> None:
-    sys.stderr.write("nenpi: %s\n" % message)
-
-
-def warn_once(message: str) -> None:
-    if message in _WARNED:
-        return
-    _WARNED.add(message)
-    warn(message)
-
-
 # --------------------------------------------------------------------------
 # transcript discovery
 
 
-def discover_roots(home: Path, kind: str) -> List[Path]:
-    leaf = "projects" if kind == "claude" else "sessions"
-    roots = []
-    try:
-        candidates = sorted(home.glob(".%s*" % kind))
-    except OSError:
-        candidates = []
-    for candidate in candidates:
-        root = candidate / leaf
-        if root.is_dir():
-            roots.append(root)
-    return roots
-
-
-def claude_transcripts(roots: Sequence[Path]) -> Iterator[Path]:
+def claude_transcripts(roots: Sequence[Path]) -> Iterator[Tuple[Path, Path]]:
+    """Yield (transcript path, resolved root) for every root's ``projects`` dir."""
     for root in roots:
-        for path in sorted(root.rglob("*.jsonl")):
+        leaf = root / "projects"
+        if not leaf.is_dir():
+            continue
+        for path in sorted(leaf.rglob("*.jsonl")):
             if path.is_file():
-                yield path
+                yield path, root
 
 
 def codex_day_epoch(path: Path) -> Optional[float]:
@@ -487,9 +468,14 @@ def codex_day_epoch(path: Path) -> Optional[float]:
     return day.timestamp()
 
 
-def codex_transcripts(roots: Sequence[Path], since: Optional[float]) -> Iterator[Path]:
+def codex_transcripts(roots: Sequence[Path], since: Optional[float]
+                      ) -> Iterator[Tuple[Path, Path]]:
+    """Yield (transcript path, resolved root) for every root's ``sessions`` dir."""
     for root in roots:
-        for path in sorted(root.rglob("rollout-*.jsonl")):
+        leaf = root / "sessions"
+        if not leaf.is_dir():
+            continue
+        for path in sorted(leaf.rglob("rollout-*.jsonl")):
             if not path.is_file():
                 continue
             if since is not None:
@@ -498,7 +484,7 @@ def codex_transcripts(roots: Sequence[Path], since: Optional[float]) -> Iterator
                 # day of slack so a session that spans midnight is not pruned.
                 if day is not None and day < since - 86400:
                     continue
-            yield path
+            yield path, root
 
 
 def read_lines_from(path: Path, offset: int) -> Iterator[Tuple[int, bytes]]:
@@ -1309,32 +1295,35 @@ class Scan:
         self.compactions = {}  # type: Dict[Tuple[str, str], List[float]]
         self.claimed = {}  # type: Dict[Tuple[str, str], str]
         self.forks = {}  # type: Dict[Tuple[str, str], Dict[str, int]]
+        # (account key, account label) for every session seen, keyed the same
+        # as `sessions`. Populated in `absorb` from the resolved root, never
+        # from anything cached on disk - see the module docstring's note on
+        # why account identity is not part of the per-file cache schema.
+        self.session_accounts = {}  # type: Dict[Tuple[str, str], Tuple[str, str]]
         self.files_read = 0
         self.files_seen = 0
         self.bytes_read = 0
 
 
 def collect(args: argparse.Namespace, since: Optional[float]) -> Scan:
-    home = home_dir()
     harness = args.harness
     cache = Cache(cache_dir(), args.rebuild_cache)
     cache.drop_old_schemas()
+    config = load_config()
 
-    targets = []  # type: List[Tuple[Path, str]]
+    targets = []  # type: List[Tuple[Path, str, Path]]
     if harness in ("claude", "all"):
-        roots = [Path(p).expanduser() for p in (args.claude_root or [])]
-        roots.extend(discover_roots(home, "claude"))
-        for path in claude_transcripts(roots):
-            targets.append((path, "claude"))
+        roots = resolve_roots("claude", args.claude_root, config)
+        for path, root in claude_transcripts(roots):
+            targets.append((path, "claude", root))
     if harness in ("codex", "all"):
-        roots = [Path(p).expanduser() for p in (args.codex_root or [])]
-        roots.extend(discover_roots(home, "codex"))
-        for path in codex_transcripts(roots, since):
-            targets.append((path, "codex"))
+        roots = resolve_roots("codex", args.codex_root, config)
+        for path, root in codex_transcripts(roots, since):
+            targets.append((path, "codex", root))
 
-    stamped = []  # type: List[Tuple[float, str, Path, str, os.stat_result]]
+    stamped = []  # type: List[Tuple[float, str, Path, str, Path, os.stat_result]]
     live = set()
-    for path, kind in targets:
+    for path, kind, root in targets:
         try:
             stat = path.stat()
         except OSError:
@@ -1344,7 +1333,7 @@ def collect(args: argparse.Namespace, since: Optional[float]) -> Scan:
             # A transcript last written before the window cannot hold events
             # inside it, so its shard is never opened.
             continue
-        stamped.append((stat.st_mtime, str(path), path, kind, stat))
+        stamped.append((stat.st_mtime, str(path), path, kind, root, stat))
     # Oldest file first, so the session that recorded an API call originally
     # keeps it and a later fork that replays it is the one that loses.
     stamped.sort(key=lambda item: (item[0], item[1]))
@@ -1353,7 +1342,10 @@ def collect(args: argparse.Namespace, since: Optional[float]) -> Scan:
     scan.files_seen = len(targets)
     progress = Progress(sys.stderr.isatty() and not getattr(args, "no_color", False),
                         len(stamped), "scanning")
-    for _, _, path, kind, stat in stamped:
+    # One (label, key) lookup per root, however many files it holds - a
+    # session's account never opens a second `auth.json`/`.claude.json` read.
+    account_cache = {}  # type: Dict[Tuple[str, Path], Tuple[str, str]]
+    for _, _, path, kind, root, stat in stamped:
         progress.step()
         entry, stale = cache.entry_for(path, kind, stat)
         if stale:
@@ -1369,7 +1361,11 @@ def collect(args: argparse.Namespace, since: Optional[float]) -> Scan:
             entry.stamp(path, stat)
             cache.mark(path)
             scan.files_read += 1
-        absorb(scan, entry, kind)
+        account_key = (kind, root)
+        if account_key not in account_cache:
+            account_cache[account_key] = account_for_root(root, kind)
+        account_label, account = account_cache[account_key]
+        absorb(scan, entry, kind, account, account_label)
         try:
             cache.flush()
         except OSError as error:
@@ -1383,7 +1379,14 @@ def collect(args: argparse.Namespace, since: Optional[float]) -> Scan:
     return scan
 
 
-def absorb(scan: Scan, entry: FileIndex, harness: str) -> None:
+def absorb(scan: Scan, entry: FileIndex, harness: str, account: str, account_label: str) -> None:
+    """Merge one parsed (possibly cached) file into the scan.
+
+    `account`/`account_label` come from the resolved root this file lives
+    under, detected once per root in `collect` and never persisted to the
+    per-file cache: a moved or relabelled root cannot leave a stale account
+    behind, and a cache shard shared across users never leaks either.
+    """
     for session_id, summary in entry.sessions.items():
         key = (harness, session_id)
         existing = scan.sessions.get(key)
@@ -1391,9 +1394,16 @@ def absorb(scan: Scan, entry: FileIndex, harness: str) -> None:
             scan.sessions[key] = SessionSummary.from_json(summary.to_json())
         else:
             existing.merge(summary)
+        scan.session_accounts[key] = (account, account_label)
     claimed = scan.claimed
     kept = scan.events[harness]
     for row in entry.events:
+        # Every event's session gets an account stamp here too, not only the
+        # ones with a `SessionSummary` above: `attribute()` treats a session
+        # missing from `session_accounts` as "any pool" (fail-open), so a
+        # session known only through its events - never seen in
+        # `entry.sessions` - must never be credited to every account's pool.
+        scan.session_accounts.setdefault((harness, row[EVENT_SESSION]), (account, account_label))
         call_id = (harness, row[EVENT_ID]) if row[EVENT_ID] else None
         if call_id is not None:
             owner = claimed.get(call_id)
@@ -1406,7 +1416,11 @@ def absorb(scan: Scan, entry: FileIndex, harness: str) -> None:
                 continue
             claimed[call_id] = row[EVENT_SESSION]
         kept.append(row)
-    scan.snapshots.extend(entry.snapshots)
+    for row in entry.snapshots:
+        stamped_row = dict(row)
+        stamped_row["account"] = account
+        stamped_row["account_label"] = account_label
+        scan.snapshots.append(stamped_row)
     for row in entry.boundaries:
         scan.boundaries.setdefault((harness, str(row[0])), []).append(float(row[1]))
     for row in entry.compactions:
@@ -1465,9 +1479,15 @@ def rebuild_totals(scan: Scan) -> None:
 
 
 class Interval:
-    def __init__(self, key: Tuple[str, str, Any], start: float, end: float, drain: float,
+    def __init__(self, key: Tuple[str, str, str, Any], start: float, end: float, drain: float,
                  resets_at: Any, rollover: bool):
+        # key = (account, limit_id, plan_type, window_minutes); keying the
+        # timeline by account is what keeps two quota pools that share a
+        # limit_id/plan_type/window (two Codex or two Claude roots) from
+        # being read as one pool alternating readings, which used to be
+        # charged as a window rollover on every alternation (#9).
         self.key = key
+        self.account = key[0]
         self.start = start
         self.end = end
         self.drain = drain
@@ -1476,6 +1496,11 @@ class Interval:
         self.sessions = {}  # type: Dict[str, float]
         self.prompts = {}  # type: Dict[Tuple[str, Any], float]
         self.features = {}  # type: Dict[Tuple[str, str], float]
+        # Drain the attribution cap could not place on any session - not a
+        # foreign account (that's cross-account bleed, #9), but usage from a
+        # client of THIS account that was never scanned (another machine,
+        # another login copy). See attribute()/water_fill().
+        self.unattributed = 0.0
 
 
 UNSET = object()
@@ -1512,13 +1537,64 @@ def resets_epoch(value: Any) -> Optional[float]:
     return None
 
 
+def cluster_reset_keys(
+    items: Iterable[Tuple[Any, Any, Any]],
+    tolerance_seconds: float = RESET_CLUSTER_TOLERANCE_SECONDS,
+) -> Dict[Tuple[Any, Any, Any], Any]:
+    """Map each (account, window_minutes, resets_at) triple to a cluster key.
+
+    `resets_bucket` rounds to the minute, which is enough for the second or
+    two of jitter both vendors put on a genuinely stable window, but an idle
+    Codex pool re-stamps `resets_at` to `now + 7d` on *every* snapshot, so it
+    drifts by roughly a minute per reading and still produces one fresh
+    bucket after another (#17) - dozens of `windows` rows for one
+    continuously-idle window. Within one (account, window_minutes) pool,
+    chain-cluster `resets_at` values sorted by time: a value within
+    `tolerance_seconds` of its predecessor joins the same cluster as that
+    predecessor, so a slow, continuous drift collapses into a single
+    cluster while a real rollover (days away) starts a new one. Every member
+    of a cluster is keyed on the earliest member's minute-rounded bucket, so
+    the result is still a stable, comparable key.
+    """
+    groups = {}  # type: Dict[Tuple[Any, Any], List[Tuple[float, Any]]]
+    result = {}  # type: Dict[Tuple[Any, Any, Any], Any]
+    seen = set()  # type: set
+    for account, window_minutes, resets_at in items:
+        triple = (account, window_minutes, resets_at)
+        if triple in seen:
+            continue
+        seen.add(triple)
+        epoch = resets_epoch(resets_at)
+        if epoch is None:
+            result[triple] = resets_bucket(resets_at)
+            continue
+        groups.setdefault((account, window_minutes), []).append((epoch, resets_at))
+    for group_key, values in groups.items():
+        values.sort(key=lambda item: item[0])
+        cluster_key = None  # type: Any
+        last_epoch = None  # type: Optional[float]
+        for epoch, resets_at in values:
+            if cluster_key is None or epoch - last_epoch > tolerance_seconds:
+                cluster_key = resets_bucket(resets_at)
+            result[(group_key[0], group_key[1], resets_at)] = cluster_key
+            last_epoch = epoch
+    return result
+
+
 def snapshot_windows(
     snapshots: Sequence[Mapping[str, Any]]
-) -> Dict[Tuple[str, str, Any], List[Mapping[str, Any]]]:
-    grouped = {}  # type: Dict[Tuple[str, str, Any], List[Mapping[str, Any]]]
+) -> Dict[Tuple[str, str, str, Any], List[Mapping[str, Any]]]:
+    """Group snapshot rows into one timeline per quota pool.
+
+    Keyed by account first: two roots on different accounts can report the
+    same limit_id/plan_type/window_minutes (two Codex Pro seats, two Claude
+    orgs on the same tier) and are still different pools whose readings must
+    never be read as one timeline rolling over (#9).
+    """
+    grouped = {}  # type: Dict[Tuple[str, str, str, Any], List[Mapping[str, Any]]]
     for row in snapshots:
-        key = (row.get("limit_id") or "codex", row.get("plan_type") or "unknown",
-               row.get("window_minutes"))
+        key = (row.get("account") or "default", row.get("limit_id") or "codex",
+               row.get("plan_type") or "unknown", row.get("window_minutes"))
         grouped.setdefault(key, []).append(row)
     for rows in grouped.values():
         rows.sort(key=lambda item: item["ts"])
@@ -1579,7 +1655,7 @@ def build_intervals(snapshots: Sequence[Mapping[str, Any]], window: Any) -> List
     intervals = []
     groups = snapshot_windows(snapshots)
     for key, rows in groups.items():
-        if not window_matches(key[2], window):
+        if not window_matches(key[3], window):
             continue
         current = UNSET  # type: Any
         running = 0.0
@@ -1600,6 +1676,19 @@ def build_intervals(snapshots: Sequence[Mapping[str, Any]], window: Any) -> List
                 current, running, anchor_ts = bucket, used, row["ts"]
                 continue
             if bucket != current:
+                if used == running:
+                    # No drain evidence: `resets_at` moved (an idle pool
+                    # re-stamping resets_at = now + 7d, or a slide) but the
+                    # reading itself did not, so this is not a rollover.
+                    # Carry running/anchor_ts forward instead of resetting
+                    # them to this reading, so the next real rise still spans
+                    # back to the last reading that actually moved (#16/#17).
+                    # `used == 0` with `running` already 0 (the only case an
+                    # idle, never-active pool can hit) lands here too; a
+                    # `used == 0` bucket change with `running > 0` is a real
+                    # reset and falls through below instead.
+                    current = bucket
+                    continue
                 drain = min(100.0, max(0.0, used))
                 start = window_start(row, anchor_ts)
                 if drain > 0 and start is not None and row["ts"] > start:
@@ -1610,6 +1699,14 @@ def build_intervals(snapshots: Sequence[Mapping[str, Any]], window: Any) -> List
                 continue
             delta = used - running
             if delta <= 0:
+                # A same-bucket reset cannot happen, so a decrease is vendor
+                # jitter unless it is bigger than JITTER_TOLERANCE. A jitter
+                # decrease (or a flat reading, delta == 0) keeps both running
+                # and anchor_ts; a real decrease takes the new, lower reading
+                # as the baseline so the next rise is not re-charged for
+                # percent already attributed against the old high-water mark.
+                if delta < 0 and (running - used) > JITTER_TOLERANCE:
+                    running, anchor_ts = used, row["ts"]
                 continue
             # `used_percent` is reported in whole percent, so a step covers
             # everything since the last change, not just the last poll.
@@ -1648,46 +1745,275 @@ def attribute(
     intervals: Sequence[Interval], events: Sequence[Sequence[Any]], weights: Weights,
     args: argparse.Namespace
 ) -> None:
-    """Split each interval's measured drain across the sessions active in it."""
+    """Split each interval's measured drain across the sessions active in it.
+
+    An interval belongs to one account's quota pool (`interval.account`); an
+    event whose session is known to be on a *different* account is skipped so
+    one pool's drain is never split across another account's sessions. The
+    session -> (account, label) map is looked up from `args._session_accounts`,
+    set by `prepare` just before this call - the signature stays
+    `(intervals, events, weights, args)` and the EVENT_* tuple stays
+    positional and unwidened; args is the one place with room for it.
+
+    A sparse reading can still make one session's proportional share
+    implausible: the whole jump between two readings is split only across
+    whichever sessions had a token delta inside that interval, so a handful
+    of turns that happened to fall inside a big jump can outrank a session
+    that did a thousand times the work in a smaller one (#16). After the
+    proportional split, each session's share is capped at `CAP_FACTOR` times
+    its plausible cost (a per-account rate, in percent per weighted unit,
+    times its own weighted units); drain the cap will not let any session
+    absorb is `interval.unattributed` - usage from a client of this account
+    that was never scanned, not cross-account bleed (that is #9, handled by
+    the per-account `interval.account` filter above).
+    """
+    session_accounts = getattr(args, "_session_accounts", None) or {}
     ordered = sorted((event for event in events if event[EVENT_TS] is not None),
                      key=lambda event: event[EVENT_TS])
     if not ordered:
+        # No Codex usage events at all (a pool with snapshots but nothing
+        # scanned locally) still measured real drain across every interval;
+        # bailing out here used to leave `interval.unattributed` at its 0.0
+        # default, breaking sum(shares) + unattributed == drain. Route it
+        # through the same "whole drain unattributed" outcome the
+        # `total <= 0` path below gives an interval with events but no
+        # local session active.
+        for interval in intervals:
+            interval.unattributed = interval.drain
         return
     stamps = [event[EVENT_TS] for event in ordered]
+    computed = {}  # type: Dict[int, Dict[str, Any]]
     for interval in intervals:
         low = bisect.bisect_right(stamps, interval.start)
         high = bisect.bisect_right(stamps, interval.end)
         total = 0.0
         shares = {}  # type: Dict[str, float]
         prompt_shares = {}  # type: Dict[Tuple[str, Any], float]
+        prompted_units = {}  # type: Dict[str, float]
+        fallback_sessions = set()  # type: set
         for event in ordered[low:high]:
+            account = session_accounts.get(("codex", event[EVENT_SESSION]))
+            if account is not None and account[0] != interval.account:
+                continue
             tokens = event_tokens(event, CODEX_KINDS)
             units = weighted_units(
                 "codex", event[EVENT_MODEL], tokens, weights, args, bool(event[EVENT_LONG])
             )
+            used_fallback = False
             if units <= 0:
                 # A model with no weight, or one whose fitted coefficient is
                 # zero, still ran inside this interval; fall back to raw
-                # tokens so it is never treated as free.
+                # tokens so it is never treated as free. That fallback's
+                # scale (tokens * 1e-9) is nowhere near the weighted-unit
+                # scale, so it is exempted from the cap below rather than
+                # capped to near-zero.
                 units = float(sum(tokens.get(kind, 0) for kind in CODEX_FIT_KINDS)) * 1e-9
+                used_fallback = True
             if units <= 0:
                 continue
+            session_id = event[EVENT_SESSION]
             total += units
-            shares[event[EVENT_SESSION]] = shares.get(event[EVENT_SESSION], 0.0) + units
+            shares[session_id] = shares.get(session_id, 0.0) + units
+            if used_fallback:
+                fallback_sessions.add(session_id)
             if len(event) > EVENT_PROMPT and event[EVENT_PROMPT] is not None:
-                prompt_key = (event[EVENT_SESSION], event[EVENT_PROMPT])
+                prompt_key = (session_id, event[EVENT_PROMPT])
                 prompt_shares[prompt_key] = prompt_shares.get(prompt_key, 0.0) + units
+                prompted_units[session_id] = prompted_units.get(session_id, 0.0) + units
             for kind in CODEX_FIT_KINDS:
                 feature = (event[EVENT_MODEL], kind)
                 interval.features[feature] = (
                     interval.features.get(feature, 0.0) + tokens.get(kind, 0) / 1_000_000.0
                 )
+        computed[id(interval)] = {
+            "total": total,
+            "shares": shares,
+            "prompt_shares": prompt_shares,
+            "prompted_units": prompted_units,
+            "fallback_sessions": fallback_sessions,
+        }
+
+    rates = attribution_rates(intervals, computed, weights)
+    warned_no_rate = False
+    for interval in intervals:
+        data = computed[id(interval)]
+        total = data["total"]
         if total <= 0:
+            # No local session had a token event inside this interval at
+            # all (a client nas cannot see did all of it) - the whole
+            # drain is unattributed, not silently dropped, so
+            # sum(shares) + unattributed == drain still holds for every
+            # interval, not just the ones with local activity.
+            interval.unattributed = interval.drain
             continue
-        for session_id, units in shares.items():
-            interval.sessions[session_id] = interval.drain * units / total
-        for prompt_key, units in prompt_shares.items():
-            interval.prompts[prompt_key] = interval.drain * units / total
+        shares = data["shares"]
+        fallback_sessions = data["fallback_sessions"]
+        raw = dict(
+            (session_id, interval.drain * units / total) for session_id, units in shares.items()
+        )
+        rate = rates.get(interval.account)
+        if rate is None:
+            if not warned_no_rate:
+                warn_once(
+                    "no attribution cap for one or more account pools: too little "
+                    "non-rollover coverage to measure a plausible-cost rate, and no "
+                    "calibrated or fitted rate is available; sessions in that pool "
+                    "are not capped (see docs/drain.md)"
+                )
+                warned_no_rate = True
+            attributed = raw
+        else:
+            allowed = dict(
+                (session_id, None if session_id in fallback_sessions
+                 else CAP_FACTOR * rate * units)
+                for session_id, units in shares.items()
+            )
+            attributed = water_fill(raw, allowed)
+        for session_id, value in attributed.items():
+            interval.sessions[session_id] = interval.sessions.get(session_id, 0.0) + value
+        interval.unattributed = max(0.0, interval.drain - sum(attributed.values()))
+        for prompt_key, units in data["prompt_shares"].items():
+            # Split the SESSION's attributed (possibly capped) share across
+            # its own turns, not the interval's raw drain - otherwise a
+            # capped session's prompts still summed to the uncapped figure
+            # even though `sessions` reported the capped one. The
+            # denominator is the session's PROMPT-KEYED units, not its whole
+            # (all-event) units - only main-thread rows carry a prompt key,
+            # so an event outside any prompt group (e.g. a sub-thread call
+            # that never joined one) still counts toward `shares` but must
+            # not dilute the prompt split, or the prompts sum to less than
+            # the session's own attributed share.
+            session_id = prompt_key[0]
+            session_units = data["prompted_units"].get(session_id, 0.0)
+            session_share = attributed.get(session_id, 0.0)
+            interval.prompts[prompt_key] = (
+                session_share * units / session_units if session_units > 0 else 0.0
+            )
+
+
+def water_fill(
+    raw: Mapping[str, float], allowed: Mapping[str, Optional[float]]
+) -> Dict[str, float]:
+    """Clamp each session's share to its cap, redistributing what is freed.
+
+    A session whose proportional share exceeds `allowed[session]` (`None`
+    means no cap - the raw-token fallback, exempted because its unit scale
+    is not comparable) is clamped to the cap; the drain that clamp frees is
+    redistributed proportionally among the sessions still under their own,
+    finite cap, which can push one of them over its own cap in turn, so
+    this repeats until none are left over. Two guards keep it safe: it
+    stops as soon as no capped session remains to receive the freed drain
+    (the rest is `interval.unattributed`, not renormalized), and it never
+    runs more than one round per session, so float residue cannot spin it.
+
+    Exempt (`allowed is None`) sessions never join the redistribution pool.
+    They have no cap to measure headroom against, so letting them soak up a
+    capped session's overflow would just recreate #16 for whichever session
+    happens to run an unweighted model: the freed drain becomes
+    `interval.unattributed` instead. An exempt session keeps its raw
+    proportional share untouched - including the degenerate case where it
+    is the ONLY session in the interval, where there is no other session's
+    cap to measure it against, so raw is the only defensible behaviour and
+    is what falls out of this loop naturally (it is never `over`).
+    """
+    result = dict(raw)
+    clamped = set()  # type: set
+    for _ in range(len(raw) + 1):
+        over = [
+            session_id for session_id, value in result.items()
+            if session_id not in clamped
+            and allowed.get(session_id) is not None
+            and value > allowed[session_id]
+        ]
+        if not over:
+            break
+        freed = 0.0
+        for session_id in over:
+            freed += result[session_id] - allowed[session_id]
+            result[session_id] = allowed[session_id]
+            clamped.add(session_id)
+        # Only sessions with a finite, unmet cap can receive freed drain;
+        # exempt sessions (allowed is None) are excluded even though they
+        # are technically "unclamped", or they would become an uncapped
+        # sink for everyone else's overflow.
+        unclamped = [
+            session_id for session_id in result
+            if session_id not in clamped and allowed.get(session_id) is not None
+        ]
+        if not unclamped:
+            break
+        headroom_total = sum(result[session_id] for session_id in unclamped)
+        if headroom_total <= 0:
+            break
+        for session_id in unclamped:
+            result[session_id] += freed * (result[session_id] / headroom_total)
+    return result
+
+
+def attribution_rates(
+    intervals: Sequence[Interval], computed: Mapping[int, Mapping[str, Any]], weights: Weights
+) -> Dict[str, Optional[float]]:
+    """One plausible-cost rate (percent of quota per weighted unit) per pool.
+
+    The rate is the median of each qualifying interval's own drain/units
+    ratio, not a pooled sum(drain)/sum(units): a single foreign-contaminated
+    interval (bigger delta, same local tokens - the interval is still real,
+    just not fully explained by the sessions this tool can see) drags a
+    pooled ratio up and blunts the cap, while a median of ratios does not.
+    Rollover intervals and intervals where any session's units came from the
+    raw-token fallback are excluded - the latter is not on the weighted-unit
+    scale, so mixing it in would corrupt the rate, not just that session's
+    cap. A pool with fewer than MIN_RATE_INTERVALS qualifying intervals, or
+    under MIN_RATE_UNITS of weighted-unit coverage across them, has too
+    little evidence to measure its own rate and falls back to
+    `fallback_rate`; `None` means capping is skipped for that pool.
+    """
+    ratios = {}  # type: Dict[str, List[float]]
+    coverage = {}  # type: Dict[str, float]
+    accounts = set()
+    for interval in intervals:
+        accounts.add(interval.account)
+        if interval.rollover:
+            continue
+        data = computed.get(id(interval))
+        if not data or data["fallback_sessions"] or data["total"] <= 0 or interval.drain <= 0:
+            continue
+        ratios.setdefault(interval.account, []).append(interval.drain / data["total"])
+        coverage[interval.account] = coverage.get(interval.account, 0.0) + data["total"]
+    rates = {}  # type: Dict[str, Optional[float]]
+    for account in accounts:
+        samples = ratios.get(account) or []
+        if len(samples) >= MIN_RATE_INTERVALS and coverage.get(account, 0.0) >= MIN_RATE_UNITS:
+            rate = statistics.median(samples)
+        else:
+            rate = fallback_rate(weights)
+        rates[account] = rate if rate and rate > 0 else None
+    return rates
+
+
+def fallback_rate(weights: Weights) -> Optional[float]:
+    """The rate to use when a pool has too little coverage to measure its own.
+
+    A calibrated weights table is already expressed in percent per weighted
+    unit (`calibrated_codex_table`), so its implied rate is exactly 1.0. Short
+    of that, a usable stored fit's `fallback_scale` is "percent per
+    rate-card unit" - the same conversion `calibrated_codex_table` applies to
+    an unidentified model - so it converts too. With neither, the caller
+    leaves the pool uncapped.
+    """
+    if "calibrated" in weights.sources:
+        return 1.0
+    fit_file = state_dir() / "codex-weights.json"
+    if not fit_file.is_file():
+        return None
+    try:
+        fit = json.loads(fit_file.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(fit, Mapping) or not fit.get("usable"):
+        return None
+    scale = fit.get("fallback_scale")
+    return float(scale) if isinstance(scale, (int, float)) and scale > 0 else None
 
 
 # --------------------------------------------------------------------------
@@ -2363,6 +2689,8 @@ class Row:
         self.turns_p90 = 0.0
         self.peak_context = 0
         self.resent_units = 0.0
+        self.account = ""
+        self.account_label = ""
 
 
 def session_rows(
@@ -2395,6 +2723,9 @@ def session_rows(
         if not summary.models and not summary.sub_models:
             continue
         row = Row(summary)
+        account = scan.session_accounts.get((harness, session_id))
+        if account is not None:
+            row.account, row.account_label = account
         kinds = CLAUDE_KINDS if harness == "claude" else CODEX_KINDS
         row.tokens = empty_tokens(kinds)
         row.sub_tokens = empty_tokens(kinds)
@@ -2448,13 +2779,37 @@ def resent_share(row: Row) -> float:
     return min(1.0, row.resent_units / row.units)
 
 
-def apply_codex_drain(rows: Sequence[Row], intervals: Sequence[Interval]) -> None:
+def apply_codex_drain(rows: Sequence[Row], intervals: Sequence[Interval]) -> Dict[str, float]:
+    """Write each session's measured drain, and return per-account unattributed.
+
+    `share_of_window`'s denominator is `interval.drain`, not the sum of what
+    got attributed to sessions: after the attribution cap (#16), a capped
+    session's share can leave some of `interval.drain` unattributed, and that
+    gap must show up as the window not summing to 100% rather than being
+    silently renormalized away.
+    """
     drained = {}  # type: Dict[str, float]
     window_totals = {}  # type: Dict[Any, float]
     session_window = {}  # type: Dict[str, Dict[Any, float]]
     labels = {}  # type: Dict[Any, Any]
+    unattributed = {}  # type: Dict[str, float]
+    # The account is part of the bucket key so two pools whose `resets_at`
+    # happens to round to the same minute never share a window total; the
+    # resets_at itself is clustered (not just minute-rounded) so an idle
+    # pool's continuously drifting re-stamp does not fragment one window's
+    # drain across many buckets (#17).
+    cluster_map = cluster_reset_keys(
+        (interval.account, interval.key[3], interval.resets_at) for interval in intervals
+    )
     for interval in intervals:
-        bucket = resets_bucket(interval.resets_at)
+        unattributed[interval.account] = (
+            unattributed.get(interval.account, 0.0) + interval.unattributed
+        )
+        cluster_key = cluster_map.get(
+            (interval.account, interval.key[3], interval.resets_at),
+            resets_bucket(interval.resets_at),
+        )
+        bucket = (interval.account, cluster_key)
         labels[bucket] = interval.resets_at
         window_totals[bucket] = window_totals.get(bucket, 0.0) + interval.drain
         for session_id, share in interval.sessions.items():
@@ -2475,6 +2830,7 @@ def apply_codex_drain(rows: Sequence[Row], intervals: Sequence[Interval]) -> Non
             total = window_totals.get(resets_at) or 0.0
             if total > 0:
                 row.share_of_window = 100.0 * windows[resets_at] / total
+    return unattributed
 
 
 def claude_dollars_per_percent(
@@ -2580,18 +2936,42 @@ def cwd_label(cwd: str) -> str:
     return Path(cwd).name or cwd
 
 
+def account_labels(scan: Scan) -> Dict[str, str]:
+    """Map each account key seen in this scan to its display label."""
+    labels = {}  # type: Dict[str, str]
+    for row in scan.snapshots:
+        account = row.get("account")
+        if account and account not in labels:
+            labels[account] = row.get("account_label") or account
+    return labels
+
+
 def header_lines(
     scan: Scan, rows: Sequence[Row], weights: Weights, args: argparse.Namespace,
-    dollars_per_percent: Optional[float], window: Optional[str] = None
+    dollars_per_percent: Optional[float], window: Optional[str] = None,
+    unattributed: Optional[Mapping[str, float]] = None,
 ) -> List[str]:
     lines = []
     tiers = []
-    claude_tier = read_claude_tier()
-    if claude_tier:
-        tiers.append("claude=%s" % claude_tier)
-    codex_plan = latest_codex_plan(scan.snapshots)
-    if codex_plan:
-        tiers.append("codex=%s" % codex_plan)
+    config = load_config()
+    claude_roots = resolve_roots(
+        "claude",
+        getattr(args, "claude_root", None) or [],
+        config,
+        quiet=getattr(args, "harness", "all") == "codex",
+    )
+    claude_tiers = read_claude_tier(claude_roots)
+    if claude_tiers:
+        for label in sorted(claude_tiers):
+            tiers.append("claude[%s]=%s" % (label, claude_tiers[label]))
+    elif config.plan_claude:
+        tiers.append("claude=%s" % config.plan_claude)
+    codex_plans = latest_codex_plan(scan.snapshots)
+    if codex_plans:
+        for label in sorted(codex_plans):
+            tiers.append("codex[%s]=%s" % (label, codex_plans[label]))
+    elif config.plan_codex:
+        tiers.append("codex=%s" % config.plan_codex)
     lines.append(
         "plan: %s | weights: %s | codex window: %s | zone: %s"
         % (", ".join(tiers) or "unknown", weights.source_label, window_label(window),
@@ -2641,21 +3021,36 @@ def header_lines(
             "caveat: long-context multiplier %.2fx applied above %s tokens"
             % (args.long_context_multiplier, format_tokens(LONG_CONTEXT_THRESHOLD))
         )
+    if unattributed:
+        labels = account_labels(scan)
+        for account in sorted(unattributed, key=lambda key: labels.get(key, key)):
+            value = unattributed[account]
+            if value <= 0:
+                continue
+            lines.append(
+                "unattributed: %s %.1f%% (usage from clients not in the scanned roots)"
+                % (labels.get(account, account), value)
+            )
     return lines
 
 
-def read_claude_tier() -> str:
-    tiers = []
-    for config in sorted(home_dir().glob(".claude*/.claude.json")):
-        payload = read_claude_config(config)
+def read_claude_tier(roots: Sequence[Path]) -> Dict[str, str]:
+    """Map each resolved Claude root's basename to its detected rate-limit tier.
+
+    Callers that only want the old combined string can still do
+    ``"/".join(sorted(set(read_claude_tier(roots).values())))``.
+    """
+    tiers = {}
+    for root in roots:
+        payload = read_claude_config(root / ".claude.json")
         if payload is None:
             continue
         account = payload.get("oauthAccount")
         if isinstance(account, dict):
             tier = account.get("organizationRateLimitTier")
             if isinstance(tier, str) and tier:
-                tiers.append(tier)
-    return "/".join(sorted(set(tiers)))
+                tiers[root.name] = tier
+    return tiers
 
 
 def read_claude_config(path: Path) -> Optional[Dict[str, Any]]:
@@ -2670,14 +3065,15 @@ def read_claude_config(path: Path) -> Optional[Dict[str, Any]]:
     return payload if isinstance(payload, dict) else None
 
 
-def latest_codex_plan(snapshots: Sequence[Mapping[str, Any]]) -> str:
-    latest = None
+def latest_codex_plan(snapshots: Sequence[Mapping[str, Any]]) -> Dict[str, str]:
+    """Map each account label to its most recently observed Codex plan_type."""
+    latest = {}  # type: Dict[str, Mapping[str, Any]]
     for row in snapshots:
-        if latest is None or row["ts"] > latest["ts"]:
-            latest = row
-    if latest is None:
-        return ""
-    return str(latest.get("plan_type") or "")
+        label = str(row.get("account_label") or "default")
+        current = latest.get(label)
+        if current is None or row["ts"] > current["ts"]:
+            latest[label] = row
+    return dict((label, str(row.get("plan_type") or "")) for label, row in latest.items())
 
 
 def render_sessions(rows: Sequence[Row], args: argparse.Namespace, paint: Painter,
@@ -2696,6 +3092,7 @@ def render_sessions(rows: Sequence[Row], args: argparse.Namespace, paint: Painte
         header += " " + "share".ljust(bar_width)[:bar_width]
     lines = [paint(header, "bold")]
 
+    multi_account = len({row.account_label for row in rows if row.account_label}) > 1
     for row in rows:
         summary = row.summary
         harness_glyph = "C" if summary.harness == "claude" else "X"
@@ -2739,6 +3136,8 @@ def render_sessions(rows: Sequence[Row], args: argparse.Namespace, paint: Painte
             detail.append(
                 "subagents %d requests / %.2f units" % (summary.sub_requests, row.sub_units)
             )
+        if multi_account and row.account_label:
+            detail.append("account %s" % row.account_label)
         if detail:
             lines.append(paint(" " * 10 + "; ".join(detail), "dim"))
     return lines
@@ -2810,6 +3209,8 @@ def row_json(row: Row) -> Dict[str, Any]:
         "resent_share": resent_share(row),
         "share_of_window_percent": row.share_of_window,
         "window_resets_at": row.resets_at,
+        "account": row.account,
+        "account_label": row.account_label,
     }
 
 
@@ -2843,12 +3244,61 @@ class Analysis:
         return True
 
 
+def filter_by_account(scan: Scan, label: str) -> None:
+    """Restrict a scan to one account's sessions, events, and quota rows.
+
+    `label` is a root's basename (what `--account` takes and what `nenpi
+    config` shows), but quota pools are keyed by account KEY, not label - two
+    roots can share one key (a re-pointed root, or the same login copied to
+    a second config dir) and both must stay in the pool together. So this
+    first resolves the label to its key(s) via the sessions already seen in
+    `scan.session_accounts`, then filters everything downstream by key.
+
+    Filtering here, once, covers every report command that goes through
+    `prepare` (sessions/prompts/fanout/windows/timeline/verify/calibrate)
+    instead of adding a per-command re-check.
+    """
+    account_keys = {
+        account_key
+        for account_key, account_label in scan.session_accounts.values()
+        if account_label == label
+    }
+    if not account_keys:
+        known = sorted({
+            account_label for _, account_label in scan.session_accounts.values()
+        })
+        warn(
+            "%r matches no resolved root's account; known labels: %s (see `nenpi config`)"
+            % (label, ", ".join(known) if known else "none")
+        )
+    keep = {
+        session_key for session_key, (account_key, _) in scan.session_accounts.items()
+        if account_key in account_keys
+    }
+    scan.sessions = dict(
+        (key, value) for key, value in scan.sessions.items() if key in keep
+    )
+    for harness, events in scan.events.items():
+        scan.events[harness] = [
+            row for row in events if (harness, row[EVENT_SESSION]) in keep
+        ]
+    scan.snapshots = [row for row in scan.snapshots if row.get("account") in account_keys]
+    scan.boundaries = dict(
+        (key, value) for key, value in scan.boundaries.items() if key in keep
+    )
+    scan.compactions = dict(
+        (key, value) for key, value in scan.compactions.items() if key in keep
+    )
+
+
 def prepare(args: argparse.Namespace) -> Analysis:
     now = time.time()
     since = parse_since(args.since, now)
     until = parse_since(args.until, now) if getattr(args, "until", None) else None
     weights = load_weights(getattr(args, "use_calibrated", False))
     scan = collect(args, since)
+    if getattr(args, "account", None):
+        filter_by_account(scan, args.account)
     if not getattr(args, "whole_session", False):
         window_events(scan, since, until)
     rebuild_totals(scan)
@@ -2866,6 +3316,10 @@ def prepare(args: argparse.Namespace) -> Analysis:
     for interval in analysis.intervals:
         if since is not None and interval.start < since:
             interval.start = since
+    # attribute()'s signature stays (intervals, events, weights, args); the
+    # session -> account map rides on args, the one place with room for it
+    # without widening the positional EVENT_* tuple.
+    args._session_accounts = scan.session_accounts
     attribute(analysis.intervals, scan.events["codex"], weights, args)
     apply_prompt_drain(analysis)
     return analysis
@@ -2892,7 +3346,7 @@ def command_sessions(args: argparse.Namespace) -> int:
     window, intervals = analysis.window, analysis.intervals
     rows = session_rows(scan, weights, args, since, until)
     attach_fanout(rows, analysis)
-    apply_codex_drain(rows, intervals)
+    unattributed = apply_codex_drain(rows, intervals)
     dollars_per_percent = claude_dollars_per_percent(since, until)
     apply_claude_estimate(rows, dollars_per_percent)
     score_rows(rows)
@@ -2908,12 +3362,13 @@ def command_sessions(args: argparse.Namespace) -> int:
             "files_scanned": scan.files_seen,
             "files_parsed": scan.files_read,
             "sessions": [row_json(row) for row in rows],
+            "pools": codex_pools(scan, intervals, since, window),
         }
         print(json.dumps(payload, indent=2, sort_keys=True))
         return 0
     paint = make_painter(args)
     width = terminal_width(args)
-    for line in header_lines(scan, rows, weights, args, dollars_per_percent, window):
+    for line in header_lines(scan, rows, weights, args, dollars_per_percent, window, unattributed):
         for wrapped in textwrap.wrap(line, width, subsequent_indent="  ") or [""]:
             print(paint(wrapped, "dim"))
     if not rows:
@@ -2993,48 +3448,112 @@ def command_timeline(args: argparse.Namespace) -> int:
     return 0
 
 
-def command_windows(args: argparse.Namespace) -> int:
-    analysis = prepare(args)
-    scan, weights = analysis.scan, analysis.weights
-    since, until = analysis.since, analysis.until
-    window, intervals = analysis.window, analysis.intervals
-    windows = {}  # type: Dict[Tuple[Any, Any], Dict[str, Any]]
-    for row in scan.snapshots:
-        if since is not None and row["ts"] < since:
-            continue
-        if not window_matches(row.get("window_minutes"), window):
-            continue
-        key = (row.get("window_minutes"), resets_bucket(row.get("resets_at")))
+def codex_window_entries(
+    scan: Scan, intervals: Sequence[Interval], since: Optional[float], window: Any
+) -> List[Dict[str, Any]]:
+    """One entry per (account, window instance): peak, sessions, unattributed.
+
+    Grouped by `resets_at` cluster, not just `resets_bucket`'s minute
+    rounding: an idle Codex pool re-stamps `resets_at` to `now + 7d` on every
+    snapshot, drifting by roughly a minute per reading, which minute-rounding
+    still slices into dozens of windows for one continuously-idle pool
+    (#17). Account is still first in the key so two pools reporting the same
+    window_minutes and cluster never merge into one window (#9).
+    """
+    filtered = [
+        row for row in scan.snapshots
+        if (since is None or row["ts"] >= since)
+        and window_matches(row.get("window_minutes"), window)
+    ]
+    cluster_map = cluster_reset_keys(
+        [
+            (row.get("account") or "default", row.get("window_minutes"), row.get("resets_at"))
+            for row in filtered
+        ]
+        + [
+            (interval.account, interval.key[3], interval.resets_at)
+            for interval in intervals
+        ]
+    )
+    windows = {}  # type: Dict[Tuple[Any, Any, Any], Dict[str, Any]]
+    for row in filtered:
+        account = row.get("account") or "default"
+        window_minutes = row.get("window_minutes")
+        resets_at = row.get("resets_at")
+        cluster_key = cluster_map.get(
+            (account, window_minutes, resets_at), resets_bucket(resets_at)
+        )
+        key = (account, window_minutes, cluster_key)
         entry = windows.setdefault(
             key,
             {
-                "window_minutes": row.get("window_minutes"),
-                "resets_at": row.get("resets_at"),
+                "account": account,
+                "account_label": row.get("account_label") or "default",
+                "window_minutes": window_minutes,
+                "resets_at": resets_at,
                 "start": row["ts"],
                 "peak_used_percent": 0.0,
                 "sessions": {},
+                "attributed_percent": 0.0,
+                "unattributed_percent": 0.0,
             },
         )
         entry["start"] = min(entry["start"], row["ts"])
         entry["peak_used_percent"] = max(entry["peak_used_percent"], row["used_percent"])
     for interval in intervals:
-        key = (interval.key[2], resets_bucket(interval.resets_at))
+        cluster_key = cluster_map.get(
+            (interval.account, interval.key[3], interval.resets_at),
+            resets_bucket(interval.resets_at),
+        )
+        key = (interval.account, interval.key[3], cluster_key)
         entry = windows.get(key)
         if entry is None:
             continue
         for session_id, share in interval.sessions.items():
             entry["sessions"][session_id] = entry["sessions"].get(session_id, 0.0) + share
-    ordered = sorted(windows.values(), key=lambda item: item["start"], reverse=True)
+        entry["attributed_percent"] += sum(interval.sessions.values())
+        entry["unattributed_percent"] += interval.unattributed
+    return sorted(windows.values(), key=lambda item: item["start"], reverse=True)
+
+
+def codex_pools(
+    scan: Scan, intervals: Sequence[Interval], since: Optional[float], window: Any
+) -> List[Dict[str, Any]]:
+    """`--json`'s `pools`: one row per (account, window instance)."""
+    return [
+        {
+            "account_label": entry["account_label"],
+            "window_resets_at": entry["resets_at"],
+            "peak": entry["peak_used_percent"],
+            "attributed": entry["attributed_percent"],
+            "unattributed": entry["unattributed_percent"],
+        }
+        for entry in codex_window_entries(scan, intervals, since, window)
+    ]
+
+
+def command_windows(args: argparse.Namespace) -> int:
+    analysis = prepare(args)
+    scan = analysis.scan
+    since = analysis.since
+    window, intervals = analysis.window, analysis.intervals
+    # `--account` is already applied to `scan` in `prepare` (`filter_by_account`),
+    # so `intervals`/`scan.snapshots` here hold only the selected account's
+    # pool; no re-check against `args.account` is needed.
+    ordered = codex_window_entries(scan, intervals, since, window)
     if args.json:
         payload = {
             "schema": JSON_SCHEMA,
             "command": "windows",
             "windows": [
                 {
+                    "account": entry["account"],
+                    "account_label": entry["account_label"],
                     "window_minutes": entry["window_minutes"],
                     "resets_at": entry["resets_at"],
                     "start": entry["start"],
                     "peak_used_percent": entry["peak_used_percent"],
+                    "unattributed_percent": entry["unattributed_percent"],
                     "top_sessions": top_session_list(entry["sessions"], args.top),
                 }
                 for entry in ordered
@@ -3046,14 +3565,17 @@ def command_windows(args: argparse.Namespace) -> int:
     if not ordered:
         print("no Codex quota windows observed in range")
         return 0
+    label_width = max(len(entry["account_label"]) for entry in ordered)
     for entry in ordered:
         resets = entry["resets_at"]
         resets_text = local_label(float(resets)) if isinstance(resets, (int, float)) else "-"
         print(
             paint(
-                "window %s min  start %s  resets %s  peak %.1f%%"
+                "window %s min  account %-*s  start %s  resets %s  peak %.1f%%"
                 % (
                     entry["window_minutes"],
+                    label_width,
+                    entry["account_label"],
                     local_label(entry["start"]),
                     resets_text,
                     entry["peak_used_percent"],
@@ -3063,6 +3585,8 @@ def command_windows(args: argparse.Namespace) -> int:
         )
         for item in top_session_list(entry["sessions"], args.top):
             print("    %-10s %6.3f%%" % (item["short_id"], item["drain_percent"]))
+        if entry["unattributed_percent"] > 0:
+            print("    unattributed %.1f%%" % entry["unattributed_percent"])
     return 0
 
 
@@ -3076,11 +3600,10 @@ def command_calibrate(args: argparse.Namespace) -> int:
         # Fitting is per harness; scanning the other one buys nothing.
         args.harness = "codex"
     analysis = prepare(args)
-    scan, weights = analysis.scan, analysis.weights
-    since, until = analysis.since, analysis.until
+    weights = analysis.weights
     if args.harness == "claude":
         return calibrate_claude(args, analysis)
-    window, intervals = analysis.window, analysis.intervals
+    intervals = analysis.intervals
     usable = [interval for interval in intervals if not interval.rollover and interval.features]
     fit = fit_percent_weights(
         usable, args.calibrate_bucket_hours, weights.table.get("codex")
@@ -3095,6 +3618,16 @@ def command_calibrate(args: argparse.Namespace) -> int:
             "--calibrate-bucket-hours is needed before these weights mean anything"
             % (fit["r_squared"], fit["identified"])
         )
+    # The fit target is measured drain, unchanged by the attribution cap: the
+    # cap only redistributes ONE interval's drain across ITS OWN sessions and
+    # never reaches `fit_percent_weights` (it reads `interval.drain`/
+    # `interval.features`, never `interval.sessions`), and subtracting
+    # unattributed from the target would be circular (unattributed depends on
+    # the rate, which depends on these very weights). Report it instead, so a
+    # corpus where a lot of drain has no local explanation is visible.
+    total_drain = sum(interval.drain for interval in usable)
+    total_unattributed = sum(interval.unattributed for interval in usable)
+    unattributed_share = (total_unattributed / total_drain) if total_drain > 0 else 0.0
     payload = {
         "schema": JSON_SCHEMA,
         "version": 1,
@@ -3107,6 +3640,7 @@ def command_calibrate(args: argparse.Namespace) -> int:
         "unit": "percent_per_mtok",
         "bucket_hours": args.calibrate_bucket_hours,
         "fallback_scale": fit["fallback_scale"],
+        "unattributed_share": unattributed_share,
         "diagnostics": fit["diagnostics"],
         "codex": {"unit": "percent_per_mtok", "models": fit["models"]},
     }
@@ -3131,6 +3665,13 @@ def command_calibrate(args: argparse.Namespace) -> int:
         "fallback scale %.8f %%/rate-card unit; unidentified coefficients use it"
         % fit["fallback_scale"]
     )
+    if unattributed_share > 0:
+        print(
+            "diagnostic: %.1f%% of measured drain in this corpus is unattributed "
+            "(usage from clients not in the scanned roots); the fit target is "
+            "unchanged, but a large share here means a contaminated corpus"
+            % (100.0 * unattributed_share)
+        )
     print("%-22s %-14s %14s %8s %8s %6s %s" % (
         "model", "kind", "fit %/Mtok", "buckets", "share", "corr", "status"))
     for model in sorted(fitted):
@@ -3188,13 +3729,31 @@ def iter_snapshots(
 
 
 def load_claude_snapshots(
-    window: str, since: Optional[float] = None, until: Optional[float] = None
+    window: str, since: Optional[float] = None, until: Optional[float] = None,
+    claude_roots: Optional[Sequence[Path]] = None,
 ) -> List[Dict[str, Any]]:
     """Read logged Claude utilisation observations as snapshot rows.
 
     Shaped like the Codex `rate_limits` rows so the same interval builder and
-    NNLS fit apply to both harnesses.
+    NNLS fit apply to both harnesses. Each record only ever carries
+    `config_dir` (a root's basename, per the privacy note on
+    `oauth_snapshot_record`'s docstring - it never stores an account id or
+    org identifier); `account`/`account_label` are resolved here, in memory,
+    by mapping that label through the currently resolved Claude roots.
+    `plan_type` is the LIVE detected rate-limit tier for that root, not
+    whatever tier was in effect when the record was written - `account` is
+    what actually separates the pools now, so a present-tense tier label is
+    enough, and there is no tier field to read out of the record itself.
     """
+    roots = list(claude_roots) if claude_roots is not None else resolve_roots(
+        "claude", [], load_config()
+    )
+    tiers = read_claude_tier(roots)
+    accounts = {}  # type: Dict[str, str]
+    for root in roots:
+        label, key = account_for_root(root, "claude")
+        accounts[label] = key
+    default_label = roots[0].name if roots else "default"
     rows = []
     for record in iter_snapshots(since, until):
         entry = (record.get("windows") or {}).get(window)
@@ -3203,16 +3762,19 @@ def load_claude_snapshots(
         used = entry.get("utilization_percent")
         if not isinstance(used, (int, float)):
             continue
+        label = str(record.get("config_dir") or default_label)
         rows.append(
             {
                 "ts": float(record["ts"]),
                 "limit_id": "claude",
-                "plan_type": str(record.get("config_dir") or "default"),
+                "plan_type": tiers.get(label) or "unknown",
                 "window_minutes": CLAUDE_WINDOW_MINUTES.get(window, 300),
                 "used_percent": float(used),
                 "resets_at": entry.get("resets_at"),
                 "limit_dollars": entry.get("limit_dollars"),
                 "used_dollars": entry.get("used_dollars"),
+                "account": accounts.get(label, label),
+                "account_label": label,
             }
         )
     rows.sort(key=lambda row: row["ts"])
@@ -3239,10 +3801,13 @@ def collect_claude_features(intervals: Sequence[Interval], events: Sequence[Sequ
 
 def calibrate_claude(args: argparse.Namespace, analysis: "Analysis") -> int:
     results = {}
+    claude_roots = resolve_roots("claude", getattr(args, "claude_root", None) or [], load_config())
     for window in ("five_hour", "seven_day"):
         rows = [
             row
-            for row in load_claude_snapshots(window, analysis.since, analysis.until)
+            for row in load_claude_snapshots(
+                window, analysis.since, analysis.until, claude_roots
+            )
         ]
         if len(rows) < 2:
             continue
@@ -3390,14 +3955,20 @@ def command_prompts(args: argparse.Namespace) -> int:
         )
     print("")
     bar_width = max(10, width - 30)
+    harness_style = "claude" if harness == "claude" else "codex"
     peak_input = max([prompt.input_tokens for prompt in shown] or [0])
-    print(paint("input tokens sent per prompt (█ uncached, ▒ cached)", "bold"))
+    print(
+        paint("input tokens sent per prompt (", "bold")
+        + paint("█", harness_style)
+        + paint(" uncached, ", "bold")
+        + paint("▒", "dim")
+        + paint(" cached)", "bold")
+    )
     for prompt in shown:
         cached = prompt.tokens.get("cache_read", 0) + prompt.tokens.get("cached_input", 0)
-        uncached = max(0, prompt.input_tokens - cached)
         total_cells = int(round(prompt.input_tokens / peak_input * bar_width)) if peak_input else 0
         cached_cells = int(round(total_cells * cached / prompt.input_tokens)) if prompt.input_tokens else 0
-        glyphs = paint("█" * (total_cells - cached_cells), "codex") + paint("▒" * cached_cells, "dim")
+        glyphs = paint("█" * (total_cells - cached_cells), harness_style) + paint("▒" * cached_cells, "dim")
         print("%-4d %10s %s" % (prompt.index, format_tokens(prompt.input_tokens), glyphs))
     print("")
     peak_context = max([prompt.context_peak for prompt in shown] or [0])
@@ -3406,7 +3977,7 @@ def command_prompts(args: argparse.Namespace) -> int:
         cells = int(round(prompt.context_peak / peak_context * bar_width)) if peak_context else 0
         print(
             "%-4d %10s %s"
-            % (prompt.index, format_tokens(prompt.context_peak), paint("▁" * cells, "claude"))
+            % (prompt.index, format_tokens(prompt.context_peak), paint("▁" * cells, harness_style))
         )
     print("")
     print(paint(describe_growth(growth), "bold"))
@@ -3629,8 +4200,8 @@ def command_reductions(args: argparse.Namespace) -> int:
 
 def command_verify(args: argparse.Namespace) -> int:
     analysis = prepare(args)
-    scan, weights = analysis.scan, analysis.weights
-    since, until = analysis.since, analysis.until
+    scan = analysis.scan
+    since = analysis.since
     report = []
     for (harness, session_id), summary in sorted(scan.sessions.items()):
         if since is not None and (summary.end or 0) < since:
@@ -3720,8 +4291,11 @@ def detect_claude_version() -> str:
     """
     newest = None
     newest_mtime = 0.0
-    for root in discover_roots(home_dir(), "claude"):
-        for path in root.rglob("*.jsonl"):
+    for root in resolve_roots("claude", [], load_config(), quiet=True):
+        leaf = root / "projects"
+        if not leaf.is_dir():
+            continue
+        for path in leaf.rglob("*.jsonl"):
             try:
                 mtime = path.stat().st_mtime
             except OSError:
@@ -3755,9 +4329,9 @@ def oauth_config_dirs(requested: Sequence[str]) -> List[Path]:
     if requested:
         return [Path(item).expanduser() for item in requested]
     found = []
-    for candidate in sorted(home_dir().glob(".claude*")):
-        if (candidate / ".credentials.json").is_file():
-            found.append(candidate)
+    for root in resolve_roots("claude", [], load_config(), quiet=True):
+        if (root / ".credentials.json").is_file():
+            found.append(root)
     return found
 
 
@@ -3982,20 +4556,50 @@ def snapshot_from_stdin(destination: Path) -> int:
                              "resets_at": window.get("resets_at")}
         if not windows:
             return 0
-        if windows == last_statusline_windows(destination):
-            # The statusline runs on every prompt; only a change is news.
+        config_env = os.environ.get("CLAUDE_CONFIG_DIR")
+        config_label = (
+            Path(config_env).expanduser().name if config_env else default_claude_config_label()
+        )
+        if windows == last_statusline_windows(destination, config_label):
+            # The statusline runs on every prompt; only a change for THIS
+            # account's config dir is news - comparing against the tail
+            # record regardless of account would drop every other reading
+            # once two config dirs start alternating (#9).
             return 0
         append_snapshot(
             destination,
-            {"source": "statusline", "ts": time.time(), "windows": windows},
+            {
+                "source": "statusline",
+                "ts": time.time(),
+                "windows": windows,
+                "config_dir": config_label,
+            },
         )
     except Exception:  # never break the statusline pipeline
         return 0
     return 0
 
 
-def last_statusline_windows(destination: Path) -> Optional[Dict[str, Any]]:
-    """The windows of the newest statusline record, read from the file tail."""
+def default_claude_config_label() -> str:
+    """The basename of the first resolved Claude root.
+
+    Used when `$CLAUDE_CONFIG_DIR` is unset, instead of hardcoding
+    `.claude`: a host whose only configured Claude root is renamed (e.g.
+    `.claude-arcade`) must still stamp its own label, not the literal
+    default that happens to be right only for an unconfigured host.
+    """
+    roots = resolve_roots("claude", [], load_config(), quiet=True)
+    return roots[0].name if roots else ".claude"
+
+
+def last_statusline_windows(destination: Path, config_label: str) -> Optional[Dict[str, Any]]:
+    """The windows of the newest statusline record for this config dir.
+
+    Dedup must be account-blind-safe: two config dirs (two accounts) polling
+    the statusline in alternation each keep their own "last seen" record, so
+    comparing only within `config_label` never drops a genuine reading from
+    the other account (#9).
+    """
     try:
         with open(destination, "rb") as handle:
             handle.seek(0, os.SEEK_END)
@@ -4009,7 +4613,11 @@ def last_statusline_windows(destination: Path) -> Optional[Dict[str, Any]]:
             record = json.loads(line)
         except ValueError:
             continue
-        if isinstance(record, dict) and record.get("source") == "statusline":
+        if (
+            isinstance(record, dict)
+            and record.get("source") == "statusline"
+            and record.get("config_dir") == config_label
+        ):
             windows = record.get("windows")
             return windows if isinstance(windows, dict) else None
     return None
@@ -4061,8 +4669,8 @@ def compact_snapshots(destination: Path) -> int:
 def snapshot_from_configs(destination: Path) -> int:
     last = last_snapshot_marks(destination)
     written = 0
-    for config in sorted(home_dir().glob(".claude*/.claude.json")):
-        payload = read_claude_config(config)
+    for root in resolve_roots("claude", [], load_config(), quiet=True):
+        payload = read_claude_config(root / ".claude.json")
         if payload is None:
             continue
         cached = payload.get("cachedUsageUtilization")
@@ -4071,7 +4679,7 @@ def snapshot_from_configs(destination: Path) -> int:
         fetched = cached.get("fetchedAtMs")
         if not isinstance(fetched, (int, float)):
             continue
-        label = config.parent.name
+        label = root.name
         if last.get(label) is not None and fetched <= last[label]:
             continue
         utilization = cached.get("utilization")
@@ -4156,14 +4764,15 @@ def add_common(parser: argparse.ArgumentParser) -> None:
         help="set the inclusive upper event-time cutoff (1d, 2026-09-10, or ISO date/time); "
              "default: no upper bound",
     )
-    parser.add_argument(
-        "--claude-root", action="append", default=[], metavar="PATH",
-        help="add a Claude transcript root; repeatable (discovered roots are also scanned)",
-    )
-    parser.add_argument(
-        "--codex-root", action="append", default=[], metavar="PATH",
-        help="add a Codex transcript root; repeatable (discovered roots are also scanned)",
-    )
+    parser.add_argument("--claude-root", action="append", default=[], metavar="PATH",
+                        help="a Claude home dir (holds .claude.json and projects/); "
+                             "repeatable, replaces config.toml and the defaults")
+    parser.add_argument("--codex-root", action="append", default=[], metavar="PATH",
+                        help="a Codex home dir (holds auth.json and sessions/); "
+                             "repeatable, replaces config.toml and the defaults")
+    parser.add_argument("--account", default=None, metavar="LABEL",
+                        help="limit to one account's pool, by root basename "
+                             "(e.g. .codex-arcade); see `nenpi config`")
     parser.add_argument(
         "--rebuild-cache", action="store_true",
         help="discard cached transcript parses and rebuild them",
@@ -4351,11 +4960,112 @@ def build_parser() -> argparse.ArgumentParser:
     )
     snapshot.set_defaults(handler=command_snapshot)
 
+    config_cmd = sub.add_parser(
+        "config", help="show the config file and resolved harness roots in use"
+    )
+    config_cmd.add_argument("--claude-root", action="append", default=[], metavar="PATH")
+    config_cmd.add_argument("--codex-root", action="append", default=[], metavar="PATH")
+    config_cmd.add_argument("--init", action="store_true",
+                            help="write a starter config.toml, seeded from every "
+                                 "~/.claude*/~/.codex* dir found on this host")
+    config_cmd.add_argument("--force", action="store_true",
+                            help="with --init, overwrite an existing config.toml")
+    config_cmd.add_argument("--json", action="store_true")
+    config_cmd.set_defaults(handler=command_config)
+
     return parser
+
+
+def command_config(args: argparse.Namespace) -> int:
+    if args.init:
+        return command_config_init(args)
+    path = config_path()
+    config = load_config()
+    rows = []
+    for harness in ("claude", "codex"):
+        flags = args.claude_root if harness == "claude" else args.codex_root
+        for root in resolve_roots(harness, flags, config, quiet=True, keep_missing=True):
+            label, key = account_for_root(root, harness)
+            rows.append(
+                {
+                    "harness": harness,
+                    "path": str(root),
+                    "exists": root.is_dir(),
+                    "account_label": label,
+                    "account_key": key,
+                }
+            )
+    if args.json:
+        print(
+            json.dumps(
+                {
+                    "schema": JSON_SCHEMA,
+                    "config_path": str(path),
+                    "config_present": path.is_file(),
+                    "roots": rows,
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        return 0
+    if path.is_file():
+        print("config: %s" % path)
+    else:
+        print("config: %s (not present, using defaults)" % path)
+    for row in rows:
+        print(
+            "%-6s %-40s exists=%-3s account=%-16s key=%s"
+            % (
+                row["harness"],
+                row["path"],
+                "yes" if row["exists"] else "no",
+                row["account_label"],
+                row["account_key"],
+            )
+        )
+    return 0
+
+
+def _toml_escape(value: str) -> str:
+    return value.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def command_config_init(args: argparse.Namespace) -> int:
+    path = config_path()
+    if path.is_dir():
+        warn("%s is a directory; cannot write config there" % path)
+        return 1
+    if path.exists() and not args.force:
+        warn("%s already exists; pass --force to overwrite" % path)
+        return 1
+    lines = [
+        "# nenpi config, written by `nenpi config --init`.",
+        "# Precedence: --claude-root/--codex-root flags > this file > defaults.",
+        "",
+    ]
+    for harness in ("claude", "codex"):
+        candidates = discover_candidate_roots(harness)
+        lines.append("[%s]" % harness)
+        lines.append("roots = [")
+        for root in candidates:
+            label, _key = account_for_root(root, harness)
+            lines.append('    "%s",  # %s' % (_toml_escape(str(root)), label))
+        lines.append("]")
+        lines.append("")
+    lines.append("# [plan]  # optional, display only")
+    lines.append('# claude = "max_20x"')
+    lines.append('# codex = "pro"')
+    lines.append("")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(lines), encoding="utf-8")
+    print("wrote %s" % path)
+    return 0
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     arguments = list(sys.argv[1:] if argv is None else argv)
+    migrate_dirs()
     # The statusline pipeline calls this thousands of times a day; get the
     # bytes moving before building the full parser.
     if arguments == ["snapshot", "--stdin"]:

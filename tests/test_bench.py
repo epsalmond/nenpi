@@ -261,13 +261,15 @@ class Harness(unittest.TestCase):
         self.fake_drain.chmod(0o755)
 
         self.environment = dict(os.environ)
+        self.environment.pop("CLAUDE_CONFIG_DIR", None)
+        self.environment.pop("CODEX_HOME", None)
         self.environment.update(
             {
                 "PATH": str(self.bin) + os.pathsep + os.environ.get("PATH", ""),
-                "QUOTA_DRAIN_HOME_DIR": str(self.root / "home"),
-                "QUOTA_DRAIN_CACHE_DIR": str(self.root / "cache"),
-                "QUOTA_DRAIN_STATE_DIR": str(self.root / "state"),
-                "QUOTA_DRAIN_CONFIG_DIR": str(self.root / "config"),
+                "NENPI_HOME_DIR": str(self.root / "home"),
+                "NENPI_CACHE_DIR": str(self.root / "cache"),
+                "NENPI_STATE_DIR": str(self.root / "state"),
+                "NENPI_CONFIG_DIR": str(self.root / "config"),
                 "BENCH_REAL_QUOTA_DRAIN": str(QUOTA_DRAIN),
                 "BENCH_FAKE_LOG": str(self.call_log),
                 "BENCH_FAKE_SEEN": str(self.seen),
@@ -986,6 +988,28 @@ class Hygiene(Harness):
         result = self.bench("plan", "--quota-drain", str(self.root / "absent"))
         self.assertEqual(result.returncode, QB.EXIT_DEPENDENCY)
         self.assertIn(b"no quota-drain at", result.stderr)
+
+
+class Migration(Harness):
+    def test_bench_moves_old_state_dir(self) -> None:
+        """bench.main must migrate state/quota-drain the same as drain.py."""
+        environment = dict(self.environment)
+        environment.pop("NENPI_STATE_DIR")
+        home = self.root / "home"
+        old_state = home / ".local" / "state" / "quota-drain"
+        old_state.mkdir(parents=True)
+        (old_state / "marker.txt").write_text("old", encoding="utf-8")
+        result = subprocess.run(
+            [sys.executable, str(QUOTA_BENCH), "plan", "--quota-drain", str(self.root / "absent")],
+            check=False,
+            capture_output=True,
+            env=environment,
+            timeout=300,
+        )
+        self.assertIn(b"moved", result.stderr)
+        new_state = home / ".local" / "state" / "nenpi"
+        self.assertTrue((new_state / "marker.txt").is_file())
+        self.assertFalse(old_state.exists())
 
 
 class ResultParsing(Harness):
