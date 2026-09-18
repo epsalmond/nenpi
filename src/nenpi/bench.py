@@ -1513,7 +1513,7 @@ def command_run(args: argparse.Namespace) -> int:
                       max_sample_age)
     baseline = sampler.sample(force=True)
     if baseline is None:
-        warn("no utilisation sample (%s); check `quota-drain snapshot --oauth`"
+        warn("no utilisation sample (%s); check `nenpi snapshot --oauth`"
              % (sampler.failure or "no observation logged"))
         return EXIT_DEPENDENCY
     # Both caps always apply: --window only selects which window the ticks are

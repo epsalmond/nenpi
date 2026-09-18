@@ -5132,5 +5132,195 @@ class PromptRanking(Harness):
         self.assertIn("rank me first please", labels)
 
 
+class NextStepFooter(Harness):
+    """Issue #27: every command ends with a data-driven stderr footer."""
+
+    BIG = "cc002701-1111-2222-3333-444444444444"
+    SMALL = "dd002702-1111-2222-3333-444444444444"
+
+    def write_corpus(self) -> float:
+        now = time.time() - 3600
+        self.write_claude(
+            "big.jsonl",
+            [
+                claude_user_prompt_line(now, self.BIG),
+                claude_tool_use_line(
+                    now + 1, self.BIG, "msg_big_1", [("toolu_big", "Bash")],
+                    input_tokens=200, cache_read=4000, output_tokens=50,
+                ),
+                claude_tool_output_line(now + 2, self.BIG, "toolu_big", "x" * 4000),
+                claude_assistant_line(
+                    now + 3, self.BIG, "msg_big_2",
+                    input_tokens=100000, cache_read=200000, output_tokens=500,
+                ),
+                claude_user_prompt_line(now + 10, self.BIG, text="second prompt here"),
+                claude_assistant_line(
+                    now + 11, self.BIG, "msg_big_3",
+                    input_tokens=1000, cache_read=2000, output_tokens=20,
+                ),
+            ],
+        )
+        self.write_claude(
+            "small.jsonl",
+            [
+                claude_user_prompt_line(now, self.SMALL),
+                claude_assistant_line(
+                    now + 1, self.SMALL, "msg_small",
+                    input_tokens=100, cache_read=100, output_tokens=5,
+                ),
+            ],
+        )
+        return now
+
+    def footer_lines(self, *arguments: str, extra_env: Optional[Dict[str, str]] = None
+                     ) -> List[str]:
+        result = self.run_tool(*arguments, extra_env=extra_env)
+        self.assertEqual(result.returncode, 0, result.stderr.decode("utf-8", "replace"))
+        return [
+            line
+            for line in result.stderr.decode("utf-8").splitlines()
+            if line.startswith("next:")
+        ]
+
+    # -- present, and data-driven ------------------------------------------
+
+    def test_every_command_ends_with_a_footer(self) -> None:
+        self.write_corpus()
+        commands = (
+            ("sessions",),
+            ("timeline",),
+            ("windows",),
+            ("prompts",),
+            ("prompts", "--session", "cc002701"),
+            ("tools",),
+            ("tools", "--session", "cc002701"),
+            ("fanout",),
+            ("reductions",),
+            ("verify",),
+            ("config",),
+        )
+        for command in commands:
+            scope = () if command == ("config",) else ("--harness", "claude", "--no-color")
+            lines = self.footer_lines(*command, *scope)
+            self.assertTrue(lines, "no footer for %s" % (command,))
+            self.assertLessEqual(len(lines), 3, "%s footer is too long" % (command,))
+
+    def test_sessions_footer_names_the_top_sessions(self) -> None:
+        self.write_corpus()
+        lines = self.footer_lines("sessions", "--harness", "claude", "--no-color")
+        self.assertIn("top 2 by drain", lines[0])
+        self.assertIn(QD.short_id(self.BIG), lines[0])
+        self.assertTrue(
+            any("nenpi prompts --session %s" % QD.short_id(self.BIG) in line
+                for line in lines), lines)
+        self.assertTrue(
+            any("nenpi tools --session %s" % QD.short_id(self.BIG) in line
+                for line in lines), lines)
+
+    def test_prompts_session_footer_points_at_the_busiest_prompt(self) -> None:
+        self.write_corpus()
+        lines = self.footer_lines(
+            "prompts", "--session", "cc002701", "--harness", "claude", "--no-color")
+        self.assertIn("nenpi tools --session %s --prompt 1" % QD.short_id(self.BIG),
+                      " ".join(lines))
+
+    def test_tools_footer_names_the_top_tool_and_session(self) -> None:
+        self.write_corpus()
+        lines = self.footer_lines("tools", "--harness", "claude", "--no-color")
+        self.assertIn("Bash", lines[0])
+        self.assertIn("nenpi tools --session %s" % QD.short_id(self.BIG), " ".join(lines))
+
+    def test_timeline_footer_suggests_the_busiest_bucket(self) -> None:
+        self.write_corpus()
+        lines = self.footer_lines("timeline", "--harness", "claude", "--no-color")
+        suggestion = [line for line in lines if "nenpi sessions" in line][0]
+        self.assertIn("--since", suggestion)
+        self.assertIn("--until", suggestion)
+
+    def test_empty_range_suggests_widening_and_config(self) -> None:
+        lines = self.footer_lines(
+            "sessions", "--harness", "claude", "--since", "1h", "--no-color")
+        self.assertIn("no sessions in range", " ".join(lines))
+        self.assertIn("nenpi config", " ".join(lines))
+
+    # -- suppression --------------------------------------------------------
+
+    def test_quiet_flags_suppress_the_footer(self) -> None:
+        self.write_corpus()
+        for flags in (("--quiet",), ("-q",)):
+            result = self.run_tool("sessions", "--harness", "claude", "--no-color", *flags)
+            self.assertEqual(result.returncode, 0)
+            self.assertNotIn(b"next:", result.stderr)
+
+    def test_nenpi_quiet_env_suppresses_the_footer(self) -> None:
+        self.write_corpus()
+        result = self.run_tool("sessions", "--harness", "claude", "--no-color",
+                               extra_env={"NENPI_QUIET": "1"})
+        self.assertEqual(result.returncode, 0)
+        self.assertNotIn(b"next:", result.stderr)
+
+    def test_json_keeps_stdout_pure_and_carries_next(self) -> None:
+        self.write_corpus()
+        for command in (("sessions",), ("prompts",), ("prompts", "--session", "cc002701"),
+                        ("tools",), ("fanout",), ("timeline",), ("windows",),
+                        ("reductions",), ("verify",), ("config",)):
+            scope = () if command == ("config",) else ("--harness", "claude")
+            result = self.run_tool(*command, *scope, "--json")
+            self.assertEqual(result.returncode, 0, result.stderr.decode())
+            payload = json.loads(result.stdout.decode("utf-8"))
+            self.assertNotIn(b"next:", result.stderr, command)
+            self.assertTrue(payload["next"], command)
+            for entry in payload["next"]:
+                self.assertEqual(sorted(entry), ["cmd", "why"], command)
+
+    def test_snapshot_stdin_stays_byte_exact_and_silent(self) -> None:
+        payload = json.dumps(
+            {"rate_limits": {"five_hour": {"used_percentage": 11.0,
+                                           "resets_at": "2026-09-16T21:30:00Z"}}}
+        ).encode("utf-8")
+        result = self.run_tool("snapshot", "--stdin", stdin=payload)
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, payload)
+        self.assertEqual(result.stderr, b"")
+
+    # -- the suggestions are runnable --------------------------------------
+
+    def test_suggestions_carry_the_scope_flags(self) -> None:
+        self.write_corpus()
+        lines = self.footer_lines(
+            "sessions", "--since", "7d", "--harness", "claude", "--no-color")
+        for line in lines[1:]:
+            self.assertIn("--since 7d", line)
+            self.assertIn("--harness claude", line)
+
+    def test_suggested_session_prefixes_resolve(self) -> None:
+        self.write_corpus()
+        lines = self.footer_lines("sessions", "--harness", "claude", "--no-color")
+        suggestion = [line for line in lines if "nenpi prompts --session" in line][0]
+        words = suggestion.split()
+        prefix = words[words.index("--session") + 1]
+        payload = self.run_json("prompts", "--session", prefix, "--harness", "claude",
+                                "--json")
+        self.assertEqual(payload["session_id"], self.BIG)
+
+    def test_suggested_commands_run_clean(self) -> None:
+        self.write_corpus()
+        for command in ("sessions", "timeline", "tools", "fanout"):
+            lines = self.footer_lines(command, "--harness", "claude", "--no-color")
+            for line in lines:
+                if "nenpi " not in line:
+                    continue
+                arguments = line.split("#")[0].split()[1:]  # drop "next:" and the why
+                self.assertEqual(arguments[0], "nenpi", line)
+                result = self.run_tool(*arguments[1:], "--json")
+                self.assertEqual(result.returncode, 0,
+                                 "%s -> %s" % (line, result.stderr.decode()))
+                json.loads(result.stdout.decode("utf-8"))
+
+    def test_footer_is_colorless_on_a_pipe(self) -> None:
+        self.write_corpus()
+        result = self.run_tool("sessions", "--harness", "claude")
+        self.assertNotIn(b"\033[", result.stderr)
+
 if __name__ == "__main__":
     unittest.main()

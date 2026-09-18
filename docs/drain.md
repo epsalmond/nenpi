@@ -46,6 +46,8 @@ nenpi verify      [--since ...]
 nenpi snapshot    [--stdin | --oauth [--config-dir PATH] | --compact]
 nenpi config      [--claude-root PATH] [--codex-root PATH] [--json]
 nenpi config      --init [--force]
+
+Every reporting subcommand also takes --quiet/-q (drop the stderr footer).
 ```
 
 Common flags on every reporting subcommand: `--claude-root PATH` and
@@ -61,6 +63,22 @@ its default of 1.0), `--use-calibrated` prefers a stored fit,
 `--whole-session` reports each selected session's whole life rather than the
 part inside the range, `--ascii` draws bars without block glyphs, and
 `--rebuild-cache` discards the parse cache.
+
+Every subcommand ends with a **"what to run next"** footer of at most three
+lines on **stderr**, derived from the rows it just printed: the top sessions
+and the `prompts --session` line for the biggest, the busiest prompt and the
+`tools --session ID --prompt N` line for it, the busiest timeline bucket and
+the `sessions --since ... --until ...` line that opens it. Suggestions repeat
+the `--since`, `--until`, `--harness`, and `--account` flags of the run that
+produced them, so each is runnable as printed and stays in the same scope; a
+flag the suggestion sets itself (the bucket's own `--since`) wins.
+
+stdout is untouched, so `nenpi sessions | tee` stays clean. `--quiet`/`-q`
+and `NENPI_QUIET=1` suppress the footer. Under `--json` nothing goes to
+stderr and the same suggestions are the payload's additive `next` key, a list
+of `{"cmd", "why"}` objects for scripts and the TUI. `nenpi snapshot --stdin`
+is a byte-exact statusline passthrough and never writes a footer. Color is
+used only when stderr is a tty.
 
 `--profile` (or `NENPI_PROFILE=1`) prints one line per phase — scan, totals,
 prompts, intervals, attribute, total — to stderr, so a run that got slower

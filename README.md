@@ -58,6 +58,28 @@ result characters / 4 and, where a later API call measured the growth, split
 across that turn's results. Only tool **names** and result **sizes** are ever
 parsed, cached or printed — never tool input or output text.
 
+### Exploring
+
+Every command ends with a short **"what to run next"** footer on **stderr**,
+built from the rows it just printed: `sessions` names its top sessions and
+hands you the `prompts --session` line for the biggest one, that view names
+the busiest prompt and hands you the `tools --session ... --prompt N` line,
+and so on. The suggestions repeat the `--since`/`--until`/`--harness`/
+`--account` flags you passed, so each one is runnable as printed and stays in
+the same scope.
+
+```sh
+nenpi sessions --since 7d          # next: nenpi prompts --session 0123abcd --since 7d
+nenpi prompts --session 0123abcd --since 7d   # next: nenpi tools --session 0123abcd --prompt 27 --since 7d
+nenpi tools --session 0123abcd --prompt 27 --since 7d
+```
+
+Because the footer is on stderr, stdout stays pipeable. `--quiet`/`-q` or
+`NENPI_QUIET=1` turns it off; under `--json` nothing is written to stderr and
+the same suggestions ride along as the payload's `next` list of
+`{"cmd", "why"}` entries. `nenpi snapshot --stdin`, the statusline
+passthrough, never prints a footer.
+
 `nenpi-bench plan` projects a benchmark without spending quota. A
 `nenpi-bench run` executes controlled `claude -p` calls and **spends real
 subscription quota** while measuring tokens per plan percent; its fitted

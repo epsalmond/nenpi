@@ -4244,6 +4244,332 @@ def row_json(row: Row) -> Dict[str, Any]:
 
 
 # --------------------------------------------------------------------------
+# "what to run next" footer (issue #27)
+#
+# Every command ends by naming the next command worth running, built from
+# the rows it just printed. The footer goes to STDERR so `nenpi sessions |
+# tee` and every `--json` pipeline stay byte-clean; under `--json` the same
+# suggestions ride along as the payload's additive `next` key instead.
+
+
+def hint(cmd: str, why: str) -> Dict[str, str]:
+    """One footer entry. An empty `cmd` prints `why` as a plain note."""
+    return {"cmd": cmd, "why": why}
+
+
+def quiet_output(args: argparse.Namespace) -> bool:
+    return bool(getattr(args, "quiet", False)) or os.environ.get("NENPI_QUIET") == "1"
+
+
+def scope_flags(args: argparse.Namespace) -> List[str]:
+    """The range/harness/account flags the user passed, to repeat verbatim.
+
+    A suggestion that dropped them would report on a different corpus than
+    the rows it was derived from.
+    """
+    flags = []  # type: List[str]
+    for name, flag in (("since", "--since"), ("until", "--until")):
+        value = getattr(args, name, None)
+        if value:
+            flags += [flag, str(value)]
+    harness = getattr(args, "harness", "all")
+    if harness and harness != "all":
+        flags += ["--harness", str(harness)]
+    account = getattr(args, "account", None)
+    if account:
+        flags += ["--account", str(account)]
+    return flags
+
+
+def suggest(args: argparse.Namespace, command: str, *flags: Any) -> str:
+    """`nenpi <command> <flags>` with the user's scope flags carried through.
+
+    A flag the caller set itself (a narrowed `--since`, say) wins over the
+    same flag from the invocation, so a suggestion is never self-contradictory.
+    """
+    given = [str(flag) for flag in flags]
+    carried = scope_flags(args)
+    extra = []  # type: List[str]
+    for index in range(0, len(carried), 2):
+        if carried[index] not in given:
+            extra += [carried[index], carried[index + 1]]
+    return " ".join(["nenpi", command] + given + extra)
+
+
+def footer_painter(args: argparse.Namespace) -> Painter:
+    """Color the footer only when stderr is a tty of its own."""
+    return Painter(sys.stderr.isatty() and not getattr(args, "no_color", False))
+
+
+def footer(args: argparse.Namespace, hints: Sequence[Mapping[str, str]]) -> None:
+    """Write up to three "what to run next" lines to stderr."""
+    if getattr(args, "json", False) or quiet_output(args):
+        return
+    rows = [entry for entry in hints if entry and (entry.get("cmd") or entry.get("why"))][:3]
+    if not rows:
+        return
+    paint = footer_painter(args)
+    for entry in rows:
+        if not entry.get("cmd"):
+            sys.stderr.write(paint("next: " + entry["why"], "dim") + "\n")
+            continue
+        sys.stderr.write(
+            "%s %s  %s\n"
+            % (paint("next:", "dim"), paint(entry["cmd"], "bold"),
+               paint("# " + entry["why"], "dim"))
+        )
+    sys.stderr.flush()
+
+
+def widen_hints(args: argparse.Namespace, what: str) -> List[Dict[str, str]]:
+    """The empty-result footer: widen the range, then check the roots."""
+    return [
+        hint(suggest(args, "sessions", "--since", "30d"),
+             "no %s in range; widen the window" % what),
+        hint("nenpi config", "check which harness roots are being scanned"),
+    ]
+
+
+def session_weight(row: "Row") -> float:
+    return row.relative
+
+
+def sessions_hints(args: argparse.Namespace, rows: Sequence["Row"]) -> List[Dict[str, str]]:
+    if not rows:
+        return widen_hints(args, "sessions")
+    top = rows[:3]
+    lead = short_id(top[0].summary.session_id)
+    note = "top %d by drain: %s" % (
+        len(top), ", ".join(short_id(row.summary.session_id) for row in top))
+    weights = sorted(session_weight(row) for row in rows)
+    median = weights[len(weights) // 2] if weights else 0.0
+    if median > 0 and session_weight(rows[0]) >= 3.0 * median:
+        note += " (%s drains %.1fx the median session here)" % (
+            lead, session_weight(rows[0]) / median)
+    return [
+        hint("", note),
+        hint(suggest(args, "prompts", "--session", lead), "which prompts drove %s" % lead),
+        hint(suggest(args, "tools", "--session", lead), "which tools filled its context"),
+    ]
+
+
+def timeline_hints(
+    args: argparse.Namespace, buckets: Mapping[int, Mapping[str, float]], bucket_seconds: int
+) -> List[Dict[str, str]]:
+    if not buckets:
+        return widen_hints(args, "activity")
+    slot = max(buckets, key=lambda key: buckets[key]["claude"] + buckets[key]["codex"])
+    entry = buckets[slot]
+    return [
+        hint("", "busiest bucket %s: %.1f claude + %.1f codex units"
+             % (local_label(slot), entry["claude"], entry["codex"])),
+        hint(suggest(args, "sessions", "--since", iso_arg(slot),
+                     "--until", iso_arg(slot + bucket_seconds)),
+             "the sessions running in that bucket"),
+    ]
+
+
+def iso_arg(epoch: float) -> str:
+    """A local ISO stamp `--since`/`--until` parse and a shell needs no quotes."""
+    return local_label(epoch, "%Y-%m-%dT%H:%M")
+
+
+def windows_hints(
+    args: argparse.Namespace, ordered: Sequence[Mapping[str, Any]]
+) -> List[Dict[str, str]]:
+    if not ordered:
+        return widen_hints(args, "Codex quota windows")
+    busiest = max(ordered, key=lambda entry: entry["peak_used_percent"])
+    start = busiest["start"]
+    resets = busiest["resets_at"]
+    end = float(resets) if isinstance(resets, (int, float)) else (
+        start + 60.0 * float(busiest["window_minutes"] or 0))
+    hints = [
+        hint("", "busiest window started %s, peak %.1f%%"
+             % (local_label(start), busiest["peak_used_percent"])),
+        hint(suggest(args, "sessions", "--since", iso_arg(start), "--until", iso_arg(end)),
+             "the sessions that drained it"),
+    ]
+    top = top_session_list(busiest["sessions"], 1)
+    if top:
+        hints.append(
+            hint(suggest(args, "prompts", "--session", top[0]["short_id"]),
+                 "its biggest session, prompt by prompt")
+        )
+    return hints
+
+
+def prompts_ranked_hints(
+    args: argparse.Namespace, shown: Sequence["Prompt"]
+) -> List[Dict[str, str]]:
+    if not shown:
+        return widen_hints(args, "prompts")
+    lead = shown[0]
+    session = short_id(lead.session_id)
+    return [
+        hint("", "#1 is prompt %d of session %s (%d turns, %s peak context)"
+             % (lead.index, session, lead.turns, format_tokens(lead.context_peak))),
+        hint(suggest(args, "prompts", "--session", session),
+             "that session's per-prompt breakdown"),
+        hint(suggest(args, "tools", "--session", session),
+             "the tools those prompts ran"),
+    ]
+
+
+def prompts_session_hints(
+    args: argparse.Namespace, session_id: str, prompts: Sequence["Prompt"]
+) -> List[Dict[str, str]]:
+    if not prompts:
+        return widen_hints(args, "prompts")
+    session = short_id(session_id)
+    busiest = max(prompts, key=lambda prompt: (prompt.turns, prompt.index))
+    largest = max(prompts, key=lambda prompt: (prompt.context_peak, prompt.index))
+    hints = [
+        hint("", "prompt %d ran the most turns (%d); prompt %d held the most context (%s)"
+             % (busiest.index, busiest.turns, largest.index,
+                format_tokens(largest.context_peak))),
+        hint(suggest(args, "tools", "--session", session, "--prompt", busiest.index),
+             "what prompt %d's turns were reading" % busiest.index),
+    ]
+    marked = [prompt for prompt in prompts if prompt.reduction]
+    if marked:
+        hints.append(hint(suggest(args, "reductions"),
+                          "a context reduction landed in this session"))
+    else:
+        hints.append(hint(suggest(args, "prompts", "--sort", "context"),
+                          "compare these prompts against every other session's"))
+    return hints
+
+
+def tools_hints(
+    args: argparse.Namespace, session_id: str, calls: Sequence["ToolCall"],
+    shown: Sequence[Mapping[str, Any]]
+) -> List[Dict[str, str]]:
+    if not calls or not shown:
+        return widen_hints(args, "tool calls")
+    top = shown[0]
+    note = hint("", "top tool by measured context: %s (%s over %d calls)"
+                % (top["tool"], format_tokens(top["measured_tokens"]), top["calls"]))
+    if session_id:
+        session = short_id(session_id)
+        busiest = max(calls, key=lambda call: (call.measured, call.prompt)).prompt
+        return [
+            note,
+            hint(suggest(args, "tools", "--session", session, "--prompt", busiest),
+                 "the same tools inside prompt %d alone" % busiest),
+            hint(suggest(args, "prompts", "--session", session, "--tools"),
+                 "which prompts those calls belong to"),
+        ]
+    busiest_session = heaviest_session(calls)
+    session = short_id(busiest_session)
+    return [
+        note,
+        hint(suggest(args, "tools", "--session", session),
+             "the same ranking inside %s, the heaviest session" % session),
+        hint(suggest(args, "prompts", "--session", session, "--tools"),
+             "per-prompt tool counts for that session"),
+    ]
+
+
+def heaviest_session(calls: Sequence["ToolCall"]) -> str:
+    totals = {}  # type: Dict[str, float]
+    for call in calls:
+        totals[call.session_id] = totals.get(call.session_id, 0.0) + call.measured + call.chars
+    return max(sorted(totals), key=lambda key: totals[key]) if totals else ""
+
+
+def fanout_hints(
+    args: argparse.Namespace, prompts: Sequence["Prompt"]
+) -> List[Dict[str, str]]:
+    if not prompts:
+        return widen_hints(args, "prompts")
+    totals = {}  # type: Dict[str, float]
+    for prompt in prompts:
+        totals[prompt.session_id] = totals.get(prompt.session_id, 0.0) + prompt.sub_turns
+    busiest = max(sorted(totals), key=lambda key: totals[key])
+    if totals[busiest] <= 0:
+        busiest = max(prompts, key=lambda prompt: (prompt.turns, prompt.index)).session_id
+        why = "the session with the widest single prompt"
+    else:
+        why = "the session with the most sub-agent turns (%d)" % int(totals[busiest])
+    session = short_id(busiest)
+    return [
+        hint(suggest(args, "prompts", "--session", session), why),
+        hint(suggest(args, "tools", "--session", session),
+             "what its sub-agents were reading"),
+    ]
+
+
+def reductions_hints(
+    args: argparse.Namespace, found: Sequence["Reduction"]
+) -> List[Dict[str, str]]:
+    if not found:
+        return [
+            hint(suggest(args, "prompts", "--sort", "context"),
+                 "no reductions in range; see which prompts carry the most context"),
+        ]
+    biggest = max(found, key=lambda reduction: reduction.removed)
+    session = short_id(biggest.session_id)
+    return [
+        hint("", "largest drop: %s removed from %s at %s"
+             % (format_tokens(biggest.removed), session, local_label(biggest.epoch))),
+        hint(suggest(args, "prompts", "--session", session),
+             "where that session's context went"),
+    ]
+
+
+def verify_hints(
+    args: argparse.Namespace, report: Sequence[Mapping[str, Any]]
+) -> List[Dict[str, str]]:
+    if not report:
+        return widen_hints(args, "sessions to verify")
+
+    def gap(entry: Mapping[str, Any]) -> float:
+        reference = entry.get("cost_state") or entry.get("thread_token_usage") or {}
+        summed = sum(entry["deduped"].get(kind, 0) for kind in ("input", "output"))
+        reported = sum(int(reference.get(kind, 0) or 0) for kind in ("input", "output"))
+        return abs(summed - reported)
+
+    worst = max(report, key=gap)
+    return [
+        hint("", "largest gap between parsed and reported totals: %s" % worst["short_id"]),
+        hint(suggest(args, "prompts", "--session", worst["short_id"]),
+             "read that session prompt by prompt"),
+    ]
+
+
+def calibrate_hints(args: argparse.Namespace, usable: bool) -> List[Dict[str, str]]:
+    hints = [
+        hint(suggest(args, "sessions", "--use-calibrated"),
+             "price sessions with the fit just saved"),
+    ]
+    if not usable:
+        hints.insert(0, hint("", "the fit is not usable yet; a longer --since or a "
+                                 "larger --calibrate-bucket-hours may identify it"))
+    return hints
+
+
+def snapshot_hints(args: argparse.Namespace) -> List[Dict[str, str]]:
+    return [
+        hint("nenpi sessions --since 7d",
+             "rank sessions against the drain these snapshots measure"),
+        hint("nenpi calibrate --harness claude --since 30d",
+             "fit Claude weights once the log spans a few windows"),
+    ]
+
+
+def config_hints(
+    args: argparse.Namespace, present: bool, unconfigured: Sequence[Mapping[str, Any]]
+) -> List[Dict[str, str]]:
+    if unconfigured or not present:
+        return [
+            hint("nenpi config --init",
+                 "write a config.toml seeded with the roots found on this host"),
+        ]
+    return [hint("nenpi sessions --since 7d", "rank the sessions these roots hold")]
+
+
+# --------------------------------------------------------------------------
 # subcommands
 
 
@@ -4421,10 +4747,12 @@ def command_sessions(args: argparse.Namespace) -> int:
     apply_claude_estimate(rows, dollars_per_percent)
     score_rows(rows)
     rows = sort_rows(rows, args.sort)[: args.top]
+    hints = sessions_hints(args, rows)
     if args.json:
         payload = {
             "schema": JSON_SCHEMA,
             "command": "sessions",
+            "next": hints,
             "generated_at": time.time(),
             "weight_source": weights.source_label,
             "claude_dollars_per_percent": dollars_per_percent,
@@ -4443,10 +4771,12 @@ def command_sessions(args: argparse.Namespace) -> int:
             print(paint(wrapped, "dim"))
     if not rows:
         print("no sessions in range")
+        footer(args, hints)
         return 0
     print("")
     for line in render_sessions(rows, args, paint, width):
         print(line)
+    footer(args, hints)
     return 0
 
 
@@ -4480,10 +4810,12 @@ def command_timeline(args: argparse.Namespace) -> int:
         slot = int(epoch // bucket_seconds) * bucket_seconds
         entry = buckets.setdefault(slot, {"claude": 0.0, "codex": 0.0, "used_percent": 0.0})
         entry["used_percent"] = max(entry["used_percent"], row["used_percent"])
+    hints = timeline_hints(args, buckets, bucket_seconds)
     if args.json:
         payload = {
             "schema": JSON_SCHEMA,
             "command": "timeline",
+            "next": hints,
             "bucket_seconds": bucket_seconds,
             "buckets": [
                 dict(start=slot, **buckets[slot]) for slot in sorted(buckets)
@@ -4494,6 +4826,7 @@ def command_timeline(args: argparse.Namespace) -> int:
     paint = make_painter(args)
     if not buckets:
         print("no activity in range")
+        footer(args, hints)
         return 0
     width = terminal_width(args)
     bar_width = max(10, width - 44)
@@ -4515,6 +4848,7 @@ def command_timeline(args: argparse.Namespace) -> int:
                 glyphs,
             )
         )
+    footer(args, hints)
     return 0
 
 
@@ -4611,10 +4945,12 @@ def command_windows(args: argparse.Namespace) -> int:
     # so `intervals`/`scan.snapshots` here hold only the selected account's
     # pool; no re-check against `args.account` is needed.
     ordered = codex_window_entries(scan, intervals, since, window)
+    hints = windows_hints(args, ordered)
     if args.json:
         payload = {
             "schema": JSON_SCHEMA,
             "command": "windows",
+            "next": hints,
             "windows": [
                 {
                     "account": entry["account"],
@@ -4634,6 +4970,7 @@ def command_windows(args: argparse.Namespace) -> int:
     paint = make_painter(args)
     if not ordered:
         print("no Codex quota windows observed in range")
+        footer(args, hints)
         return 0
     label_width = max(len(entry["account_label"]) for entry in ordered)
     for entry in ordered:
@@ -4657,6 +4994,7 @@ def command_windows(args: argparse.Namespace) -> int:
             print("    %-10s %6.3f%%" % (item["short_id"], item["drain_percent"]))
         if entry["unattributed_percent"] > 0:
             print("    unattributed %.1f%%" % entry["unattributed_percent"])
+    footer(args, hints)
     return 0
 
 
@@ -4701,9 +5039,11 @@ def command_calibrate(args: argparse.Namespace) -> int:
     total_drain = sum(interval.drain for interval in usable)
     total_unattributed = sum(interval.unattributed for interval in usable)
     unattributed_share = (total_unattributed / total_drain) if total_drain > 0 else 0.0
+    hints = calibrate_hints(args, bool(fit["usable"]))
     payload = {
         "schema": JSON_SCHEMA,
         "command": "calibrate",
+        "next": hints,
         "harness": "codex",
         "version": 1,
         "fitted_at": time.time(),
@@ -4768,6 +5108,7 @@ def command_calibrate(args: argparse.Namespace) -> int:
                 )
             )
     print("saved to %s" % destination)
+    footer(args, hints)
     return 0
 
 
@@ -4906,9 +5247,13 @@ def calibrate_claude(args: argparse.Namespace, analysis: "Analysis") -> int:
             "`nenpi snapshot --oauth` (see docs/drain.md) and retry"
         )
         return 1
+    hints = calibrate_hints(
+        args, any(result["usable"] for result in results.values())
+    )
     payload = {
         "schema": JSON_SCHEMA,
         "command": "calibrate",
+        "next": hints,
         "harness": "claude",
         "unit": "percent_per_mtok",
         "windows": results,
@@ -4954,6 +5299,7 @@ def calibrate_claude(args: argparse.Namespace, analysis: "Analysis") -> int:
             "  list price puts cache reads at 0.1x input (0.025x on Fable 5.1); "
             "the implied column is the measured ratio"
         )
+    footer(args, hints)
     return 0
 
 
@@ -5043,12 +5389,14 @@ def command_prompts_ranked(args: argparse.Namespace, analysis: "Analysis") -> in
     """`prompts` with no --session: one row per prompt, across sessions."""
     top = args.top if args.top is not None else PROMPTS_RANK_TOP
     shown = rank_prompts(analysis, args.sort, top)
+    hints = prompts_ranked_hints(args, shown)
     if args.json:
         print(
             json.dumps(
                 {
                     "schema": JSON_SCHEMA,
                     "command": "prompts",
+                    "next": hints,
                     "sort": args.sort,
                     "top": top,
                     "prompts": [
@@ -5071,6 +5419,7 @@ def command_prompts_ranked(args: argparse.Namespace, analysis: "Analysis") -> in
     )
     if not shown:
         print("no prompts in range")
+        footer(args, hints)
         return 0
     print("")
     columns = "%4s %-7s %-10s %-14s %5s %6s %6s %10s %8s" % (
@@ -5096,6 +5445,7 @@ def command_prompts_ranked(args: argparse.Namespace, analysis: "Analysis") -> in
         if with_label:
             line += " " + prompt.label[:label_width]
         print(line.rstrip())
+    footer(args, hints)
     return 0
 
 
@@ -5116,12 +5466,14 @@ def command_prompts(args: argparse.Namespace) -> int:
     growth = fit_growth(prompts)
     top = args.top if args.top is not None else PROMPTS_SESSION_TOP
     shown = prompts[-top:] if top and len(prompts) > top else prompts
+    hints = prompts_session_hints(args, session_id, shown)
     if args.json:
         print(
             json.dumps(
                 {
                     "schema": JSON_SCHEMA,
                     "command": "prompts",
+                    "next": hints,
                     "harness": harness,
                     "session_id": session_id,
                     "short_id": short_id(session_id),
@@ -5211,6 +5563,7 @@ def command_prompts(args: argparse.Namespace) -> int:
         )
     print("")
     print(paint(describe_growth(growth), "bold"))
+    footer(args, hints)
     return 0
 
 
@@ -5314,12 +5667,14 @@ def command_tools(args: argparse.Namespace) -> int:
     shown = rows[: args.top] if args.top else rows
     largest = sorted(calls, key=lambda call: call.chars, reverse=True)[:5]
     measured_total = sum(call.measured for call in calls)
+    hints = tools_hints(args, session_id, calls, shown)
     if args.json:
         print(
             json.dumps(
                 {
                     "schema": JSON_SCHEMA,
                     "command": "tools",
+                    "next": hints,
                     "generated_at": time.time(),
                     "session": short_id(session_id) if session_id else "",
                     "session_id": session_id,
@@ -5357,6 +5712,7 @@ def command_tools(args: argparse.Namespace) -> int:
     ))
     if not calls:
         print("no tool calls in range")
+        footer(args, hints)
         return 0
     print("")
     print(paint("%-28s %6s %10s %10s %9s %9s %6s" % (
@@ -5402,6 +5758,7 @@ def command_tools(args: argparse.Namespace) -> int:
         "est = result size / %d" % int(CHARS_PER_TOKEN),
         "dim",
     ))
+    footer(args, hints)
     return 0
 
 
@@ -5414,6 +5771,7 @@ def command_fanout(args: argparse.Namespace) -> int:
         if analysis.in_range(prompt.start) or analysis.in_range(prompt.end)
     ]
     if not prompts:
+        footer(args, widen_hints(args, "prompts"))
         print("no prompts in range")
         return 0
     turns = [float(prompt.turns) for prompt in prompts]
@@ -5446,6 +5804,7 @@ def command_fanout(args: argparse.Namespace) -> int:
             dict(prompt.to_json(), cwd=cwds.get((prompt.harness, prompt.session_id), "-"))
             for prompt in top
         ],
+        "next": fanout_hints(args, prompts),
     }
     if args.json:
         print(json.dumps(summary_json, indent=2, sort_keys=True))
@@ -5489,6 +5848,7 @@ def command_fanout(args: argparse.Namespace) -> int:
                 format_tokens(prompt.input_tokens),
             )
         )
+    footer(args, summary_json["next"])
     return 0
 
 
@@ -5534,12 +5894,14 @@ def command_reductions(args: argparse.Namespace) -> int:
         for reduction in detect_reductions_cached(analysis)
         if analysis.in_range(reduction.epoch)
     ][: args.top]
+    hints = reductions_hints(args, found)
     if args.json:
         print(
             json.dumps(
                 {
                     "schema": JSON_SCHEMA,
                     "command": "reductions",
+                    "next": hints,
                     "reductions": [reduction.to_json() for reduction in found],
                 },
                 indent=2,
@@ -5550,6 +5912,7 @@ def command_reductions(args: argparse.Namespace) -> int:
     paint = make_painter(args)
     if not found:
         print("no context reductions detected in range")
+        footer(args, hints)
         return 0
     print(
         paint(
@@ -5582,6 +5945,7 @@ def command_reductions(args: argparse.Namespace) -> int:
                 reduction.saved_units_upper,
             )
         )
+    footer(args, hints)
     return 0
 
 
@@ -5642,13 +6006,16 @@ def command_verify(args: argparse.Namespace) -> int:
                     "thread_token_usage": thread,
                 }
             )
+    hints = verify_hints(args, report)
     if args.json:
-        print(json.dumps({"schema": JSON_SCHEMA, "command": "verify", "rows": report},
-                         indent=2, sort_keys=True))
+        print(json.dumps(
+            {"schema": JSON_SCHEMA, "command": "verify", "next": hints, "rows": report},
+            indent=2, sort_keys=True))
         return 0
     paint = make_painter(args)
     if not report:
         print("nothing to verify in range")
+        footer(args, hints)
         return 0
     print(paint("%-7s %-10s %-20s %14s %14s %10s" %
                 ("harness", "session", "model", "summed", "reported", "delta"), "bold"))
@@ -5668,6 +6035,7 @@ def command_verify(args: argparse.Namespace) -> int:
                 (100.0 * delta / reported) if reported else 0.0,
             )
         )
+    footer(args, hints)
     return 0
 
 
@@ -5915,12 +6283,17 @@ def snapshot_from_oauth(destination: Path, args: argparse.Namespace) -> int:
 def command_snapshot(args: argparse.Namespace) -> int:
     destination = state_dir() / "snapshots.jsonl"
     if args.stdin:
+        # The statusline passthrough writes nothing of its own on either
+        # stream; no footer here, ever (#27).
         return snapshot_from_stdin(destination)
     if args.compact:
-        return compact_snapshots(destination)
-    if args.oauth:
-        return snapshot_from_oauth(destination, args)
-    return snapshot_from_configs(destination)
+        code = compact_snapshots(destination)
+    elif args.oauth:
+        code = snapshot_from_oauth(destination, args)
+    else:
+        code = snapshot_from_configs(destination)
+    footer(args, snapshot_hints(args))
+    return code
 
 
 def snapshot_from_stdin(destination: Path) -> int:
@@ -6172,6 +6545,10 @@ def add_common(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--json", action="store_true",
         help="write the command result as indented JSON",
+    )
+    parser.add_argument(
+        "-q", "--quiet", action="store_true",
+        help="drop the stderr \"what to run next\" footer; NENPI_QUIET=1 does the same",
     )
     parser.add_argument(
         "--profile", action="store_true",
@@ -6429,6 +6806,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="drop repeated, malformed, and older-than-60-day snapshot records",
     )
     snapshot.add_argument(
+        "-q", "--quiet", action="store_true",
+        help="drop the stderr \"what to run next\" footer",
+    )
+    snapshot.add_argument(
         "--config-dir", action="append", default=[], metavar="PATH",
         help="Claude config directory for --oauth; repeatable (default: discovered configs)",
     )
@@ -6445,6 +6826,10 @@ def build_parser() -> argparse.ArgumentParser:
     config_cmd.add_argument("--force", action="store_true",
                             help="with --init, overwrite an existing config.toml")
     config_cmd.add_argument("--json", action="store_true")
+    config_cmd.add_argument(
+        "-q", "--quiet", action="store_true",
+        help="drop the stderr \"what to run next\" footer",
+    )
     config_cmd.set_defaults(handler=command_config)
 
     return parser
@@ -6475,11 +6860,13 @@ def command_config(args: argparse.Namespace) -> int:
         for harness in ("claude", "codex")
         for root in unconfigured.get(harness, [])
     ]
+    hints = config_hints(args, path.is_file(), unconfigured_rows)
     if args.json:
         print(
             json.dumps(
                 {
                     "schema": JSON_SCHEMA,
+                    "next": hints,
                     "config_path": str(path),
                     "config_present": path.is_file(),
                     "roots": rows,
@@ -6511,6 +6898,7 @@ def command_config(args: argparse.Namespace) -> int:
             "[claude]/[codex] roots, or set [general] ignore_unconfigured = true)"
             % ", ".join(display_path(Path(row["path"])) for row in unconfigured_rows)
         )
+    footer(args, hints)
     return 0
 
 
@@ -6562,6 +6950,8 @@ def command_config_init(args: argparse.Namespace) -> int:
         ],
     )
     print("wrote %s" % path)
+    footer(args, [hint("nenpi config", "check the roots it resolved"),
+                  hint("nenpi sessions --since 7d", "rank the sessions they hold")])
     return 0
 
 
