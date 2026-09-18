@@ -335,13 +335,18 @@ class Harness(unittest.TestCase):
             os.environ.clear()
             os.environ.update(saved)
 
-    def run_tool(self, *arguments: str, stdin: Optional[bytes] = None) -> subprocess.CompletedProcess:
+    def run_tool(self, *arguments: str, stdin: Optional[bytes] = None,
+                extra_env: Optional[Dict[str, str]] = None) -> subprocess.CompletedProcess:
+        env = self.environment
+        if extra_env:
+            env = dict(self.environment)
+            env.update(extra_env)
         return subprocess.run(
             DRAIN_COMMAND + list(arguments),
             check=False,
             input=stdin,
             capture_output=True,
-            env=self.environment,
+            env=env,
             timeout=120,
         )
 
@@ -1167,6 +1172,67 @@ class Snapshots(Harness):
         self.run_tool("snapshot", "--stdin", stdin=moved)
         logged = (self.root / "state" / "snapshots.jsonl").read_text(encoding="utf-8")
         self.assertEqual(len(logged.strip().splitlines()), 2)
+
+    def _statusline_payload(self, used_percentage: float) -> bytes:
+        return json.dumps(
+            {"rate_limits": {"five_hour": {"used_percentage": used_percentage,
+                                           "resets_at": "2026-09-16T21:30:00Z"}}}
+        ).encode("utf-8")
+
+    def test_statusline_dedup_is_per_config_dir(self) -> None:
+        # Dedup that ignores the account (#9): comparing only against the
+        # newest record regardless of `config_dir` drops a genuine change
+        # from one account whenever it coincides with the other account's
+        # last-seen value. A: 10% -> B: 30% -> A: 30% (a REAL change for A,
+        # from 10% to 30%, that happens to equal B's last reading) -> B: 10%
+        # (a real change for B). All four are distinct per-account readings
+        # and must all be kept.
+        claude_root = self.home / ".claude"
+        arcade_root = self.home / ".claude-arcade"
+        arcade_root.mkdir(parents=True, exist_ok=True)
+        sequence = [
+            (claude_root, 10.0),
+            (arcade_root, 30.0),
+            (claude_root, 30.0),
+            (arcade_root, 10.0),
+        ]
+        for root, used in sequence:
+            result = self.run_tool(
+                "snapshot", "--stdin", stdin=self._statusline_payload(used),
+                extra_env={"CLAUDE_CONFIG_DIR": str(root)},
+            )
+            self.assertEqual(result.returncode, 0)
+        logged = (self.root / "state" / "snapshots.jsonl").read_text(encoding="utf-8")
+        records = [json.loads(line) for line in logged.strip().splitlines()]
+        self.assertEqual(len(records), len(sequence))
+        seen = [
+            (record["config_dir"], record["windows"]["five_hour"]["utilization_percent"])
+            for record in records
+        ]
+        self.assertEqual(
+            seen,
+            [(".claude", 10.0), (".claude-arcade", 30.0), (".claude", 30.0),
+             (".claude-arcade", 10.0)],
+        )
+
+    def test_statusline_label_falls_back_to_first_resolved_root(self) -> None:
+        # With no $CLAUDE_CONFIG_DIR, the fallback label must come from the
+        # first resolved Claude root, not a hardcoded ".claude" - here the
+        # only configured root is renamed, so the record must carry that
+        # root's own basename.
+        renamed = self.home / ".claude-only"
+        renamed.mkdir(parents=True, exist_ok=True)
+        config_path = self.root / "config" / "config.toml"
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        config_path.write_text(
+            '[claude]\nroots = ["%s"]\n' % str(renamed).replace("\\", "\\\\"),
+            encoding="utf-8",
+        )
+        result = self.run_tool("snapshot", "--stdin", stdin=self._statusline_payload(12.0))
+        self.assertEqual(result.returncode, 0)
+        logged = (self.root / "state" / "snapshots.jsonl").read_text(encoding="utf-8")
+        record = json.loads(logged.strip().splitlines()[-1])
+        self.assertEqual(record["config_dir"], ".claude-only")
 
     def test_compact_drops_repeats_and_stale_entries(self) -> None:
         path = self.root / "state" / "snapshots.jsonl"
@@ -2573,7 +2639,7 @@ class RootsAndConfig(Harness):
         )
         result = self.run_tool("sessions", "--harness", "claude")
         self.assertEqual(result.returncode, 0)
-        self.assertIn(b"claude=pro_5x", result.stdout)
+        self.assertIn(b"claude[.claude]=pro_5x", result.stdout)
         self.assertNotIn(b"max_20x", result.stdout)
 
     def test_config_init_escapes_special_characters_in_root_path(self) -> None:
@@ -2636,6 +2702,333 @@ class RootsAndConfig(Harness):
     def test_warn_once_registry_is_shared_between_drain_and_config(self) -> None:
         self.assertIs(QD.warn_once, QC.warn_once)
         self.assertIs(QD.warn, QC.warn)
+
+
+class AccountPools(Harness):
+    """Per-account quota pools (#9).
+
+    Two roots on different accounts must never be read as one alternating
+    timeline (each gets its own pool, its own drain, its own window); two
+    roots on the SAME account must still merge into one pool.
+    """
+
+    def write_codex_root(self, root_name: str, filename: str, lines: Sequence[str],
+                         day: Optional[float] = None) -> Path:
+        stamp = datetime.fromtimestamp(day or time.time(), timezone.utc)
+        path = self.home / root_name / "sessions" / stamp.strftime("%Y/%m/%d") / filename
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "a", encoding="utf-8") as handle:
+            for line in lines:
+                handle.write(line + "\n")
+        return path
+
+    def write_auth(self, root_name: str, account_id: str) -> None:
+        root = self.home / root_name
+        root.mkdir(parents=True, exist_ok=True)
+        (root / "auth.json").write_text(
+            json.dumps(
+                {"tokens": {"account_id": account_id, "access_token": "must-not-print"}}
+            ),
+            encoding="utf-8",
+        )
+
+    def test_two_accounts_no_rollover_and_separate_drain(self) -> None:
+        # Reproduces #9: two Codex roots on different accounts, same
+        # limit_id/plan_type/window_minutes, readings interleaved every few
+        # seconds, and the Arcade pool's resets_at is hours after the
+        # personal pool's - exactly the shape that used to be read as one
+        # timeline rolling over.
+        self.write_auth(".codex", "acct-personal")
+        self.write_auth(".codex-arcade", "acct-arcade")
+        now = time.time() - 3600
+        resets_a = int(now) + 7 * 86400
+        resets_b = resets_a + 4 * 3600
+
+        session_a = "aaaaaaaa-personal-2222-3333-444444444444"
+        lines_a = [
+            codex_session_meta_line(now, session_a, "/home/agent/personal"),
+            codex_turn_context_line(now, "gpt-5.6-sol"),
+            codex_token_count_line(now + 5, rate_limits=rate_limits(27.0, resets_a, 10080)),
+            codex_usage_record_line(
+                now + 20, session_a, input_tokens=100_000, cached_input_tokens=0,
+                output_tokens=0,
+            ),
+            codex_token_count_line(now + 35, rate_limits=rate_limits(42.0, resets_a, 10080)),
+        ]
+        self.write_codex_root(".codex", "rollout-personal.jsonl", lines_a)
+
+        session_b = "bbbbbbbb-arcade-2222-3333-444444444444"
+        lines_b = [
+            codex_session_meta_line(now, session_b, "/home/agent/arcade"),
+            codex_turn_context_line(now, "gpt-5.6-sol"),
+            codex_token_count_line(now + 10, rate_limits=rate_limits(33.0, resets_b, 10080)),
+            codex_usage_record_line(
+                now + 25, session_b, input_tokens=100_000, cached_input_tokens=0,
+                output_tokens=0,
+            ),
+            codex_token_count_line(now + 40, rate_limits=rate_limits(90.0, resets_b, 10080)),
+        ]
+        self.write_codex_root(".codex-arcade", "rollout-arcade.jsonl", lines_b)
+
+        root_args = [
+            "--codex-root", str(self.home / ".codex"),
+            "--codex-root", str(self.home / ".codex-arcade"),
+        ]
+        payload = self.run_json(
+            "sessions", "--harness", "codex", "--json", "--window", "weekly", *root_args
+        )
+        row_a = self.session_by_short_id(payload, "aaaaaaaa")
+        row_b = self.session_by_short_id(payload, "bbbbbbbb")
+        # 15 = 42 - 27 (personal pool's own delta); 57 = 90 - 33 (Arcade's).
+        # A merged timeline would instead charge one session the other
+        # pool's whole used_percent as a bogus rollover.
+        self.assertAlmostEqual(row_a["drain_percent"], 15.0, places=6)
+        self.assertAlmostEqual(row_b["drain_percent"], 57.0, places=6)
+        self.assertEqual(row_a["account_label"], ".codex")
+        self.assertEqual(row_b["account_label"], ".codex-arcade")
+        self.assertEqual(row_a["account"], "acct-personal")
+        self.assertEqual(row_b["account"], "acct-arcade")
+
+        windows_payload = self.run_json(
+            "windows", "--harness", "codex", "--json", "--window", "weekly", *root_args
+        )
+        by_label = dict(
+            (entry["account_label"], entry) for entry in windows_payload["windows"]
+        )
+        self.assertEqual(sorted(by_label), [".codex", ".codex-arcade"])
+        self.assertAlmostEqual(by_label[".codex"]["peak_used_percent"], 42.0, places=6)
+        self.assertAlmostEqual(by_label[".codex-arcade"]["peak_used_percent"], 90.0, places=6)
+
+    def test_same_account_two_roots_merge_into_one_pool(self) -> None:
+        # Two roots that happen to share the same account (a re-pointed
+        # $CODEX_HOME, say) must still read as one continuous pool.
+        self.write_auth(".codex", "acct-shared")
+        self.write_auth(".codex-mirror", "acct-shared")
+        now = time.time() - 3600
+        resets_at = int(now) + 7 * 86400
+
+        session_a = "cccccccc-shared-2222-3333-444444444444"
+        self.write_codex_root(
+            ".codex", "rollout-a.jsonl",
+            [
+                codex_session_meta_line(now, session_a, "/home/agent/shared"),
+                codex_turn_context_line(now, "gpt-5.6-sol"),
+                codex_token_count_line(
+                    now + 5, rate_limits=rate_limits(10.0, resets_at, 10080)
+                ),
+                codex_usage_record_line(
+                    now + 20, session_a, input_tokens=50_000, cached_input_tokens=0,
+                    output_tokens=0,
+                ),
+            ],
+        )
+        session_b = "dddddddd-shared-2222-3333-444444444444"
+        self.write_codex_root(
+            ".codex-mirror", "rollout-b.jsonl",
+            [
+                codex_session_meta_line(now, session_b, "/home/agent/shared"),
+                codex_turn_context_line(now, "gpt-5.6-sol"),
+                codex_token_count_line(
+                    now + 30, rate_limits=rate_limits(18.0, resets_at, 10080)
+                ),
+                codex_usage_record_line(
+                    now + 25, session_b, input_tokens=50_000, cached_input_tokens=0,
+                    output_tokens=0,
+                ),
+            ],
+        )
+        root_args = [
+            "--codex-root", str(self.home / ".codex"),
+            "--codex-root", str(self.home / ".codex-mirror"),
+        ]
+        windows_payload = self.run_json(
+            "windows", "--harness", "codex", "--json", "--window", "weekly", *root_args
+        )
+        # One merged pool, not two: a single 10% -> 18% timeline split
+        # between whichever session had events since the previous reading.
+        self.assertEqual(len(windows_payload["windows"]), 1)
+        self.assertAlmostEqual(
+            windows_payload["windows"][0]["peak_used_percent"], 18.0, places=6
+        )
+
+    def test_cached_shard_keeps_the_right_account_after_reresolve(self) -> None:
+        # A shard cached under a root on one run must still stamp the right
+        # account on a later run that resolves the same root again - account
+        # identity is never part of the per-file cache payload.
+        self.write_auth(".codex", "acct-personal")
+        now = time.time() - 3600
+        session = "eeeeeeee-cache-2222-3333-444444444444"
+        self.write_codex_root(
+            ".codex", "rollout-cache.jsonl",
+            [
+                codex_session_meta_line(now, session, "/home/agent/personal"),
+                codex_turn_context_line(now, "gpt-5.6-sol"),
+                codex_usage_record_line(
+                    now + 5, session, input_tokens=10_000, cached_input_tokens=0,
+                    output_tokens=0,
+                ),
+            ],
+        )
+        first = self.run_json("sessions", "--harness", "codex", "--json")
+        row = self.session_by_short_id(first, "eeeeeeee")
+        self.assertEqual(row["account_label"], ".codex")
+        self.assertEqual(row["account"], "acct-personal")
+        # Second run reads the same file from cache (mtime/size unchanged);
+        # the account still has to come from the root, not a stale copy.
+        second = self.run_json("sessions", "--harness", "codex", "--json")
+        row = self.session_by_short_id(second, "eeeeeeee")
+        self.assertEqual(row["account_label"], ".codex")
+        self.assertEqual(row["account"], "acct-personal")
+
+    def test_account_filter_limits_the_report_to_one_pool(self) -> None:
+        self.write_auth(".codex", "acct-personal")
+        self.write_auth(".codex-arcade", "acct-arcade")
+        now = time.time() - 3600
+        resets_at = int(now) + 7 * 86400
+        session_a = "ffffffff-filt-a222-3333-444444444444"
+        session_b = "11111111-filt-b222-3333-444444444444"
+        # Distinct offsets per root: the usage record's epoch feeds a
+        # synthetic call id (`resp-%f`), and two roots sharing one would
+        # collide in the corpus-wide dedup and silently drop one session.
+        for root_name, session_id, offset in (
+            (".codex", session_a, 5), (".codex-arcade", session_b, 7)
+        ):
+            self.write_codex_root(
+                root_name, "rollout-r.jsonl",
+                [
+                    codex_session_meta_line(now, session_id, "/home/agent/x"),
+                    codex_turn_context_line(now, "gpt-5.6-sol"),
+                    codex_usage_record_line(
+                        now + offset, session_id, input_tokens=10_000,
+                        cached_input_tokens=0, output_tokens=0,
+                    ),
+                    codex_token_count_line(
+                        now + 10, rate_limits=rate_limits(10.0, resets_at, 10080)
+                    ),
+                ],
+                day=now,
+            )
+        payload = self.run_json(
+            "sessions", "--harness", "codex", "--json",
+            "--codex-root", str(self.home / ".codex"),
+            "--codex-root", str(self.home / ".codex-arcade"),
+            "--account", ".codex-arcade",
+        )
+        short_ids = [row["short_id"] for row in payload["sessions"]]
+        self.assertEqual(short_ids, ["11111111"])
+
+    def test_account_filter_by_either_label_returns_the_shared_key_pool(self) -> None:
+        # Two roots sharing one account key (a re-pointed root, or the same
+        # login copied to a second config dir) must merge into one pool
+        # (`test_same_account_two_roots_merge_into_one_pool` above) - and
+        # `--account` on EITHER root's label must resolve to that shared key
+        # and return sessions from BOTH roots, not just the labelled one.
+        self.write_auth(".codex", "acct-shared")
+        self.write_auth(".codex-mirror", "acct-shared")
+        now = time.time() - 3600
+        resets_at = int(now) + 7 * 86400
+        session_a = "22222222-share-a222-3333-444444444444"
+        session_b = "33333333-share-b222-3333-444444444444"
+        for root_name, session_id, offset in (
+            (".codex", session_a, 5), (".codex-mirror", session_b, 7)
+        ):
+            self.write_codex_root(
+                root_name, "rollout-shared.jsonl",
+                [
+                    codex_session_meta_line(now, session_id, "/home/agent/x"),
+                    codex_turn_context_line(now, "gpt-5.6-sol"),
+                    codex_usage_record_line(
+                        now + offset, session_id, input_tokens=10_000,
+                        cached_input_tokens=0, output_tokens=0,
+                    ),
+                    codex_token_count_line(
+                        now + 10, rate_limits=rate_limits(10.0, resets_at, 10080)
+                    ),
+                ],
+                day=now,
+            )
+        root_args = [
+            "--codex-root", str(self.home / ".codex"),
+            "--codex-root", str(self.home / ".codex-mirror"),
+        ]
+        for label in (".codex", ".codex-mirror"):
+            payload = self.run_json(
+                "sessions", "--harness", "codex", "--json", "--account", label, *root_args
+            )
+            short_ids = sorted(row["short_id"] for row in payload["sessions"])
+            self.assertEqual(short_ids, ["22222222", "33333333"])
+
+
+class ClaudeAccountPools(Harness):
+    """Two Claude `config_dir`s map to two accounts (#9, Claude side)."""
+
+    def write_claude_config(self, root_name: str, org_uuid: str) -> None:
+        root = self.home / root_name
+        root.mkdir(parents=True, exist_ok=True)
+        (root / ".claude.json").write_text(
+            json.dumps(
+                {
+                    "oauthAccount": {
+                        "organizationUuid": org_uuid,
+                        "organizationRateLimitTier": "max_20x",
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    def write_snapshots(self, records: Sequence[Dict[str, Any]]) -> None:
+        path = self.root / "state" / "snapshots.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "a", encoding="utf-8") as handle:
+            for record in records:
+                handle.write(json.dumps(record) + "\n")
+
+    def test_two_config_dirs_map_to_two_accounts(self) -> None:
+        self.write_claude_config(".claude", "org-personal")
+        self.write_claude_config(".claude-arcade", "org-arcade")
+        now = time.time() - 3600
+        self.write_snapshots(
+            [
+                {
+                    "source": "oauth",
+                    "config_dir": ".claude",
+                    "ts": now,
+                    "windows": {
+                        "five_hour": {
+                            "utilization_percent": 10.0,
+                            "resets_at": "2026-09-16T21:30:00+00:00",
+                        }
+                    },
+                },
+                {
+                    "source": "oauth",
+                    "config_dir": ".claude-arcade",
+                    "ts": now + 60,
+                    "windows": {
+                        "five_hour": {
+                            "utilization_percent": 40.0,
+                            "resets_at": "2026-09-16T21:30:00+00:00",
+                        }
+                    },
+                },
+            ]
+        )
+        with self.env_applied():
+            roots = [self.home / ".claude", self.home / ".claude-arcade"]
+            rows = QD.load_claude_snapshots("five_hour", claude_roots=roots)
+        by_label = dict((row["account_label"], row) for row in rows)
+        self.assertEqual(by_label[".claude"]["account"], "org-personal")
+        self.assertEqual(by_label[".claude-arcade"]["account"], "org-arcade")
+        self.assertEqual(by_label[".claude"]["plan_type"], "max_20x")
+        self.assertEqual(by_label[".claude-arcade"]["plan_type"], "max_20x")
+        # The account key (an org uuid, resolved in memory from `.claude.json`)
+        # is never written back to the snapshot record itself - only
+        # `config_dir` (the label) is, per `oauth_snapshot_record`'s privacy
+        # note. This asserts the file on disk still holds no org uuid.
+        raw = (self.root / "state" / "snapshots.jsonl").read_text(encoding="utf-8")
+        self.assertNotIn("org-personal", raw)
+        self.assertNotIn("org-arcade", raw)
 
 
 if __name__ == "__main__":
