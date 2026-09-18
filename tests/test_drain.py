@@ -3810,5 +3810,191 @@ class UnconfiguredSiblingNotice(RootsAndConfig):
                       result.stdout.decode("utf-8", "replace"))
 
 
+def synthetic_event(
+    session_id: str,
+    model: str,
+    epoch: float,
+    tokens: Sequence[int],
+    long_context: bool = False,
+    subagent: bool = False,
+    call_id: str = "",
+) -> List[Any]:
+    """One synthetic event row in the layout `absorb`/`build_prompt` expect.
+
+    Never built from a transcript: the numbers are made up so the arithmetic
+    under test is the only thing the assertions depend on.
+    """
+    row = [session_id, model, epoch] + [0] * QD.EVENT_KIND_SLOTS
+    for offset, value in enumerate(tokens):
+        row[QD.EVENT_KINDS + offset] = value
+    row.extend([long_context, subagent, None, None, call_id])
+    return row
+
+
+class CountingMap(dict):
+    """A dict that records how many key lookups went through it.
+
+    Every `Weights` memo test that only compares return values passes with
+    the memo removed, so the tests below count the lookups the memo is
+    supposed to prevent instead.
+    """
+
+    def __init__(self, *arguments: Any, **keywords: Any) -> None:
+        super().__init__(*arguments, **keywords)
+        self.lookups = 0
+
+    def get(self, key: Any, default: Any = None) -> Any:
+        self.lookups += 1
+        return super().get(key, default)
+
+    def __getitem__(self, key: Any) -> Any:
+        self.lookups += 1
+        return super().__getitem__(key)
+
+
+class WeightMemoization(unittest.TestCase):
+    """`Weights` memoizes pure lookups; the memo must not change an answer."""
+
+    def setUp(self) -> None:
+        self.weights = QD.load_weights(False)
+        # A second Weights over instrumented maps, so a lookup that reaches
+        # the table can be counted rather than inferred.
+        self.claude_entry = CountingMap(
+            input=2.0, cache_read=0.2, cache_write_5m=2.5,
+            cache_write_1h=4.0, output=10.0,
+        )
+        self.claude_models = CountingMap({"model-a": self.claude_entry})
+        self.codex_models = CountingMap(
+            {"model-b": CountingMap(input=100.0, cached_input=10.0, output=500.0)}
+        )
+        self.counted = QD.Weights(
+            {
+                "claude": {"unit": "usd_per_mtok", "models": self.claude_models},
+                "codex": {"unit": "credit_units_per_mtok", "models": self.codex_models},
+            },
+            ["test"],
+        )
+
+    def test_repeat_model_entry_does_no_table_lookup(self) -> None:
+        self.assertIsNotNone(self.counted.model_entry("claude", "model-a"))
+        after_first = self.claude_models.lookups
+        self.assertEqual(after_first, 1)
+        for _ in range(5):
+            self.assertIsNotNone(self.counted.model_entry("claude", "model-a"))
+        self.assertEqual(self.claude_models.lookups, after_first)
+
+    def test_a_repeated_miss_is_remembered_as_a_miss(self) -> None:
+        self.assertIsNone(self.counted.model_entry("claude", "no-such-model"))
+        after_first = self.claude_models.lookups
+        self.assertEqual(after_first, 1)
+        for _ in range(5):
+            self.assertIsNone(self.counted.model_entry("claude", "no-such-model"))
+        self.assertEqual(self.claude_models.lookups, after_first)
+
+    def test_repeat_pricing_does_not_reread_the_entry(self) -> None:
+        tokens = {"input": 1_000_000, "output": 1_000_000}
+        self.assertEqual(self.counted.claude_units("model-a", tokens, None), 12.0)
+        after_first = self.claude_entry.lookups
+        self.assertGreater(after_first, 0)
+        for _ in range(5):
+            self.assertEqual(self.counted.claude_units("model-a", tokens, None), 12.0)
+            self.counted.event_vector("claude", "model-a", None)
+            self.counted.event_vector("claude", "model-a", None, True)
+        self.assertEqual(self.claude_entry.lookups, after_first)
+
+    def test_memo_survives_a_miss_without_poisoning_a_hit(self) -> None:
+        self.assertIsNone(self.counted.model_entry("claude", "model-b"))
+        self.assertIsNotNone(self.counted.model_entry("codex", "model-b"))
+        self.assertIsNone(self.counted.model_entry("claude", "model-b"))
+
+    def test_model_entry_returns_the_table_entry(self) -> None:
+        entry = self.weights.model_entry("claude", "claude-sonnet-5")
+        self.assertIsNotNone(entry)
+        self.assertEqual(
+            self.weights.table["claude"]["models"]["claude-sonnet-5"], entry
+        )
+
+    def test_memo_does_not_leak_between_harnesses(self) -> None:
+        # "gpt-5.5" is a Codex model and has no Claude entry; a memo keyed on
+        # the model alone would hand the Codex entry back for Claude.
+        self.assertIsNotNone(self.weights.model_entry("codex", "gpt-5.5"))
+        self.assertIsNone(self.weights.model_entry("claude", "gpt-5.5"))
+        self.assertIsNotNone(self.weights.model_entry("codex", "gpt-5.5"))
+
+    def test_invalidate_picks_up_a_table_edit(self) -> None:
+        self.assertIsNone(self.weights.model_entry("codex", "made-up-model"))
+        self.weights.table["codex"]["models"]["made-up-model"] = {
+            "input": 1.0, "cached_input": 0.5, "output": 2.0
+        }
+        self.assertIsNone(self.weights.model_entry("codex", "made-up-model"))
+        self.weights.invalidate()
+        self.assertIsNotNone(self.weights.model_entry("codex", "made-up-model"))
+        self.assertEqual(
+            self.weights.codex_units("made-up-model", {"input": 1_000_000}), 1.0
+        )
+
+    def test_cache_read_weight_is_part_of_the_key(self) -> None:
+        tokens = {"cache_read": 1_000_000}
+        plain = self.weights.claude_units("claude-sonnet-5", tokens, None)
+        weighted = self.weights.claude_units("claude-sonnet-5", tokens, 1.0)
+        self.assertNotEqual(plain, weighted)
+        # Re-asking in the other order must not serve the other row's memo.
+        self.assertEqual(self.weights.claude_units("claude-sonnet-5", tokens, 1.0), weighted)
+        self.assertEqual(self.weights.claude_units("claude-sonnet-5", tokens, None), plain)
+
+
+class EventVectorEquivalence(unittest.TestCase):
+    """`event_vector` + `vector_units` must be bit-identical to the dict path."""
+
+    def setUp(self) -> None:
+        self.weights = QD.load_weights(False)
+        self.args = argparse.Namespace(
+            claude_cache_read_weight=None, long_context_multiplier=1.0
+        )
+
+    def check(self, harness: str, model: str, tokens: Sequence[int]) -> None:
+        kinds = QD.CLAUDE_KINDS if harness == "claude" else QD.CODEX_KINDS
+        row = synthetic_event("s1", model, 1_700_000_000.0, tokens)
+        as_dict = QD.event_tokens(row, kinds)
+        for cache_read_weight in (None, 0.0, 0.1, 0.5):
+            vector = self.weights.event_vector(harness, model, cache_read_weight)
+            expected = QD.weighted_units(
+                harness, model, as_dict, self.weights,
+                argparse.Namespace(
+                    claude_cache_read_weight=cache_read_weight,
+                    long_context_multiplier=1.0,
+                ),
+            )
+            actual = 0.0 if vector is None else QD.vector_units(vector, row)
+            self.assertEqual(actual, expected, (harness, model, cache_read_weight))
+            input_vector = self.weights.event_vector(
+                harness, model, cache_read_weight, True
+            )
+            expected_input = QD.input_side_units(
+                harness, model, as_dict, self.weights, cache_read_weight
+            )
+            actual_input = 0.0 if input_vector is None else QD.vector_units(input_vector, row)
+            self.assertEqual(actual_input, expected_input, (harness, model, cache_read_weight))
+
+    def test_claude_models(self) -> None:
+        for model in ("claude-sonnet-5", "claude-opus-5", "unweighted-nonsense"):
+            self.check("claude", model, (11_111, 222_222, 3_333, 444, 55_555))
+
+    def test_codex_models(self) -> None:
+        for model in ("gpt-5.5", "gpt-5.4", "unweighted-nonsense"):
+            self.check("codex", model, (98_765, 4_321_000, 777, 12_345))
+
+    def test_output_is_priced_out_of_the_input_side_vector(self) -> None:
+        row = synthetic_event("s1", "claude-sonnet-5", 1.0, (0, 0, 0, 0, 1_000_000))
+        vector = self.weights.event_vector("claude", "claude-sonnet-5", None, True)
+        self.assertEqual(QD.vector_units(vector, row), 0.0)
+        full = self.weights.event_vector("claude", "claude-sonnet-5", None, False)
+        self.assertGreater(QD.vector_units(full, row), 0.0)
+
+    def test_unweighted_model_has_no_vector(self) -> None:
+        self.assertIsNone(self.weights.event_vector("codex", "not-a-real-model"))
+        self.assertIsNone(self.weights.event_vector("claude", "not-a-real-model"))
+
+
 if __name__ == "__main__":
     unittest.main()

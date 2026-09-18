@@ -357,21 +357,103 @@ def claude_price(entry: Mapping[str, Any], model: str, kind: str) -> float:
 
 
 class Weights:
-    """Per-model price tables plus the provenance shown in the report header."""
+    """Per-model price tables plus the provenance shown in the report header.
+
+    Every lookup here is a pure function of `table`, and the analysis phase
+    asks the same handful of questions a million times (one model per API
+    call, a few dozen distinct models in a whole corpus). So the resolved
+    entry and the per-kind price row are memoized; `invalidate()` drops the
+    memos for anyone who mutates `table` in place after construction.
+    """
 
     def __init__(self, table: Dict[str, Any], sources: Sequence[str]):
+        # Treat this as frozen once constructed: the memos below are only
+        # correct while it does not change, so any in-place edit must be
+        # followed by `invalidate()`. Nothing in the tool edits it today.
         self.table = table
         self.sources = list(sources)
+        self._entries = {}  # type: Dict[Tuple[str, str], Optional[Mapping[str, Any]]]
+        self._price_rows = {}  # type: Dict[Tuple[str, str, Any], Optional[Tuple[float, ...]]]
+        self._vectors = {}  # type: Dict[Tuple[str, str, Any, bool], Optional[Tuple[Any, ...]]]
+
+    def invalidate(self) -> None:
+        """Forget every memoized lookup; call after mutating `table` in place."""
+        self._entries.clear()
+        self._price_rows.clear()
+        self._vectors.clear()
 
     @property
     def source_label(self) -> str:
         return " + ".join(self.sources) if self.sources else "default"
 
     def model_entry(self, harness: str, model: str) -> Optional[Mapping[str, Any]]:
+        key = (harness, model)
+        entries = self._entries
+        if key in entries:
+            return entries[key]
         section = self.table.get(harness) or {}
         models = section.get("models") or {}
         entry = models.get(model)
-        return entry if isinstance(entry, Mapping) else None
+        resolved = entry if isinstance(entry, Mapping) else None
+        entries[key] = resolved
+        return resolved
+
+    def price_row(
+        self, harness: str, model: str, cache_read_weight: Optional[float] = None
+    ) -> Optional[Tuple[float, ...]]:
+        """Per-kind prices for one model, aligned to the harness' fit kinds.
+
+        Claude rows line up with `CLAUDE_KINDS`, Codex rows with
+        `CODEX_FIT_KINDS`. `None` means the model has no weight at all, which
+        the callers report as zero units rather than as a zero price.
+        """
+        key = (harness, model, cache_read_weight)
+        rows = self._price_rows
+        if key in rows:
+            return rows[key]
+        entry = self.model_entry(harness, model)
+        if entry is None:
+            row = None  # type: Optional[Tuple[float, ...]]
+        elif harness == "claude":
+            cache_read = claude_price(entry, model, "cache_read")
+            if cache_read_weight is not None:
+                cache_read = claude_price(entry, model, "input") * cache_read_weight
+            row = tuple(
+                cache_read if kind == "cache_read" else claude_price(entry, model, kind)
+                for kind in CLAUDE_KINDS
+            )
+        else:
+            row = tuple(float(entry.get(kind, 0.0)) for kind in CODEX_FIT_KINDS)
+        rows[key] = row
+        return row
+
+    def event_vector(
+        self, harness: str, model: str, cache_read_weight: Optional[float] = None,
+        input_only: bool = False,
+    ) -> Optional[Tuple[Tuple[int, float], ...]]:
+        """`(token slot, price)` pairs for pricing an event row in place.
+
+        The slot is an absolute index into the event row's token area, so a
+        hot loop can weigh a call without first materializing a token dict.
+        `input_only` prices generated output at zero, which is exactly what
+        `input_side_units` does by dropping "output" from its token dict.
+        """
+        key = (harness, model, cache_read_weight, input_only)
+        vectors = self._vectors
+        if key in vectors:
+            return vectors[key]
+        row = self.price_row(harness, model, cache_read_weight)
+        if row is None:
+            vector = None  # type: Optional[Tuple[Tuple[int, float], ...]]
+        else:
+            kinds = CLAUDE_KINDS if harness == "claude" else CODEX_FIT_KINDS
+            slots = CLAUDE_FIT_SLOTS if harness == "claude" else CODEX_FIT_SLOTS
+            vector = tuple(
+                (slots[index], 0.0 if (input_only and kind == "output") else row[index])
+                for index, kind in enumerate(kinds)
+            )
+        vectors[key] = vector
+        return vector
 
     def guessed_models(self, harness: str, used: Iterable[str]) -> List[str]:
         found = []
@@ -384,25 +466,21 @@ class Weights:
     def claude_units(
         self, model: str, tokens: Mapping[str, int], cache_read_weight: Optional[float]
     ) -> float:
-        entry = self.model_entry("claude", model)
-        if entry is None:
+        prices = self.price_row("claude", model, cache_read_weight)
+        if prices is None:
             return 0.0
-        cache_read_price = claude_price(entry, model, "cache_read")
-        if cache_read_weight is not None:
-            cache_read_price = claude_price(entry, model, "input") * cache_read_weight
         total = 0.0
-        for kind in CLAUDE_KINDS:
-            price = cache_read_price if kind == "cache_read" else claude_price(entry, model, kind)
-            total += tokens.get(kind, 0) / 1_000_000.0 * price
+        for index, kind in enumerate(CLAUDE_KINDS):
+            total += tokens.get(kind, 0) / 1_000_000.0 * prices[index]
         return total
 
     def codex_units(self, model: str, tokens: Mapping[str, int]) -> float:
-        entry = self.model_entry("codex", model)
-        if entry is None:
+        prices = self.price_row("codex", model)
+        if prices is None:
             return 0.0
         total = 0.0
-        for kind in CODEX_FIT_KINDS:
-            total += tokens.get(kind, 0) / 1_000_000.0 * float(entry.get(kind, 0.0))
+        for index, kind in enumerate(CODEX_FIT_KINDS):
+            total += tokens.get(kind, 0) / 1_000_000.0 * prices[index]
         return total
 
 
@@ -789,9 +867,27 @@ EVENT_THREAD = 11
 EVENT_ID = 12
 EVENT_PROMPT = 13
 
+# Absolute token-area indices for the kinds each harness actually prices, in
+# the order its `*_units` method sums them. `Weights.event_vector` pairs these
+# with prices so a hot loop can weigh a row without building a token dict.
+CLAUDE_FIT_SLOTS = tuple(EVENT_KINDS + offset for offset in range(len(CLAUDE_KINDS)))
+CODEX_FIT_SLOTS = tuple(EVENT_KINDS + CODEX_KINDS.index(kind) for kind in CODEX_FIT_KINDS)
+
 
 def event_tokens(event: Sequence[Any], kinds: Sequence[str]) -> Dict[str, int]:
     return dict((kind, int(event[EVENT_KINDS + offset])) for offset, kind in enumerate(kinds))
+
+
+def vector_units(vector: Sequence[Tuple[int, float]], event: Sequence[Any]) -> float:
+    """Weighted units for one event row, summed in the harness' kind order.
+
+    Arithmetic is term-for-term what `Weights.claude_units`/`codex_units` do
+    on the equivalent token dict, so results stay bit-identical.
+    """
+    total = 0.0
+    for slot, price in vector:
+        total += int(event[slot]) / 1_000_000.0 * price
+    return total
 
 
 def event_context(event: Sequence[Any], harness: str) -> int:
@@ -1530,24 +1626,30 @@ def absorb(scan: Scan, entry: FileIndex, harness: str, account: str, account_lab
         scan.session_accounts[key] = (account, account_label)
     claimed = scan.claimed
     kept = scan.events[harness]
+    stamp = (account, account_label)
+    session_accounts = scan.session_accounts
+    stamped_sessions = set()  # type: set
     for row in entry.events:
         # Every event's session gets an account stamp here too, not only the
         # ones with a `SessionSummary` above: `attribute()` treats a session
         # missing from `session_accounts` as "any pool" (fail-open), so a
         # session known only through its events - never seen in
         # `entry.sessions` - must never be credited to every account's pool.
-        scan.session_accounts.setdefault((harness, row[EVENT_SESSION]), (account, account_label))
+        row_session = row[EVENT_SESSION]
+        if row_session not in stamped_sessions:
+            stamped_sessions.add(row_session)
+            session_accounts.setdefault((harness, row_session), stamp)
         call_id = (harness, row[EVENT_ID]) if row[EVENT_ID] else None
         if call_id is not None:
             owner = claimed.get(call_id)
             if owner is not None:
                 # Same API call seen again: a resumed or forked transcript
                 # replaying it. Count it once, against whoever recorded it first.
-                if owner != row[EVENT_SESSION]:
-                    forks = scan.forks.setdefault((harness, row[EVENT_SESSION]), {})
+                if owner != row_session:
+                    forks = scan.forks.setdefault((harness, row_session), {})
                     forks[owner] = forks.get(owner, 0) + 1
                 continue
-            claimed[call_id] = row[EVENT_SESSION]
+            claimed[call_id] = row_session
         kept.append(row)
     for row in entry.snapshots:
         stamped_row = dict(row)
@@ -1589,24 +1691,34 @@ def rebuild_totals(scan: Scan, cancellation: Cancellation = None) -> None:
         summary.sub_models = {}
         summary.requests = 0
         summary.sub_requests = 0
+    sessions = scan.sessions
+    watch = cancellation is not None
     for harness, events in scan.events.items():
         check_cancelled(cancellation)
         kinds = CLAUDE_KINDS if harness == "claude" else CODEX_KINDS
+        kind_slots = tuple(enumerate(kinds, start=EVENT_KINDS))
         for row in events:
-            check_cancelled(cancellation)
-            summary = scan.sessions.get((harness, row[EVENT_SESSION]))
+            if watch:
+                check_cancelled(cancellation)
+            summary = sessions.get((harness, row[EVENT_SESSION]))
             if summary is None:
                 continue
-            tokens = event_tokens(row, kinds)
+            model = row[EVENT_MODEL]
             bucket = summary.sub_models if row[EVENT_SUB] else summary.models
-            slot = bucket.setdefault(row[EVENT_MODEL], empty_tokens(kinds))
-            for kind in kinds:
-                slot[kind] += tokens[kind]
+            slot = bucket.get(model)
+            if slot is None:
+                slot = empty_tokens(kinds)
+                bucket[model] = slot
+            for index, kind in kind_slots:
+                slot[kind] += int(row[index])
             if row[EVENT_SUB]:
                 summary.sub_requests += 1
-                rollup = summary.models.setdefault(row[EVENT_MODEL], empty_tokens(kinds))
-                for kind in kinds:
-                    rollup[kind] += tokens[kind]
+                rollup = summary.models.get(model)
+                if rollup is None:
+                    rollup = empty_tokens(kinds)
+                    summary.models[model] = rollup
+                for index, kind in kind_slots:
+                    rollup[kind] += int(row[index])
             else:
                 summary.requests += 1
     for (harness, session_id), forks in scan.forks.items():
@@ -1732,13 +1844,20 @@ def snapshot_windows(
     never be read as one timeline rolling over (#9).
     """
     grouped = {}  # type: Dict[Tuple[str, str, str, Any], List[Mapping[str, Any]]]
+    watch = cancellation is not None
     for row in snapshots:
-        check_cancelled(cancellation)
+        if watch:
+            check_cancelled(cancellation)
         key = (row.get("account") or "default", row.get("limit_id") or "codex",
                row.get("plan_type") or "unknown", row.get("window_minutes"))
-        grouped.setdefault(key, []).append(row)
+        rows = grouped.get(key)
+        if rows is None:
+            grouped[key] = [row]
+        else:
+            rows.append(row)
     for rows in grouped.values():
-        check_cancelled(cancellation)
+        if watch:
+            check_cancelled(cancellation)
         rows.sort(key=lambda item: item["ts"])
     return grouped
 
@@ -1798,6 +1917,7 @@ def build_intervals(
     cancellation: Cancellation = None,
 ) -> List[Interval]:
     intervals = []
+    watch = cancellation is not None
     groups = snapshot_windows(snapshots, cancellation)
     for key, rows in groups.items():
         check_cancelled(cancellation)
@@ -1807,7 +1927,8 @@ def build_intervals(
         running = 0.0
         anchor_ts = None  # type: Optional[float]
         for row in rows:
-            check_cancelled(cancellation)
+            if watch:
+                check_cancelled(cancellation)
             bucket = resets_bucket(row.get("resets_at"))
             used = row["used_percent"]
             if (
@@ -1930,6 +2051,14 @@ def attribute(
         return
     stamps = [event[EVENT_TS] for event in ordered]
     computed = {}  # type: Dict[int, Dict[str, Any]]
+    # One price vector and one set of feature keys per model, resolved once
+    # for the whole call: a corpus has a handful of Codex models and millions
+    # of calls. Memoizing per *event* was tried and lost - the table costs
+    # more in allocation than re-pricing a row costs in arithmetic.
+    per_model = {}  # type: Dict[str, Tuple[Any, Tuple[Tuple[str, str], ...]]]
+    cache_read_weight = args.claude_cache_read_weight
+    multiplier = args.long_context_multiplier
+    watch = cancellation is not None
     for interval in intervals:
         check_cancelled(cancellation)
         low = bisect.bisect_right(stamps, interval.start)
@@ -1939,15 +2068,28 @@ def attribute(
         prompt_shares = {}  # type: Dict[Tuple[str, Any], float]
         prompted_units = {}  # type: Dict[str, float]
         fallback_sessions = set()  # type: set
-        for event in ordered[low:high]:
-            check_cancelled(cancellation)
-            account = session_accounts.get(("codex", event[EVENT_SESSION]))
-            if account is not None and account[0] != interval.account:
+        features = interval.features
+        account_label = interval.account
+        for index in range(low, high):
+            if watch:
+                check_cancelled(cancellation)
+            event = ordered[index]
+            session_id = event[EVENT_SESSION]
+            account = session_accounts.get(("codex", session_id))
+            if account is not None and account[0] != account_label:
                 continue
-            tokens = event_tokens(event, CODEX_KINDS)
-            units = weighted_units(
-                "codex", event[EVENT_MODEL], tokens, weights, args, bool(event[EVENT_LONG])
-            )
+            model = event[EVENT_MODEL]
+            resolved = per_model.get(model)
+            if resolved is None:
+                resolved = (
+                    weights.event_vector("codex", model, cache_read_weight),
+                    tuple((model, kind) for kind in CODEX_FIT_KINDS),
+                )
+                per_model[model] = resolved
+            vector, feature_keys = resolved
+            units = 0.0 if vector is None else vector_units(vector, event)
+            if event[EVENT_LONG]:
+                units *= multiplier
             used_fallback = False
             if units <= 0:
                 # A model with no weight, or one whose fitted coefficient is
@@ -1956,11 +2098,12 @@ def attribute(
                 # scale (tokens * 1e-9) is nowhere near the weighted-unit
                 # scale, so it is exempted from the cap below rather than
                 # capped to near-zero.
-                units = float(sum(tokens.get(kind, 0) for kind in CODEX_FIT_KINDS)) * 1e-9
+                units = float(
+                    sum(int(event[slot]) for slot in CODEX_FIT_SLOTS)
+                ) * 1e-9
                 used_fallback = True
             if units <= 0:
                 continue
-            session_id = event[EVENT_SESSION]
             total += units
             shares[session_id] = shares.get(session_id, 0.0) + units
             if used_fallback:
@@ -1969,10 +2112,10 @@ def attribute(
                 prompt_key = (session_id, event[EVENT_PROMPT])
                 prompt_shares[prompt_key] = prompt_shares.get(prompt_key, 0.0) + units
                 prompted_units[session_id] = prompted_units.get(session_id, 0.0) + units
-            for kind in CODEX_FIT_KINDS:
-                feature = (event[EVENT_MODEL], kind)
-                interval.features[feature] = (
-                    interval.features.get(feature, 0.0) + tokens.get(kind, 0) / 1_000_000.0
+            for offset, feature in enumerate(feature_keys):
+                features[feature] = (
+                    features.get(feature, 0.0)
+                    + int(event[CODEX_FIT_SLOTS[offset]]) / 1_000_000.0
                 )
         computed[id(interval)] = {
             "total": total,
@@ -2277,6 +2420,7 @@ def assemble_prompts(
     when they started, in both harnesses.
     """
     assembled = {}  # type: Dict[Tuple[str, str], List[Prompt]]
+    watch = cancellation is not None
     for harness, events in scan.events.items():
         check_cancelled(cancellation)
         kinds = CLAUDE_KINDS if harness == "claude" else CODEX_KINDS
@@ -2286,7 +2430,8 @@ def assemble_prompts(
             groups = group_rows_by_prompt(rows, bounds, harness)
             prompts = []
             for position, (start_ts, group) in enumerate(groups, start=1):
-                check_cancelled(cancellation)
+                if watch:
+                    check_cancelled(cancellation)
                 prompts.append(
                     build_prompt(harness, session_id, position, start_ts, group, kinds,
                                  weights, args, cancellation)
@@ -2328,36 +2473,56 @@ def build_prompt(
     prompt.start = start_ts
     baseline = 0.0
     seen_main = False
+    # One price vector per model, not per call: `group` is usually dozens of
+    # calls against one or two models, and the vector lets each row be weighed
+    # straight off its token slots instead of through a fresh dict.
+    cache_read_weight = args.claude_cache_read_weight
+    multiplier = args.long_context_multiplier
+    watch = cancellation is not None
+    is_claude = harness == "claude"
+    totals = prompt.tokens
+    kind_slots = tuple(enumerate(kinds, start=EVENT_KINDS))
+    vectors = {}  # type: Dict[str, Tuple[Any, Any]]
     for row in group:
-        check_cancelled(cancellation)
+        if watch:
+            check_cancelled(cancellation)
         if len(row) <= EVENT_PROMPT:
             row.extend([None] * (EVENT_PROMPT + 1 - len(row)))
         row[EVENT_PROMPT] = position
-        tokens = event_tokens(row, kinds)
-        context = event_context(row, harness)
+        model = row[EVENT_MODEL]
+        pair = vectors.get(model)
+        if pair is None:
+            pair = (
+                weights.event_vector(harness, model, cache_read_weight, False),
+                weights.event_vector(harness, model, cache_read_weight, True),
+            )
+            vectors[model] = pair
+        unit_vector, input_vector = pair
+        if is_claude:
+            context = int(row[3]) + int(row[4]) + int(row[5]) + int(row[6])
+        else:
+            context = int(row[3]) + int(row[4])
+        resent = 0.0 if input_vector is None else vector_units(input_vector, row)
         prompt.end = row[EVENT_TS]
         prompt.turns += 1
         if row[EVENT_SUB]:
             prompt.sub_turns += 1
         else:
-            prompt.context_peak = max(prompt.context_peak, context)
+            if context > prompt.context_peak:
+                prompt.context_peak = context
             if not seen_main:
                 prompt.context_start = context
-                prompt.model = row[EVENT_MODEL]
-                baseline = input_side_units(
-                    harness, row[EVENT_MODEL], tokens, weights,
-                    args.claude_cache_read_weight
-                )
+                prompt.model = model
+                baseline = resent
                 seen_main = True
-        for kind in kinds:
-            prompt.tokens[kind] += tokens[kind]
+        for slot, kind in kind_slots:
+            totals[kind] += int(row[slot])
         prompt.input_tokens += context
-        prompt.units += weighted_units(
-            harness, row[EVENT_MODEL], tokens, weights, args, bool(row[EVENT_LONG])
-        )
-        prompt.resent_units += input_side_units(
-            harness, row[EVENT_MODEL], tokens, weights, args.claude_cache_read_weight
-        )
+        units = 0.0 if unit_vector is None else vector_units(unit_vector, row)
+        if row[EVENT_LONG]:
+            units *= multiplier
+        prompt.units += units
+        prompt.resent_units += resent
     prompt.resent_units = max(0.0, prompt.resent_units - baseline)
     if prompt.start is None:
         prompt.start = group[0][EVENT_TS] if group else None
@@ -2527,11 +2692,19 @@ def group_events_by_session(
     events: Sequence[Sequence[Any]], cancellation: Cancellation = None
 ) -> Dict[str, List[Sequence[Any]]]:
     grouped = {}  # type: Dict[str, List[Sequence[Any]]]
+    watch = cancellation is not None
     for row in events:
-        check_cancelled(cancellation)
-        grouped.setdefault(row[EVENT_SESSION], []).append(row)
+        if watch:
+            check_cancelled(cancellation)
+        session = row[EVENT_SESSION]
+        rows = grouped.get(session)
+        if rows is None:
+            grouped[session] = [row]
+        else:
+            rows.append(row)
     for rows in grouped.values():
-        check_cancelled(cancellation)
+        if watch:
+            check_cancelled(cancellation)
         rows.sort(key=lambda row: row[EVENT_TS])
     return grouped
 
@@ -2863,14 +3036,17 @@ def session_rows(
     long_context = {}  # type: Dict[Tuple[str, str, str], Dict[str, int]]
     for harness, events in scan.events.items():
         kinds = CLAUDE_KINDS if harness == "claude" else CODEX_KINDS
+        kind_slots = tuple(enumerate(kinds, start=EVENT_KINDS))
         for event in events:
             if not event[EVENT_LONG]:
                 continue
-            slot = long_context.setdefault(
-                (harness, event[EVENT_SESSION], event[EVENT_MODEL]), empty_tokens(kinds)
-            )
-            for kind, value in event_tokens(event, kinds).items():
-                slot[kind] += value
+            key = (harness, event[EVENT_SESSION], event[EVENT_MODEL])
+            slot = long_context.get(key)
+            if slot is None:
+                slot = empty_tokens(kinds)
+                long_context[key] = slot
+            for index, kind in kind_slots:
+                slot[kind] += int(event[index])
     rows = []
     for (harness, session_id), summary in scan.sessions.items():
         if summary.end is None:
@@ -3504,6 +3680,7 @@ def prepare(
 
 def apply_prompt_drain(analysis: Analysis, cancellation: Cancellation = None) -> None:
     shares = {}  # type: Dict[Tuple[str, Any], float]
+    watch = cancellation is not None
     for interval in analysis.intervals:
         check_cancelled(cancellation)
         for key, value in interval.prompts.items():
@@ -3513,7 +3690,8 @@ def apply_prompt_drain(analysis: Analysis, cancellation: Cancellation = None) ->
         if harness != "codex":
             continue
         for prompt in prompts:
-            check_cancelled(cancellation)
+            if watch:
+                check_cancelled(cancellation)
             value = shares.get((session_id, prompt.index))
             if value is not None:
                 prompt.drain_percent = value
