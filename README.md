@@ -34,6 +34,30 @@ nenpi prompts --session 0123abcd
 nenpi-bench plan --models claude-haiku-4-5 --contexts 10k,60k --cache cold,warm
 ```
 
+## Configuration
+
+With no flags and no config file, nenpi looks at one root per harness:
+`~/.claude` (or `$CLAUDE_CONFIG_DIR`) and `~/.codex` (or `$CODEX_HOME`). Extra
+roots — a second Claude or Codex account, for instance — go in
+`~/.config/nenpi/config.toml`:
+
+```toml
+[claude]
+roots = ["~/.claude", "~/.claude-arcade"]
+
+[codex]
+roots = ["~/.codex", "~/.codex-arcade"]
+```
+
+`--claude-root`/`--codex-root` flags override this file for one invocation.
+Run `nenpi config` to see which roots are resolved and what account each one
+authenticates as, or `nenpi config --init` to write a starter file seeded
+from every `~/.claude*`/`~/.codex*` directory found on this host. See
+[Roots and config.toml](docs/drain.md#roots-and-configtoml) for precedence
+details and the breaking changes from earlier versions (the implicit
+`~/.claude*`/`~/.codex*` glob is gone, and `--claude-root`/`--codex-root` now
+take the harness home dir rather than its `projects`/`sessions` subdirectory).
+
 ## Docs
 
 - [docs/drain.md](docs/drain.md) — subcommands, the Codex-measured vs.

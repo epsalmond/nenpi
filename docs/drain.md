@@ -41,11 +41,15 @@ nenpi windows     [--harness codex]
 nenpi calibrate   [--harness codex|claude] [--since ...]
 nenpi verify      [--since ...]
 nenpi snapshot    [--stdin | --oauth [--config-dir PATH] | --compact]
+nenpi config      [--claude-root PATH] [--codex-root PATH] [--json]
+nenpi config      --init [--force]
 ```
 
 Common flags on every reporting subcommand: `--claude-root PATH` and
-`--codex-root PATH` (both repeatable) add transcript roots,
-`--claude-cache-read-weight FLOAT` overrides the disputed cache-read price,
+`--codex-root PATH` (both repeatable) *replace* the resolved roots for that
+harness — see [Roots and config.toml](#roots-and-configtoml) for how they are
+resolved when omitted. `--claude-cache-read-weight FLOAT` overrides the
+disputed cache-read price,
 `--long-context-multiplier FLOAT` scales requests over 200K tokens (a no-op at
 its default of 1.0), `--use-calibrated` prefers a stored fit,
 `--whole-session` reports each selected session's whole life rather than the
@@ -154,7 +158,7 @@ Claude has no rate card for and does not require. Otherwise it is stored with
 `--use-calibrated`.
 
 `--harness codex` writes the fit to
-`~/.local/state/quota-drain/codex-weights.json`; `--use-calibrated` then
+`~/.local/state/nenpi/codex-weights.json`; `--use-calibrated` then
 prefers it. `--harness claude` needs sampled snapshots and reports the
 measured cache-read rate beside the uncached-input rate, so the disputed 0.1x
 list ratio can be tested against observation.
@@ -339,10 +343,69 @@ hits) with the uncached rate printed as an upper bound.
 fork would make this exact.** It should carry `kind`, `before`, `after`,
 `timestamp`, and `turn_id`.
 
+## Roots and config.toml
+
+A **root** is a harness home dir: `~/.claude`, `~/.codex`, or a differently
+named one such as `~/.claude-arcade`. It holds the transcripts (`projects/`
+for Claude, `sessions/` for Codex) and the credentials (`.claude.json` /
+`.credentials.json` for Claude, `auth.json` for Codex).
+
+Roots are resolved per harness, in this order, and each source *replaces*
+rather than adds to the ones after it:
+
+1. `--claude-root PATH` / `--codex-root PATH` (repeatable). A path ending in
+   `projects` or `sessions` is still accepted, with the leaf stripped and a
+   deprecation warning — before this change the flags took that leaf path,
+   not the home dir.
+2. `[claude].roots` / `[codex].roots` in `config.toml` (below).
+3. Defaults: `[$CLAUDE_CONFIG_DIR, ~/.claude]` for Claude,
+   `[$CODEX_HOME, ~/.codex]` for Codex, with the environment variable first.
+
+At every step, missing directories are dropped silently and the list is
+deduplicated; a harness that resolves to zero roots gets one warning. There is
+no implicit `~/.claude*` / `~/.codex*` glob any more — a root that is not the
+default location has to be named, in a flag or in `config.toml`.
+
+`config.toml` lives at `~/.config/nenpi/config.toml` (`NENPI_CONFIG_FILE`
+overrides the path):
+
+```toml
+[claude]
+roots = ["~/.claude", "~/.claude-arcade"]
+
+[codex]
+roots = ["~/.codex", "~/.codex-arcade"]
+
+[plan]            # optional, display only
+claude = "max_20x"
+codex = "pro"
+```
+
+A missing file falls back to the defaults above. A malformed file is a hard
+error naming the file and the parse problem; an unknown key is a warning, not
+an error. `[plan]` is cosmetic — it never overrides a measured tier or the
+`plan_type` snapshots are grouped by; use it to label the header when nothing
+has been sampled yet.
+
+`nenpi config` prints the config file in use (or that none was found) and,
+for every resolved root, its harness, path, whether it exists, and the
+account it authenticates as: a label (the root's basename) and a key (Codex:
+`auth.json`'s `tokens.account_id`; Claude: `.claude.json`'s
+`oauthAccount.organizationUuid`, falling back to `accountUuid`, then to the
+label). Tokens are never read or printed. `nenpi config --init` writes a
+starter `config.toml`, seeded with every root the old glob would have found
+on this host (refuses to overwrite an existing file without `--force`).
+
+**Breaking change:** with defaults narrowed to one location per harness, a
+host that relied on the old glob picking up e.g. `~/.codex-arcade` or
+`~/.claude-work` needs those roots added to `config.toml` (or run
+`nenpi config --init` once, before upgrading further) — otherwise they drop
+out of every report silently.
+
 ## Snapshots
 
 `nenpi snapshot` logs Claude quota observations to
-`~/.local/state/quota-drain/snapshots.jsonl`. Three sources:
+`~/.local/state/nenpi/snapshots.jsonl`. Three sources:
 
 ### `--oauth` (recommended)
 
@@ -355,8 +418,9 @@ using the CLI.
 nenpi snapshot --oauth [--config-dir ~/.claude]
 ```
 
-`--config-dir` is repeatable; with none given, every `~/.claude*` directory
-holding a `.credentials.json` with a `claudeAiOauth` block is sampled. **On
+`--config-dir` is repeatable; with none given, every resolved Claude root
+(see [Roots and config.toml](#roots-and-configtoml)) holding a
+`.credentials.json` with a `claudeAiOauth` block is sampled. **On
 macOS the CLI keeps these credentials in the login Keychain instead of on
 disk**, so `--oauth` finds nothing there and says so; reading the Keychain is
 deliberately not implemented. The
@@ -368,7 +432,7 @@ Guards: one attempt per invocation, a 15 s timeout, a minimum of 60 s between
 calls per config dir, a 10-minute backoff after an HTTP 429, and a private
 opener that refuses redirects — urllib would otherwise forward the bearer
 token to whatever host answered. Poll state
-lives in `~/.local/state/quota-drain/oauth-poll.json` and holds timestamps
+lives in `~/.local/state/nenpi/oauth-poll.json` and holds timestamps
 only.
 
 Stored per observation: `utilization` and `resets_at` for `five_hour`,
@@ -429,14 +493,15 @@ range.
 
 ### no flag
 
-Reads `cachedUsageUtilization` from every `~/.claude*/.claude.json` and appends
-when `fetchedAtMs` is newer than the last logged value for that config dir.
+Reads `cachedUsageUtilization` from every resolved Claude root's
+`.claude.json` and appends when `fetchedAtMs` is newer than the last logged
+value for that root.
 `accountUuid` is never stored. This source is stale by design — it is whatever
 the CLI last cached.
 
 ## Weights
 
-`~/.config/quota-drain/weights.json` overrides any built-in weight, per model,
+`~/.config/nenpi/weights.json` overrides any built-in weight, per model,
 merged over the defaults:
 
 ```json
@@ -479,7 +544,7 @@ unrecognised is left unweighted.
 ## Performance and state
 
 Roughly 10 GB of rollouts. Files stream line by line with a byte-offset cache
-of one JSON shard per transcript under `~/.cache/quota-drain/`, keyed by path
+of one JSON shard per transcript under `~/.cache/nenpi/`, keyed by path
 with `size`, `mtime` and `offset`. Each shard also stores a hash of the file's
 first 4 KiB and of the 256 bytes before the resume offset: size and mtime
 alone miss an in-place rewrite that happens to grow the file, which would
@@ -514,11 +579,17 @@ Only the structural fields are read: `type`, `message.usage`, `message.id`,
 printed. Claude user lines carrying tool results are screened out on the raw
 bytes before `json.loads` ever sees them.
 
-State lives in `~/.local/state/quota-drain/` (`snapshots.jsonl`,
+State lives in `~/.local/state/nenpi/` (`snapshots.jsonl`,
 `codex-weights.json`, `oauth-poll.json`), config in
-`~/.config/quota-drain/weights.json`, cache in `~/.cache/quota-drain/`. The
-`QUOTA_DRAIN_HOME_DIR`, `QUOTA_DRAIN_CACHE_DIR`, `QUOTA_DRAIN_STATE_DIR` and
-`QUOTA_DRAIN_CONFIG_DIR` environment variables relocate all four for tests.
+`~/.config/nenpi/` (`weights.json`, `config.toml`), cache in
+`~/.cache/nenpi/`. The `NENPI_HOME_DIR`, `NENPI_CACHE_DIR`,
+`NENPI_STATE_DIR` and `NENPI_CONFIG_DIR` environment variables relocate all
+four for tests; `NENPI_CONFIG_FILE` relocates `config.toml` on its own. The
+old `~/.cache/quota-drain` (and the matching state/config dirs) and
+`QUOTA_DRAIN_*` names still work for one release: on first run, an old
+default dir is moved to its new name if the new one does not already exist,
+and each `QUOTA_DRAIN_*` variable still honoured prints one deprecation
+warning.
 
 ## What is known
 
