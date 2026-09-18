@@ -410,6 +410,11 @@ host that relied on the old glob picking up e.g. `~/.codex-arcade` or
 `nenpi config --init` once, before upgrading further) — otherwise they drop
 out of every report silently.
 
+Per-account Claude statusline snapshots (`nenpi snapshot --stdin`, wired into
+the statusline command) need `$CLAUDE_CONFIG_DIR` set in the statusline's own
+environment, not just the shell that launches Claude — otherwise every
+account's statusline reads and dedups as the default root.
+
 ## Snapshots
 
 `nenpi snapshot` logs Claude quota observations to
