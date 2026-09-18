@@ -6,7 +6,7 @@ API dollars. Codex quota is measured directly from the `rate_limits`
 snapshots the CLI writes into its own rollouts; Claude writes no quota data at
 all, so Claude sessions are modelled at API list price and, when live
 utilisation has been sampled, reported against the actual plan window. It is
-standalone: Python standard library only, Python 3.9 or newer, Linux and
+standalone: Python standard library only, Python 3.11 or newer, Linux and
 macOS.
 
 `nenpi-bench` measures what one percent of a Claude plan window actually

@@ -11,8 +11,9 @@ Every percent this spends is real quota: `run` refuses to start without
 token are never printed, logged or stored; token handling stays inside
 nenpi-bench, which owns the credential read.
 
-Test path overrides use the same ``QUOTA_DRAIN_*`` environment variables
-nenpi reads: ``HOME_DIR``, ``CACHE_DIR``, ``STATE_DIR``, ``CONFIG_DIR``.
+Test path overrides use the same ``NENPI_*`` environment variables nenpi
+reads: ``HOME_DIR``, ``CACHE_DIR``, ``STATE_DIR``, ``CONFIG_DIR`` (the old
+``QUOTA_DRAIN_*`` names still work, with a deprecation warning).
 """
 
 from __future__ import annotations

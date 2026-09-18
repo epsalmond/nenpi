@@ -14,7 +14,7 @@ written where `nenpi` keeps its calibration.
 
 It is standalone apart from `nenpi.drain`, which it imports for the
 snapshot format and the NNLS solver and runs as a subprocess to sample. Python
-standard library only, Python 3.9 or newer, Linux and macOS.
+standard library only, Python 3.11 or newer, Linux and macOS.
 
 **Every percent it spends is real quota.** `run` prints the projection, refuses
 to start without `--yes`, and aborts at `--max-percent`.
@@ -311,7 +311,7 @@ spending a run.
 ## Verification
 
 ```sh
-uv run --python 3.9 python -m unittest discover -s tests -v  # 3.9 floor, no quota spent
+uv run --python 3.11 python -m unittest discover -s tests -v  # 3.11 floor, no quota spent
 uv run --python 3.13 python -m unittest discover -s tests -v
 ```
 

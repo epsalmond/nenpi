@@ -8,7 +8,7 @@ read-when: Attributing subscription-plan quota to agent sessions, tuning nenpi w
 
 `nenpi` reads Claude Code and Codex CLI transcripts on disk and
 reports which sessions drained how much **subscription-plan quota** — not API
-dollars. It is standalone: Python standard library only, Python 3.9 or newer,
+dollars. It is standalone: Python standard library only, Python 3.11 or newer,
 Linux and macOS.
 
 Two harnesses, two very different evidence bases:
@@ -584,7 +584,7 @@ wants:
 ## Verification
 
 ```sh
-uv run --python 3.9 python -m unittest discover -s tests -v  # 3.9 floor
+uv run --python 3.11 python -m unittest discover -s tests -v  # 3.11 floor
 uv run --python 3.13 python -m unittest discover -s tests -v
 ```
 
