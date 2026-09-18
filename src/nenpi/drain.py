@@ -6,8 +6,10 @@ modelled as API list-price dollars and reported as a share of the observed
 total; see docs/drain.md for what is official, community-sourced, and
 unknown.
 
-Test path overrides use the ``QUOTA_DRAIN_*`` environment variables:
-``HOME_DIR``, ``CACHE_DIR``, ``STATE_DIR``, and ``CONFIG_DIR``.
+Test path overrides use the ``NENPI_*`` environment variables: ``HOME_DIR``,
+``CACHE_DIR``, ``STATE_DIR``, ``CONFIG_DIR``, and ``CONFIG_FILE`` (the old
+``QUOTA_DRAIN_*`` names still work, with a deprecation warning). See
+nenpi.config for root resolution and config.toml.
 """
 
 from __future__ import annotations
@@ -2995,8 +2997,8 @@ def command_timeline(args: argparse.Namespace) -> int:
 
 def command_windows(args: argparse.Namespace) -> int:
     analysis = prepare(args)
-    scan, weights = analysis.scan, analysis.weights
-    since, until = analysis.since, analysis.until
+    scan = analysis.scan
+    since = analysis.since
     window, intervals = analysis.window, analysis.intervals
     windows = {}  # type: Dict[Tuple[Any, Any], Dict[str, Any]]
     for row in scan.snapshots:
@@ -3076,11 +3078,10 @@ def command_calibrate(args: argparse.Namespace) -> int:
         # Fitting is per harness; scanning the other one buys nothing.
         args.harness = "codex"
     analysis = prepare(args)
-    scan, weights = analysis.scan, analysis.weights
-    since, until = analysis.since, analysis.until
+    weights = analysis.weights
     if args.harness == "claude":
         return calibrate_claude(args, analysis)
-    window, intervals = analysis.window, analysis.intervals
+    intervals = analysis.intervals
     usable = [interval for interval in intervals if not interval.rollover and interval.features]
     fit = fit_percent_weights(
         usable, args.calibrate_bucket_hours, weights.table.get("codex")
@@ -3401,7 +3402,6 @@ def command_prompts(args: argparse.Namespace) -> int:
     )
     for prompt in shown:
         cached = prompt.tokens.get("cache_read", 0) + prompt.tokens.get("cached_input", 0)
-        uncached = max(0, prompt.input_tokens - cached)
         total_cells = int(round(prompt.input_tokens / peak_input * bar_width)) if peak_input else 0
         cached_cells = int(round(total_cells * cached / prompt.input_tokens)) if prompt.input_tokens else 0
         glyphs = paint("█" * (total_cells - cached_cells), harness_style) + paint("▒" * cached_cells, "dim")
@@ -3636,8 +3636,8 @@ def command_reductions(args: argparse.Namespace) -> int:
 
 def command_verify(args: argparse.Namespace) -> int:
     analysis = prepare(args)
-    scan, weights = analysis.scan, analysis.weights
-    since, until = analysis.since, analysis.until
+    scan = analysis.scan
+    since = analysis.since
     report = []
     for (harness, session_id), summary in sorted(scan.sessions.items()):
         if since is not None and (summary.end or 0) < since:
