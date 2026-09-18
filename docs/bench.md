@@ -14,7 +14,7 @@ written where `nenpi` keeps its calibration.
 
 It is standalone apart from `nenpi.drain`, which it imports for the
 snapshot format and the NNLS solver and runs as a subprocess to sample. Python
-standard library only, Python 3.9 or newer, Linux and macOS.
+standard library only, Python 3.11 or newer, Linux and macOS.
 
 **Every percent it spends is real quota.** `run` prints the projection, refuses
 to start without `--yes`, and aborts at `--max-percent`.
@@ -181,11 +181,11 @@ dollars.
 ## State
 
 ```
-~/.local/state/quota-drain/bench/<run-id>/meta.json        run arguments, baseline, budget
-~/.local/state/quota-drain/bench/<run-id>/calls.jsonl      one line per call
-~/.local/state/quota-drain/bench/<run-id>/scenarios.jsonl  one line per scenario, with ticks
-~/.local/state/quota-drain/bench/<run-id>/report.json      estimates and fit
-~/.local/state/quota-drain/claude-weights.json             the fitted weights
+~/.local/state/nenpi/bench/<run-id>/meta.json        run arguments, baseline, budget
+~/.local/state/nenpi/bench/<run-id>/calls.jsonl      one line per call
+~/.local/state/nenpi/bench/<run-id>/scenarios.jsonl  one line per scenario, with ticks
+~/.local/state/nenpi/bench/<run-id>/report.json      estimates and fit
+~/.local/state/nenpi/claude-weights.json             the fitted weights
 ```
 
 A call line holds the scenario key, the requested model, per-model usage,
@@ -235,7 +235,7 @@ record of the run rather than a price table. Only a usable fit is written to
 
 ### Merging a fit into nenpi by hand
 
-Copying the `claude` section into `~/.config/quota-drain/weights.json` mixes
+Copying the `claude` section into `~/.config/nenpi/weights.json` mixes
 two units. The fitted numbers are percent per million tokens; every kind the
 section omits keeps its built-in price, which is USD per million tokens. A
 partial fit merged that way prices some kinds in percent and the rest in
@@ -248,8 +248,8 @@ you care about — `input`, `cache_read`, `cache_write_5m` and `output` — so n
 kind falls back. `nenpi-bench report` names every unidentified kind and its
 reason.
 
-`QUOTA_DRAIN_HOME_DIR`, `QUOTA_DRAIN_CACHE_DIR`, `QUOTA_DRAIN_STATE_DIR` and
-`QUOTA_DRAIN_CONFIG_DIR` relocate all of it, exactly as they do for
+`NENPI_HOME_DIR`, `NENPI_CACHE_DIR`, `NENPI_STATE_DIR` and
+`NENPI_CONFIG_DIR` relocate all of it, exactly as they do for
 nenpi.
 
 ## What the result JSON is read from
@@ -311,7 +311,7 @@ spending a run.
 ## Verification
 
 ```sh
-uv run --python 3.9 python -m unittest discover -s tests -v  # 3.9 floor, no quota spent
+uv run --python 3.11 python -m unittest discover -s tests -v  # 3.11 floor, no quota spent
 uv run --python 3.13 python -m unittest discover -s tests -v
 ```
 

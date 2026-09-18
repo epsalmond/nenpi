@@ -10,6 +10,7 @@ import contextlib
 import io
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -19,6 +20,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+import nenpi.config as QC
 import nenpi.drain as QD
 
 DRAIN_COMMAND = [sys.executable, "-m", "nenpi.drain"]
@@ -278,12 +280,16 @@ class Harness(unittest.TestCase):
         self.claude_projects.mkdir(parents=True)
         self.codex_sessions.mkdir(parents=True)
         self.environment = dict(os.environ)
+        # A host that happens to export these would otherwise change which
+        # root the default resolution picks, out from under the fixture.
+        self.environment.pop("CLAUDE_CONFIG_DIR", None)
+        self.environment.pop("CODEX_HOME", None)
         self.environment.update(
             {
-                "QUOTA_DRAIN_HOME_DIR": str(self.home),
-                "QUOTA_DRAIN_CACHE_DIR": str(self.root / "cache"),
-                "QUOTA_DRAIN_STATE_DIR": str(self.root / "state"),
-                "QUOTA_DRAIN_CONFIG_DIR": str(self.root / "config"),
+                "NENPI_HOME_DIR": str(self.home),
+                "NENPI_CACHE_DIR": str(self.root / "cache"),
+                "NENPI_STATE_DIR": str(self.root / "state"),
+                "NENPI_CONFIG_DIR": str(self.root / "config"),
                 "TZ": "UTC",
             }
         )
@@ -314,11 +320,13 @@ class Harness(unittest.TestCase):
         ~/.claude, ~/.cache and ~/.local/state of whoever runs the tests.
         """
         saved = dict(os.environ)
+        os.environ.pop("CLAUDE_CONFIG_DIR", None)
+        os.environ.pop("CODEX_HOME", None)
         os.environ.update(
             dict(
                 (key, value)
                 for key, value in self.environment.items()
-                if key.startswith("QUOTA_DRAIN_")
+                if key.startswith("NENPI_") or key.startswith("QUOTA_DRAIN_")
             )
         )
         try:
@@ -2297,6 +2305,337 @@ class PromptsBarLegendColor(Harness):
         text = self.render_prompts("--session", "dddd9999")
         self.assertIn(QD.ANSI["claude"] + "█", text)
         self.assertNotIn(QD.ANSI["codex"] + "█", text)
+
+
+class RootsAndConfig(Harness):
+    """`config.toml`, root precedence, `nenpi config`, and the dir rename."""
+
+    def config_path(self) -> Path:
+        return self.root / "config" / "config.toml"
+
+    def write_config(self, text: str) -> Path:
+        path = self.config_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+        return path
+
+    def make_extra_claude_root(self, name: str = ".claude-extra") -> Path:
+        root = self.home / name
+        (root / "projects" / "proj").mkdir(parents=True, exist_ok=True)
+        return root
+
+    def make_extra_codex_root(self, name: str = ".codex-extra") -> Path:
+        root = self.home / name
+        (root / "sessions").mkdir(parents=True, exist_ok=True)
+        return root
+
+    def test_default_roots_scan_only_dot_claude_and_dot_codex(self) -> None:
+        extra = self.make_extra_claude_root()
+        now = time.time() - 600
+        self.write_claude(
+            "default.jsonl",
+            [claude_assistant_line(now, "aaaa0001-1111-2222-3333-444444444444", "msg_d",
+                                   output_tokens=10)],
+        )
+        (extra / "projects" / "proj" / "extra.jsonl").write_text(
+            claude_assistant_line(
+                now, "bbbb0002-1111-2222-3333-444444444444", "msg_e", output_tokens=10
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        payload = self.run_json("sessions", "--harness", "claude", "--json")
+        ids = {row["short_id"] for row in payload["sessions"]}
+        self.assertIn("aaaa0001", ids)
+        self.assertNotIn("bbbb0002", ids)
+
+    def test_config_toml_adds_a_root(self) -> None:
+        extra = self.make_extra_claude_root()
+        now = time.time() - 600
+        (extra / "projects" / "proj" / "extra.jsonl").write_text(
+            claude_assistant_line(
+                now, "bbbb0002-1111-2222-3333-444444444444", "msg_e", output_tokens=10
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        self.write_config(
+            '[claude]\nroots = ["%s", "%s"]\n' % (self.home / ".claude", extra)
+        )
+        payload = self.run_json("sessions", "--harness", "claude", "--json")
+        ids = {row["short_id"] for row in payload["sessions"]}
+        self.assertIn("bbbb0002", ids)
+
+    def test_flags_replace_config_and_defaults(self) -> None:
+        extra = self.make_extra_claude_root()
+        now = time.time() - 600
+        self.write_claude(
+            "default.jsonl",
+            [claude_assistant_line(now, "aaaa0001-1111-2222-3333-444444444444", "msg_d",
+                                   output_tokens=10)],
+        )
+        (extra / "projects" / "proj" / "extra.jsonl").write_text(
+            claude_assistant_line(
+                now, "bbbb0002-1111-2222-3333-444444444444", "msg_e", output_tokens=10
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        self.write_config('[claude]\nroots = ["%s"]\n' % (self.home / ".claude"))
+        payload = self.run_json(
+            "sessions", "--harness", "claude", "--json", "--claude-root", str(extra)
+        )
+        ids = {row["short_id"] for row in payload["sessions"]}
+        self.assertIn("bbbb0002", ids)
+        self.assertNotIn("aaaa0001", ids)
+
+    def test_claude_root_flag_accepts_the_old_projects_leaf(self) -> None:
+        extra = self.make_extra_claude_root()
+        now = time.time() - 600
+        (extra / "projects" / "proj" / "extra.jsonl").write_text(
+            claude_assistant_line(
+                now, "bbbb0002-1111-2222-3333-444444444444", "msg_e", output_tokens=10
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        result = self.run_tool(
+            "sessions", "--harness", "claude", "--claude-root", str(extra / "projects")
+        )
+        self.assertEqual(result.returncode, 0)
+        self.assertIn(b"deprecated", result.stderr)
+        self.assertIn(b"bbbb0002", result.stdout)
+
+    def test_malformed_toml_errors(self) -> None:
+        self.write_config("not [ valid toml")
+        result = self.run_tool("config")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(b"nenpi: config", result.stderr)
+
+    def test_unknown_key_warns_but_does_not_fail(self) -> None:
+        self.write_config('[claude]\nroots = ["%s"]\nbogus = true\n' % (self.home / ".claude"))
+        result = self.run_tool("config")
+        self.assertEqual(result.returncode, 0)
+        self.assertIn(b"unknown key", result.stderr)
+
+    def test_config_command_shows_roots_and_account(self) -> None:
+        (self.home / ".codex" / "auth.json").write_text(
+            json.dumps({"tokens": {"account_id": "acct-codex-123", "access_token": "must-not-print"}}),
+            encoding="utf-8",
+        )
+        payload = self.run_json("config", "--json")
+        codex_rows = [row for row in payload["roots"] if row["harness"] == "codex"]
+        self.assertTrue(codex_rows)
+        self.assertEqual(codex_rows[0]["account_key"], "acct-codex-123")
+        self.assertNotIn("must-not-print", json.dumps(payload))
+
+    def test_config_command_falls_back_to_label_without_auth_json(self) -> None:
+        payload = self.run_json("config", "--json")
+        claude_rows = [row for row in payload["roots"] if row["harness"] == "claude"]
+        self.assertTrue(claude_rows)
+        self.assertEqual(claude_rows[0]["account_label"], ".claude")
+        self.assertEqual(claude_rows[0]["account_key"], ".claude")
+
+    def test_config_init_writes_starter_and_refuses_overwrite(self) -> None:
+        first = self.run_tool("config", "--init")
+        self.assertEqual(first.returncode, 0)
+        text = self.config_path().read_text(encoding="utf-8")
+        self.assertIn("[claude]", text)
+        self.assertIn("[codex]", text)
+        second = self.run_tool("config", "--init")
+        self.assertNotEqual(second.returncode, 0)
+        third = self.run_tool("config", "--init", "--force")
+        self.assertEqual(third.returncode, 0)
+
+    def test_legacy_quota_drain_env_still_honoured(self) -> None:
+        environment = dict(self.environment)
+        for name in ("HOME_DIR", "CACHE_DIR", "STATE_DIR", "CONFIG_DIR"):
+            value = environment.pop("NENPI_" + name)
+            environment["QUOTA_DRAIN_" + name] = value
+        result = subprocess.run(
+            DRAIN_COMMAND + ["config"],
+            check=False,
+            capture_output=True,
+            env=environment,
+            timeout=120,
+        )
+        self.assertEqual(result.returncode, 0)
+        self.assertIn(b"deprecated", result.stderr)
+
+    def test_migration_moves_old_dir_to_new_name(self) -> None:
+        environment = dict(self.environment)
+        environment.pop("NENPI_CACHE_DIR")
+        old_cache = self.home / ".cache" / "quota-drain"
+        old_cache.mkdir(parents=True)
+        (old_cache / "marker.txt").write_text("old", encoding="utf-8")
+        result = subprocess.run(
+            DRAIN_COMMAND + ["config"],
+            check=False,
+            capture_output=True,
+            env=environment,
+            timeout=120,
+        )
+        self.assertEqual(result.returncode, 0)
+        self.assertIn(b"moved", result.stderr)
+        new_cache = self.home / ".cache" / "nenpi"
+        self.assertTrue((new_cache / "marker.txt").is_file())
+        self.assertFalse(old_cache.exists())
+
+    def test_migration_leaves_both_when_new_dir_already_exists(self) -> None:
+        environment = dict(self.environment)
+        environment.pop("NENPI_CACHE_DIR")
+        old_cache = self.home / ".cache" / "quota-drain"
+        old_cache.mkdir(parents=True)
+        (old_cache / "marker.txt").write_text("old", encoding="utf-8")
+        new_cache = self.home / ".cache" / "nenpi"
+        new_cache.mkdir(parents=True)
+        (new_cache / "marker.txt").write_text("new", encoding="utf-8")
+        result = subprocess.run(
+            DRAIN_COMMAND + ["config"],
+            check=False,
+            capture_output=True,
+            env=environment,
+            timeout=120,
+        )
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual((new_cache / "marker.txt").read_text(encoding="utf-8"), "new")
+        self.assertEqual((old_cache / "marker.txt").read_text(encoding="utf-8"), "old")
+
+    def test_resolve_roots_in_process_precedence(self) -> None:
+        """Direct unit check of the precedence rule, independent of the CLI."""
+        with self.env_applied():
+            default_config = QC.Config()
+            claude_default = QC.resolve_roots("claude", [], default_config)
+            self.assertEqual(claude_default, [self.home / ".claude"])
+
+            configured = QC.Config(claude_roots=[str(self.home / ".claude-extra")])
+            (self.home / ".claude-extra").mkdir()
+            claude_configured = QC.resolve_roots("claude", [], configured)
+            self.assertEqual(claude_configured, [self.home / ".claude-extra"])
+
+            flagged = QC.resolve_roots("claude", [str(self.home / ".claude")], configured)
+            self.assertEqual(flagged, [self.home / ".claude"])
+
+    def test_codex_only_harness_emits_no_claude_roots_warning(self) -> None:
+        shutil.rmtree(self.home / ".claude")
+        now = time.time() - 600
+        session = "codex-only-0001"
+        self.write_codex(
+            "rollout-1-aaa.jsonl",
+            [
+                codex_session_meta_line(now, session, "/home/agent/repo"),
+                codex_turn_context_line(now, "gpt-5.6-sol"),
+                codex_usage_record_line(
+                    now + 10, session, input_tokens=1_000, cached_input_tokens=0,
+                    output_tokens=100
+                ),
+            ],
+        )
+        result = self.run_tool("sessions", "--harness", "codex")
+        self.assertEqual(result.returncode, 0, result.stderr.decode("utf-8", "replace"))
+        self.assertNotIn(b"no claude roots found", result.stderr)
+
+    def test_config_command_shows_missing_root(self) -> None:
+        missing = self.home / ".claude-typo"
+        self.write_config('[claude]\nroots = ["%s"]\n' % missing)
+        result = self.run_tool("config")
+        self.assertEqual(result.returncode, 0)
+        self.assertIn(b"exists=no", result.stdout)
+        payload = self.run_json("config", "--json")
+        claude_rows = [row for row in payload["roots"] if row["harness"] == "claude"]
+        self.assertTrue(
+            any(row["path"] == str(missing) and row["exists"] is False for row in claude_rows)
+        )
+
+    def test_plan_config_labels_the_header_when_nothing_measured(self) -> None:
+        self.write_config('[plan]\nclaude = "max_20x"\n')
+        now = time.time() - 600
+        self.write_claude(
+            "s.jsonl",
+            [claude_assistant_line(now, "aaaa0001-1111-2222-3333-444444444444", "msg",
+                                   output_tokens=10)],
+        )
+        result = self.run_tool("sessions", "--harness", "claude")
+        self.assertEqual(result.returncode, 0)
+        self.assertIn(b"claude=max_20x", result.stdout)
+
+    def test_plan_config_never_overrides_a_measured_tier(self) -> None:
+        self.write_config('[plan]\nclaude = "max_20x"\n')
+        (self.home / ".claude" / ".claude.json").write_text(
+            json.dumps({"oauthAccount": {"organizationRateLimitTier": "pro_5x"}}),
+            encoding="utf-8",
+        )
+        now = time.time() - 600
+        self.write_claude(
+            "s.jsonl",
+            [claude_assistant_line(now, "aaaa0001-1111-2222-3333-444444444444", "msg",
+                                   output_tokens=10)],
+        )
+        result = self.run_tool("sessions", "--harness", "claude")
+        self.assertEqual(result.returncode, 0)
+        self.assertIn(b"claude=pro_5x", result.stdout)
+        self.assertNotIn(b"max_20x", result.stdout)
+
+    def test_config_init_escapes_special_characters_in_root_path(self) -> None:
+        tricky = self.home / '.claude-weird"name\\dir'
+        (tricky / "projects").mkdir(parents=True)
+        result = self.run_tool("config", "--init")
+        self.assertEqual(result.returncode, 0, result.stderr.decode("utf-8", "replace"))
+        text = self.config_path().read_text(encoding="utf-8")
+        self.assertIn('\\"', text)
+        self.assertIn('\\\\', text)
+        # A malformed escape would make this an invalid TOML string, or would
+        # not round-trip to the same path; loading it back must recover it.
+        with self.env_applied():
+            loaded = QC.load_config()
+        self.assertIn(str(tricky), loaded.claude_roots)
+
+    def test_config_init_refuses_when_target_is_a_directory(self) -> None:
+        directory_path = self.config_path()
+        directory_path.mkdir(parents=True)
+        result = self.run_tool("config", "--init")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(b"directory", result.stderr)
+
+    def test_discover_candidate_roots_includes_env_var_outside_home(self) -> None:
+        outside = self.root / "outside-codex"
+        (outside / "sessions").mkdir(parents=True)
+        environment = dict(self.environment)
+        environment["CODEX_HOME"] = str(outside)
+        result = subprocess.run(
+            DRAIN_COMMAND + ["config", "--init"],
+            check=False,
+            capture_output=True,
+            env=environment,
+            timeout=120,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr.decode("utf-8", "replace"))
+        text = self.config_path().read_text(encoding="utf-8")
+        self.assertIn(str(outside), text)
+
+    def test_legacy_config_file_env_has_no_fallback(self) -> None:
+        environment = dict(self.environment)
+        legacy_path = self.root / "legacy-config.toml"
+        legacy_path.parent.mkdir(parents=True, exist_ok=True)
+        legacy_path.write_text('[claude]\nroots = ["%s"]\n' % (self.home / ".claude"),
+                               encoding="utf-8")
+        environment["QUOTA_DRAIN_CONFIG_FILE"] = str(legacy_path)
+        result = subprocess.run(
+            DRAIN_COMMAND + ["config"],
+            check=False,
+            capture_output=True,
+            env=environment,
+            timeout=120,
+        )
+        self.assertEqual(result.returncode, 0)
+        self.assertNotIn(b"deprecated", result.stderr)
+        self.assertNotEqual(
+            self.config_path(), legacy_path, "legacy CONFIG_FILE must not relocate config_path"
+        )
+
+    def test_warn_once_registry_is_shared_between_drain_and_config(self) -> None:
+        self.assertIs(QD.warn_once, QC.warn_once)
+        self.assertIs(QD.warn, QC.warn)
 
 
 if __name__ == "__main__":
