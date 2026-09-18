@@ -7,6 +7,7 @@ data and must never be copied into this repository.
 from __future__ import annotations
 
 import contextlib
+import io
 import json
 import os
 import subprocess
@@ -2229,6 +2230,73 @@ class WindowSelection(Harness):
         result = self.run_tool("sessions", "--harness", "codex", "--no-color")
         self.assertEqual(result.returncode, 0)
         self.assertIn(b"none produced a measurable interval", result.stderr)
+
+
+class TtyStringIO(io.StringIO):
+    """Stands in for a real UTF-8 terminal so the painter turns colors on."""
+
+    encoding = "utf-8"
+
+    def isatty(self) -> bool:  # noqa: D102 - stdlib override
+        return True
+
+
+class PromptsBarLegendColor(Harness):
+    """Issue #12: the legend must match the bar cells and the harness color."""
+
+    def render_prompts(self, *arguments: str) -> str:
+        stdout = sys.stdout
+        sys.stdout = TtyStringIO()
+        try:
+            with self.env_applied():
+                QD.main(["prompts", "--width", "120"] + list(arguments))
+            return sys.stdout.getvalue()
+        finally:
+            sys.stdout = stdout
+
+    def test_legend_glyphs_match_bar_glyphs(self) -> None:
+        now = time.time() - 1800
+        session = "cccc9999-aaaa-2222-3333-444444444444"
+        lines = [claude_user_prompt_line(now, session)]
+        lines.append(
+            claude_assistant_line(
+                now + 1, session, "msg_p0", input_tokens=1000, cache_read=500,
+                output_tokens=50
+            )
+        )
+        self.write_claude("legend.jsonl", lines)
+        text = self.render_prompts("--session", "cccc9999")
+
+        legend_line = next(
+            line for line in text.splitlines() if "input tokens sent per prompt" in line
+        )
+        bar_line = next(
+            line for line in text.splitlines() if line.strip().startswith("1 ") and "█" in line
+        )
+
+        legend_filled = QD.ANSI["claude"] + "█" + QD.ANSI["reset"]
+        legend_cached = QD.ANSI["dim"] + "▒" + QD.ANSI["reset"]
+        self.assertIn(legend_filled, legend_line)
+        self.assertIn(legend_cached, legend_line)
+
+        # The legend glyphs must carry the same escape sequence prefix as the
+        # bar's glyphs: same color for the filled cell, "dim" for cached.
+        self.assertIn(QD.ANSI["claude"] + "█", bar_line)
+        self.assertIn(QD.ANSI["dim"] + "▒", bar_line)
+
+    def test_claude_session_uses_claude_color(self) -> None:
+        now = time.time() - 1800
+        session = "dddd9999-aaaa-2222-3333-444444444444"
+        lines = [claude_user_prompt_line(now, session)]
+        lines.append(
+            claude_assistant_line(
+                now + 1, session, "msg_p0", input_tokens=1000, output_tokens=50
+            )
+        )
+        self.write_claude("claude_color.jsonl", lines)
+        text = self.render_prompts("--session", "dddd9999")
+        self.assertIn(QD.ANSI["claude"] + "█", text)
+        self.assertNotIn(QD.ANSI["codex"] + "█", text)
 
 
 if __name__ == "__main__":
