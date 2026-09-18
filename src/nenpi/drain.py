@@ -31,8 +31,18 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, List, Mapping, Optional, Sequence, Tuple
 
+from nenpi.config import (
+    account_for_root,
+    cache_dir,
+    config_dir,
+    config_path,
+    discover_candidate_roots,
+    load_config,
+    migrate_dirs,
+    resolve_roots,
+    state_dir,
+)
 
-PREFIX = "QUOTA_DRAIN_"
 CACHE_SCHEMA = 3
 JSON_SCHEMA = 1
 LONG_CONTEXT_THRESHOLD = 200_000
@@ -127,26 +137,6 @@ ASCII_GLYPHS = {
     "█": "#", "▄": "=", "▀": "-", "▒": ":", "▁": ".",
     "▏": "|", "▎": "|", "▍": "|", "▌": "|", "▋": "|", "▊": "|", "▉": "|",
 }
-
-
-def env_path(name: str, default: Path) -> Path:
-    return Path(os.environ.get(PREFIX + name, str(default))).expanduser()
-
-
-def home_dir() -> Path:
-    return env_path("HOME_DIR", Path.home())
-
-
-def cache_dir() -> Path:
-    return env_path("CACHE_DIR", home_dir() / ".cache" / "quota-drain")
-
-
-def state_dir() -> Path:
-    return env_path("STATE_DIR", home_dir() / ".local" / "state" / "quota-drain")
-
-
-def config_dir() -> Path:
-    return env_path("CONFIG_DIR", home_dir() / ".config" / "quota-drain")
 
 
 # --------------------------------------------------------------------------
@@ -455,25 +445,15 @@ def warn_once(message: str) -> None:
 # transcript discovery
 
 
-def discover_roots(home: Path, kind: str) -> List[Path]:
-    leaf = "projects" if kind == "claude" else "sessions"
-    roots = []
-    try:
-        candidates = sorted(home.glob(".%s*" % kind))
-    except OSError:
-        candidates = []
-    for candidate in candidates:
-        root = candidate / leaf
-        if root.is_dir():
-            roots.append(root)
-    return roots
-
-
-def claude_transcripts(roots: Sequence[Path]) -> Iterator[Path]:
+def claude_transcripts(roots: Sequence[Path]) -> Iterator[Tuple[Path, Path]]:
+    """Yield (transcript path, resolved root) for every root's ``projects`` dir."""
     for root in roots:
-        for path in sorted(root.rglob("*.jsonl")):
+        leaf = root / "projects"
+        if not leaf.is_dir():
+            continue
+        for path in sorted(leaf.rglob("*.jsonl")):
             if path.is_file():
-                yield path
+                yield path, root
 
 
 def codex_day_epoch(path: Path) -> Optional[float]:
@@ -489,9 +469,14 @@ def codex_day_epoch(path: Path) -> Optional[float]:
     return day.timestamp()
 
 
-def codex_transcripts(roots: Sequence[Path], since: Optional[float]) -> Iterator[Path]:
+def codex_transcripts(roots: Sequence[Path], since: Optional[float]
+                      ) -> Iterator[Tuple[Path, Path]]:
+    """Yield (transcript path, resolved root) for every root's ``sessions`` dir."""
     for root in roots:
-        for path in sorted(root.rglob("rollout-*.jsonl")):
+        leaf = root / "sessions"
+        if not leaf.is_dir():
+            continue
+        for path in sorted(leaf.rglob("rollout-*.jsonl")):
             if not path.is_file():
                 continue
             if since is not None:
@@ -500,7 +485,7 @@ def codex_transcripts(roots: Sequence[Path], since: Optional[float]) -> Iterator
                 # day of slack so a session that spans midnight is not pruned.
                 if day is not None and day < since - 86400:
                     continue
-            yield path
+            yield path, root
 
 
 def read_lines_from(path: Path, offset: int) -> Iterator[Tuple[int, bytes]]:
@@ -1317,26 +1302,24 @@ class Scan:
 
 
 def collect(args: argparse.Namespace, since: Optional[float]) -> Scan:
-    home = home_dir()
     harness = args.harness
     cache = Cache(cache_dir(), args.rebuild_cache)
     cache.drop_old_schemas()
+    config = load_config()
 
-    targets = []  # type: List[Tuple[Path, str]]
+    targets = []  # type: List[Tuple[Path, str, Path]]
     if harness in ("claude", "all"):
-        roots = [Path(p).expanduser() for p in (args.claude_root or [])]
-        roots.extend(discover_roots(home, "claude"))
-        for path in claude_transcripts(roots):
-            targets.append((path, "claude"))
+        roots = resolve_roots("claude", args.claude_root, config)
+        for path, root in claude_transcripts(roots):
+            targets.append((path, "claude", root))
     if harness in ("codex", "all"):
-        roots = [Path(p).expanduser() for p in (args.codex_root or [])]
-        roots.extend(discover_roots(home, "codex"))
-        for path in codex_transcripts(roots, since):
-            targets.append((path, "codex"))
+        roots = resolve_roots("codex", args.codex_root, config)
+        for path, root in codex_transcripts(roots, since):
+            targets.append((path, "codex", root))
 
-    stamped = []  # type: List[Tuple[float, str, Path, str, os.stat_result]]
+    stamped = []  # type: List[Tuple[float, str, Path, str, Path, os.stat_result]]
     live = set()
-    for path, kind in targets:
+    for path, kind, root in targets:
         try:
             stat = path.stat()
         except OSError:
@@ -1346,7 +1329,7 @@ def collect(args: argparse.Namespace, since: Optional[float]) -> Scan:
             # A transcript last written before the window cannot hold events
             # inside it, so its shard is never opened.
             continue
-        stamped.append((stat.st_mtime, str(path), path, kind, stat))
+        stamped.append((stat.st_mtime, str(path), path, kind, root, stat))
     # Oldest file first, so the session that recorded an API call originally
     # keeps it and a later fork that replays it is the one that loses.
     stamped.sort(key=lambda item: (item[0], item[1]))
@@ -1355,7 +1338,7 @@ def collect(args: argparse.Namespace, since: Optional[float]) -> Scan:
     scan.files_seen = len(targets)
     progress = Progress(sys.stderr.isatty() and not getattr(args, "no_color", False),
                         len(stamped), "scanning")
-    for _, _, path, kind, stat in stamped:
+    for _, _, path, kind, root, stat in stamped:
         progress.step()
         entry, stale = cache.entry_for(path, kind, stat)
         if stale:
@@ -2588,7 +2571,8 @@ def header_lines(
 ) -> List[str]:
     lines = []
     tiers = []
-    claude_tier = read_claude_tier()
+    claude_roots = resolve_roots("claude", getattr(args, "claude_root", None) or [], load_config())
+    claude_tier = "/".join(sorted(set(read_claude_tier(claude_roots).values())))
     if claude_tier:
         tiers.append("claude=%s" % claude_tier)
     codex_plan = latest_codex_plan(scan.snapshots)
@@ -2646,18 +2630,23 @@ def header_lines(
     return lines
 
 
-def read_claude_tier() -> str:
-    tiers = []
-    for config in sorted(home_dir().glob(".claude*/.claude.json")):
-        payload = read_claude_config(config)
+def read_claude_tier(roots: Sequence[Path]) -> Dict[str, str]:
+    """Map each resolved Claude root's basename to its detected rate-limit tier.
+
+    Callers that only want the old combined string can still do
+    ``"/".join(sorted(set(read_claude_tier(roots).values())))``.
+    """
+    tiers = {}
+    for root in roots:
+        payload = read_claude_config(root / ".claude.json")
         if payload is None:
             continue
         account = payload.get("oauthAccount")
         if isinstance(account, dict):
             tier = account.get("organizationRateLimitTier")
             if isinstance(tier, str) and tier:
-                tiers.append(tier)
-    return "/".join(sorted(set(tiers)))
+                tiers[root.name] = tier
+    return tiers
 
 
 def read_claude_config(path: Path) -> Optional[Dict[str, Any]]:
@@ -3727,8 +3716,11 @@ def detect_claude_version() -> str:
     """
     newest = None
     newest_mtime = 0.0
-    for root in discover_roots(home_dir(), "claude"):
-        for path in root.rglob("*.jsonl"):
+    for root in resolve_roots("claude", [], load_config()):
+        leaf = root / "projects"
+        if not leaf.is_dir():
+            continue
+        for path in leaf.rglob("*.jsonl"):
             try:
                 mtime = path.stat().st_mtime
             except OSError:
@@ -3762,9 +3754,9 @@ def oauth_config_dirs(requested: Sequence[str]) -> List[Path]:
     if requested:
         return [Path(item).expanduser() for item in requested]
     found = []
-    for candidate in sorted(home_dir().glob(".claude*")):
-        if (candidate / ".credentials.json").is_file():
-            found.append(candidate)
+    for root in resolve_roots("claude", [], load_config()):
+        if (root / ".credentials.json").is_file():
+            found.append(root)
     return found
 
 
@@ -4068,8 +4060,8 @@ def compact_snapshots(destination: Path) -> int:
 def snapshot_from_configs(destination: Path) -> int:
     last = last_snapshot_marks(destination)
     written = 0
-    for config in sorted(home_dir().glob(".claude*/.claude.json")):
-        payload = read_claude_config(config)
+    for root in resolve_roots("claude", [], load_config()):
+        payload = read_claude_config(root / ".claude.json")
         if payload is None:
             continue
         cached = payload.get("cachedUsageUtilization")
@@ -4078,7 +4070,7 @@ def snapshot_from_configs(destination: Path) -> int:
         fetched = cached.get("fetchedAtMs")
         if not isinstance(fetched, (int, float)):
             continue
-        label = config.parent.name
+        label = root.name
         if last.get(label) is not None and fetched <= last[label]:
             continue
         utilization = cached.get("utilization")
@@ -4151,8 +4143,12 @@ def add_common(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--harness", choices=("claude", "codex", "all"), default="all")
     parser.add_argument("--since", default=None, metavar="WHEN")
     parser.add_argument("--until", default=None, metavar="WHEN")
-    parser.add_argument("--claude-root", action="append", default=[], metavar="PATH")
-    parser.add_argument("--codex-root", action="append", default=[], metavar="PATH")
+    parser.add_argument("--claude-root", action="append", default=[], metavar="PATH",
+                        help="a Claude home dir (holds .claude.json and projects/); "
+                             "repeatable, replaces config.toml and the defaults")
+    parser.add_argument("--codex-root", action="append", default=[], metavar="PATH",
+                        help="a Codex home dir (holds auth.json and sessions/); "
+                             "repeatable, replaces config.toml and the defaults")
     parser.add_argument("--rebuild-cache", action="store_true")
     parser.add_argument("--json", action="store_true")
     parser.add_argument("--no-color", action="store_true")
@@ -4220,11 +4216,105 @@ def build_parser() -> argparse.ArgumentParser:
     snapshot.add_argument("--config-dir", action="append", default=[], metavar="PATH")
     snapshot.set_defaults(handler=command_snapshot)
 
+    config_cmd = sub.add_parser(
+        "config", help="show the config file and resolved harness roots in use"
+    )
+    config_cmd.add_argument("--claude-root", action="append", default=[], metavar="PATH")
+    config_cmd.add_argument("--codex-root", action="append", default=[], metavar="PATH")
+    config_cmd.add_argument("--init", action="store_true",
+                            help="write a starter config.toml, seeded from every "
+                                 "~/.claude*/~/.codex* dir found on this host")
+    config_cmd.add_argument("--force", action="store_true",
+                            help="with --init, overwrite an existing config.toml")
+    config_cmd.add_argument("--json", action="store_true")
+    config_cmd.set_defaults(handler=command_config)
+
     return parser
+
+
+def command_config(args: argparse.Namespace) -> int:
+    if args.init:
+        return command_config_init(args)
+    path = config_path()
+    config = load_config()
+    rows = []
+    for harness in ("claude", "codex"):
+        flags = args.claude_root if harness == "claude" else args.codex_root
+        for root in resolve_roots(harness, flags, config):
+            label, key = account_for_root(root, harness)
+            rows.append(
+                {
+                    "harness": harness,
+                    "path": str(root),
+                    "exists": root.is_dir(),
+                    "account_label": label,
+                    "account_key": key,
+                }
+            )
+    if args.json:
+        print(
+            json.dumps(
+                {
+                    "schema": JSON_SCHEMA,
+                    "config_path": str(path),
+                    "config_present": path.is_file(),
+                    "roots": rows,
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        return 0
+    if path.is_file():
+        print("config: %s" % path)
+    else:
+        print("config: %s (not present, using defaults)" % path)
+    for row in rows:
+        print(
+            "%-6s %-40s exists=%-3s account=%-16s key=%s"
+            % (
+                row["harness"],
+                row["path"],
+                "yes" if row["exists"] else "no",
+                row["account_label"],
+                row["account_key"],
+            )
+        )
+    return 0
+
+
+def command_config_init(args: argparse.Namespace) -> int:
+    path = config_path()
+    if path.exists() and not args.force:
+        warn("%s already exists; pass --force to overwrite" % path)
+        return 1
+    lines = [
+        "# nenpi config, written by `nenpi config --init`.",
+        "# Precedence: --claude-root/--codex-root flags > this file > defaults.",
+        "",
+    ]
+    for harness in ("claude", "codex"):
+        candidates = discover_candidate_roots(harness)
+        lines.append("[%s]" % harness)
+        lines.append("roots = [")
+        for root in candidates:
+            label, _key = account_for_root(root, harness)
+            lines.append('    "%s",  # %s' % (root, label))
+        lines.append("]")
+        lines.append("")
+    lines.append("# [plan]  # optional, display only")
+    lines.append('# claude = "max_20x"')
+    lines.append('# codex = "pro"')
+    lines.append("")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(lines), encoding="utf-8")
+    print("wrote %s" % path)
+    return 0
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     arguments = list(sys.argv[1:] if argv is None else argv)
+    migrate_dirs()
     # The statusline pipeline calls this thousands of times a day; get the
     # bytes moving before building the full parser.
     if arguments == ["snapshot", "--stdin"]:
