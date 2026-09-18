@@ -1,5 +1,9 @@
 import asyncio
+import contextlib
+import io
+import sys
 import unittest
+from unittest.mock import patch
 
 try:
     import textual  # noqa: F401
@@ -7,6 +11,25 @@ except ImportError:  # pragma: no cover - exercised only without the optional ex
     textual = None
 
 from nenpi.tui import ScanResult, SessionRecord, build_app, normalize_result
+import nenpi.tui as tui
+
+
+class EntryPointHelpTests(unittest.TestCase):
+    def test_web_help_uses_console_arguments_without_starting_server(self):
+        output = io.StringIO()
+        with patch.object(sys, "argv", ["nenpi-web", "--help"]), \
+             patch.object(tui, "serve_browser", side_effect=AssertionError("server started")), \
+             contextlib.redirect_stdout(output):
+            with self.assertRaises(SystemExit) as raised:
+                tui.web_main()
+        self.assertEqual(raised.exception.code, 0)
+        self.assertIn("usage: nenpi-web", output.getvalue())
+
+    def test_web_forwards_host_and_port_to_browser_server(self):
+        with patch.object(tui, "serve_browser", return_value=7) as serve:
+            result = tui.web_main(["--host", "127.0.0.1", "--port", "8123"])
+        self.assertEqual(result, 7)
+        serve.assert_called_once_with("127.0.0.1", 8123)
 
 
 class SessionRecordTests(unittest.TestCase):

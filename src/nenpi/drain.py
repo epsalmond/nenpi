@@ -5008,7 +5008,16 @@ def build_parser() -> argparse.ArgumentParser:
             "  nenpi sessions --since 7d --harness all\n"
             "  nenpi sessions --harness codex --window five_hour --sort tokens --top 10\n"
             "  nenpi prompts --session 0123abcd --since 7d\n"
-            "  nenpi timeline --since 24h --bucket 1h"
+            "  nenpi timeline --since 24h --bucket 1h\n"
+            "\n"
+            "Optional UI:\n"
+            "  python -m pip install 'nenpi[ui]'\n"
+            "  nenpi-ui                         # terminal UI (requires nenpi[ui])\n"
+            "  python -m pip install 'nenpi[browser]'\n"
+            "  nenpi-ui --browser --host 127.0.0.1 --port 8000\n"
+            "  nenpi-web --host 127.0.0.1 --port 8000\n"
+            "  Open http://127.0.0.1:8000/ in your browser.\n"
+            "  HOST and PORT refer to the machine running nenpi."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
