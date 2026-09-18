@@ -121,7 +121,9 @@ corpus-wide. Columns:
   their sizes. A turn with no following call measures nothing, so measured is
   0 there; where other things also grew the context (reasoning, assistant
   output, pasted text) the split charges them to the tools of that turn, so
-  measured reads as an upper bound.
+  measured is an UPPER BOUND - the table says so under its header, and
+  `--json` carries `measured_is_upper_bound`. On a real corpus it runs
+  several times the estimate for that reason.
 - **mean** / **max** — mean and largest single result, in estimated tokens.
 - **share** — measured tokens over the total positive input growth of the
   sessions in scope.
@@ -767,8 +769,13 @@ carrying tool results still bypass the prompt path on the raw-bytes screen;
 they now go through the size-only tool parser instead of being skipped.
 
 Reading those lines costs something: on a 14-day sweep of a real corpus the
-cold parse went from ~24 s to ~32 s and the cache from 34 MB to 43 MB. Warm
-runs are unchanged.
+cold parse went from ~24 s to ~32 s and the cache from 34 MB to 43 MB (a
+later pass trimmed that back to ~24 s: only `"tool_result"` admits a line,
+and a structured result is sized by walking its strings rather than by
+re-serializing it, which under-counts JSON punctuation by a fraction of a
+percent). Warm runs are unchanged. An issued call is forgotten once the next
+user turn starts in that file, so a result can only be named by a call of
+its own turn.
 
 State lives in `~/.local/state/nenpi/` (`snapshots.jsonl`,
 `codex-weights.json`, `oauth-poll.json`), config in

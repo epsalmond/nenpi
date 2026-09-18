@@ -172,7 +172,10 @@ CLAUDE_NOT_A_PROMPT = (b'"toolUseResult"', b'"tool_result"')
 # Tool bookkeeping reads the same lines the prompt screen rejects, but only
 # for the tool's name and the SIZE of its result; no input or output text is
 # kept, hashed, or printed.
-CLAUDE_TOOL_MARKERS = (b'"tool_use"', b'"tool_result"')
+# Only the result marker: an assistant line issuing a tool call already
+# passes the `"usage"` screen, so admitting on `"tool_use"` never let a line
+# through that was otherwise dropped - it only cost a second scan per line.
+CLAUDE_TOOL_MARKERS = (b'"tool_result"',)
 CHARS_PER_TOKEN = 4.0
 # Tools whose call starts a child agent, so the child's usage can be read back
 # against the call that spawned it.
@@ -948,10 +951,16 @@ def content_chars(value: Any) -> int:
         output = value.get("output")
         if isinstance(output, str):
             return len(output)
-        try:
-            return len(json.dumps(value, separators=(",", ":"), default=str))
-        except (TypeError, ValueError):
-            return 0
+        # Everything else is measured by walking its strings rather than by
+        # serializing it: a re-serialized megabyte of structured output costs
+        # more than the parse did. The walk under-counts JSON punctuation and
+        # key quoting by a few percent, which the /4 token estimate absorbs.
+        total = 0
+        for key, part in value.items():
+            if isinstance(key, str):
+                total += len(key)
+            total += content_chars(part)
+        return total
     return len(str(value))
 
 
@@ -971,6 +980,20 @@ def remember_tool(index: "FileIndex", call_id: str, name: str, sidechain: bool) 
     )
     if len(index.pending_tools) > MAX_PENDING_TOOLS:
         del index.pending_tools[: len(index.pending_tools) - MAX_PENDING_TOOLS]
+
+
+def expire_pending_tools(index: "FileIndex") -> None:
+    """Forget issued calls whose result can no longer arrive.
+
+    A user prompt starts a new turn, and a tool result for a call issued
+    before it is never written afterwards - the harness has either recorded
+    the result already or abandoned the call (interrupt, crash, rejected
+    permission). Dropping them there keeps the pending map bounded by one
+    turn's calls instead of decaying through the 512-entry FIFO trim, so a
+    later result cannot be named after a long-abandoned call of the same id.
+    """
+    if index.pending_tools:
+        del index.pending_tools[:]
 
 
 def resolve_tool(index: "FileIndex", call_id: str) -> Tuple[str, int, int]:
@@ -1091,6 +1114,7 @@ def parse_claude_file(
                 if epoch is not None:
                     index.boundaries.append([session_id, epoch])
                     summary.touch(epoch)
+                expire_pending_tools(index)
                 continue
             message = record.get("message")
             if not isinstance(message, dict):
@@ -1356,6 +1380,7 @@ def parse_codex_file(
         if kind == "event_msg" and payload.get("type") == "task_started":
             if epoch is not None and not index.is_subagent:
                 add_boundary(index.boundaries, session_id, epoch)
+            expire_pending_tools(index)
             continue
 
         if kind == "event_msg" and payload.get("type") == "token_count":
@@ -4969,6 +4994,11 @@ def command_tools(args: argparse.Namespace) -> int:
                     "result_chars": sum(call.chars for call in calls),
                     "est_tokens": sum(call.est_tokens for call in calls),
                     "measured_tokens": measured_total,
+                    "measured_is_upper_bound": True,
+                    "measured_note": (
+                        "a turn's whole input growth is split across its tool "
+                        "results, so output and prompt text are charged here too"
+                    ),
                     "context_growth_tokens": growth_total,
                     "tools": [
                         dict(row, share_of_growth=(
@@ -4998,6 +5028,11 @@ def command_tools(args: argparse.Namespace) -> int:
     print("")
     print(paint("%-28s %6s %10s %10s %9s %9s %6s" % (
         "tool", "calls", "est tokens", "measured", "mean", "max", "share"), "bold"))
+    print(paint(
+        "measured is an UPPER BOUND: a turn's whole input growth is split across "
+        "its tool results, so output and prompt text land here too",
+        "dim",
+    ))
     peak = max(row["est_tokens"] for row in shown)
     bar_width = max(8, min(30, width - 90))
     for row in shown:

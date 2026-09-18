@@ -272,6 +272,12 @@ def rate_limits(used_percent: float, resets_at: int, window_minutes: int = 300) 
     }
 
 
+# Distinctive strings planted in tool inputs and results. Nothing the parser
+# writes - shard, JSON, or text table - may ever contain them.
+TOOL_INPUT_SENTINEL = "ZZINPUTSENTINELZZ-rm-rf-secret-path"
+TOOL_RESULT_SENTINEL = "ZZRESULTSENTINELZZ-api-key-abcdef"
+
+
 def claude_tool_use_line(
     epoch: float,
     session_id: str,
@@ -297,7 +303,15 @@ def claude_tool_use_line(
                 "role": "assistant",
                 "model": "claude-opus-5",
                 "content": [
-                    {"type": "tool_use", "id": call_id, "name": name, "input": {}}
+                    {
+                        "type": "tool_use",
+                        "id": call_id,
+                        "name": name,
+                        "input": {
+                            "command": TOOL_INPUT_SENTINEL,
+                            "nested": {"path": TOOL_INPUT_SENTINEL},
+                        },
+                    }
                     for call_id, name in calls
                 ],
                 "usage": {
@@ -348,9 +362,9 @@ def codex_tool_call_line(
     if namespace is not None:
         payload["namespace"] = namespace
     if item == "custom_tool_call":
-        payload["input"] = "synthetic"
+        payload["input"] = TOOL_INPUT_SENTINEL
     else:
-        payload["arguments"] = "{}"
+        payload["arguments"] = json.dumps({"command": TOOL_INPUT_SENTINEL})
     return json.dumps(
         {"type": "response_item", "timestamp": iso(epoch), "payload": payload}
     )
@@ -4588,6 +4602,134 @@ class ToolAttribution(Harness):
         )
         payload = self.run_json("tools", "--harness", "claude", "--json")
         self.assertEqual(payload["tool_calls"], 1)
+
+
+
+    def test_tool_input_and_output_never_leave_the_parser(self) -> None:
+        """Sentinels planted in tool inputs and results must not surface."""
+        session = "64000000-1111-2222-3333-444444444444"
+        codex_session = "65000000-1111-2222-3333-444444444444"
+        now = time.time() - 3600
+        self.write_claude(
+            "sentinel.jsonl",
+            [
+                claude_user_prompt_line(now, session),
+                claude_tool_use_line(
+                    now + 1, session, "msg_1",
+                    [("toolu_a", "Bash"), ("toolu_b", "Read")],
+                    input_tokens=100, cache_read=1000, output_tokens=20,
+                ),
+                claude_tool_output_line(
+                    now + 2, session, "toolu_a",
+                    "head " + TOOL_RESULT_SENTINEL + " tail",
+                ),
+                claude_tool_output_line(
+                    now + 3, session, "toolu_b",
+                    [{"type": "text", "text": TOOL_RESULT_SENTINEL},
+                     {"type": "other", "blob": TOOL_RESULT_SENTINEL}],
+                ),
+                claude_assistant_line(
+                    now + 4, session, "msg_2",
+                    input_tokens=100, cache_read=2200, output_tokens=30,
+                ),
+            ],
+        )
+        self.write_codex(
+            "rollout-sentinel.jsonl",
+            [
+                codex_session_meta_line(now, codex_session, "/home/agent/project"),
+                codex_turn_context_line(now + 1, "gpt-5-codex"),
+                codex_task_started_line(now + 1),
+                codex_tool_call_line(now + 2, "call_s", "exec", item="custom_tool_call"),
+                codex_tool_output_line(
+                    now + 3, "call_s",
+                    [{"type": "text", "text": TOOL_RESULT_SENTINEL}],
+                    item="custom_tool_call_output",
+                ),
+                codex_usage_record_line(
+                    now + 4, codex_session, input_tokens=5000,
+                    cached_input_tokens=1000, output_tokens=50, turn_id="turn-1",
+                ),
+            ],
+            day=now,
+        )
+        outputs = [
+            self.run_tool("tools", "--no-color").stdout,
+            self.run_tool("tools", "--json").stdout,
+            self.run_tool("sessions", "--json").stdout,
+            self.run_tool(
+                "prompts", "--session", "64000000", "--tools", "--no-color"
+            ).stdout,
+            self.run_tool("prompts", "--session", "64000000", "--json").stdout,
+        ]
+        shards = list((self.root / "cache").rglob("*.json"))
+        self.assertTrue(shards)
+        outputs.extend(path.read_bytes() for path in shards)
+        for blob in outputs:
+            text = blob.decode("utf-8", "replace")
+            self.assertNotIn(TOOL_INPUT_SENTINEL, text)
+            self.assertNotIn(TOOL_RESULT_SENTINEL, text)
+        # The sizes still made it through, so the screen is not just dropping
+        # the lines it is supposed to measure.
+        payload = self.run_json("tools", "--json")
+        self.assertEqual(payload["tool_calls"], 3)
+        self.assertGreater(payload["result_chars"], 0)
+
+    def test_structured_result_size_counts_nested_strings(self) -> None:
+        session = "66000000-1111-2222-3333-444444444444"
+        now = time.time() - 3600
+        self.write_claude(
+            "nested.jsonl",
+            [
+                claude_user_prompt_line(now, session),
+                claude_tool_use_line(
+                    now + 1, session, "msg_1", [("toolu_n", "Read")], output_tokens=5
+                ),
+                claude_tool_output_line(
+                    now + 2, session, "toolu_n",
+                    [{"kind": "x" * 10, "rows": ["y" * 20, "z" * 30]}],
+                ),
+            ],
+        )
+        payload = self.run_json("tools", "--harness", "claude", "--json")
+        # keys "kind" (4) + "rows" (4) plus the nested strings 10 + 20 + 30.
+        self.assertEqual(payload["tools"][0]["result_chars"], 68)
+
+    def test_pending_tool_ids_expire_at_the_next_prompt(self) -> None:
+        """A result can never arrive after the next turn has started."""
+        session = "67000000-1111-2222-3333-444444444444"
+        now = time.time() - 3600
+        self.write_claude(
+            "expire.jsonl",
+            [
+                claude_user_prompt_line(now, session),
+                claude_tool_use_line(
+                    now + 1, session, "msg_1", [("toolu_x", "Bash")], output_tokens=5
+                ),
+                # No result: the call was interrupted.
+                claude_user_prompt_line(now + 2, session),
+                claude_tool_use_line(
+                    now + 3, session, "msg_2", [("toolu_x", "Read")], output_tokens=5
+                ),
+                claude_tool_output_line(now + 4, session, "toolu_x", "n" * 80),
+            ],
+        )
+        payload = self.run_json("tools", "--harness", "claude", "--json")
+        # The recycled id resolves to the live call, not the abandoned one.
+        self.assertEqual([row["tool"] for row in payload["tools"]], ["Read"])
+        with self.env_applied():
+            index = QD.parse_claude_file(
+                self.claude_projects / "proj" / "expire.jsonl", QD.FileIndex("claude")
+            )
+        self.assertEqual(index.pending_tools, [])
+
+    def test_text_output_marks_measured_as_an_upper_bound(self) -> None:
+        session = "68000000-1111-2222-3333-444444444444"
+        self.claude_session("bound.jsonl", session)
+        text = self.run_tool("tools", "--no-color").stdout.decode("utf-8")
+        self.assertIn("UPPER BOUND", text)
+        payload = self.run_json("tools", "--json")
+        self.assertTrue(payload["measured_is_upper_bound"])
 
 
 if __name__ == "__main__":
