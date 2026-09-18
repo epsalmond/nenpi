@@ -1,27 +1,69 @@
 # nenpi
 
-## Optional browser
+nenpi (燃費, fuel economy) reads Claude Code and Codex CLI transcripts on disk
+and reports which sessions drained how much **subscription-plan quota** — not
+API dollars. Codex quota is measured directly from the `rate_limits` snapshots
+the CLI writes into its own rollouts; Claude writes no quota data, so Claude
+sessions are modelled at API list price and, when live utilisation has been
+sampled, reported against the actual plan window.
 
-The terminal reports remain stdlib-only. Install the optional UI extra on
-Python 3.11 or newer and launch the local Textual browser:
+Python 3.11 or newer is required. The base reports have no runtime dependency;
+the optional Textual extras add the terminal UI and browser server.
+
+## Install
+
+For the complete CLI, benchmark, terminal UI, and browser server, install the
+browser extra from GitHub:
+
+```
+uv tool install 'nenpi[browser] @ git+https://github.com/epsalmond/nenpi'
+```
+
+From a checkout, use:
+
+```
+uv tool install '.[browser]'
+```
+
+For smaller installations, use the base package for `nenpi` and
+`nenpi-bench`, or add only the terminal UI:
 
 ```sh
-python -m pip install 'nenpi[ui]'
+uv tool install 'nenpi @ git+https://github.com/epsalmond/nenpi'
+uv tool install 'nenpi[ui] @ git+https://github.com/epsalmond/nenpi'
+```
+
+## Commands
+
+`nenpi` prints quota reports. For example:
+
+```sh
+nenpi sessions --harness all --since 7d --top 25
+nenpi prompts --session 0123abcd
+```
+
+`nenpi-bench plan` projects a benchmark without spending quota. A
+`nenpi-bench run` executes controlled `claude -p` calls and **spends real
+subscription quota** while measuring tokens per plan percent; its fitted
+weights are used by `nenpi` for Claude estimates.
+
+```sh
+nenpi-bench plan --models claude-haiku-4-5 --contexts 10k,60k --cache cold,warm
+```
+
+`nenpi-ui` opens the terminal UI and requires `nenpi[ui]`. With the browser
+extra, `nenpi-ui --browser` starts the browser websocket server; `nenpi-web` is
+an alias that always starts browser mode:
+
+```sh
 nenpi-ui
-```
-
-For the browser websocket server, install the browser extra and run:
-
-```sh
-python -m pip install 'nenpi[browser]'
 nenpi-ui --browser --host 127.0.0.1 --port 8000
+nenpi-web --host 127.0.0.1 --port 8000
 ```
 
-`nenpi-web` is an alias for the same browser entry point. The server binds to
-localhost by default and serves the Textual websocket application, not only a
-static page.
-
-The browser discovers Claude and Codex transcript roots under the home
+Open `http://127.0.0.1:8000/` in your browser. `HOST` and `PORT` refer to the
+machine running nenpi, which can differ from the machine displaying the page.
+The browser discovers Claude and Codex transcript roots under that host's home
 directory and persists source choices in `~/.config/nenpi/config.json` (or
 `$NENPI_CONFIG`). Filter the session table with free text or
 `harness:claude`, `project:name`, `since:YYYY-MM-DD`, and
@@ -30,43 +72,9 @@ a worker and cancellation keeps the previous result visible. Date filters
 select sessions active in the range; the displayed session totals remain
 whole-session totals.
 
-The browser is a local view of the same transcript data and uses the same
-`config.toml` root and account resolution as the terminal reports. Account
-labels remain attached to the session payloads used by the browser.
-
-nenpi (燃費, fuel economy) reads Claude Code and Codex CLI transcripts on disk
-and reports which sessions drained how much **subscription-plan quota** — not
-API dollars. Codex quota is measured directly from the `rate_limits`
-snapshots the CLI writes into its own rollouts; Claude writes no quota data at
-all, so Claude sessions are modelled at API list price and, when live
-utilisation has been sampled, reported against the actual plan window. It is
-standalone: Python standard library only, Python 3.11 or newer, Linux and
-macOS.
-
-`nenpi-bench` measures what one percent of a Claude plan window actually
-costs, per token kind, by firing controlled `claude -p` calls and watching
-utilisation tick over. It writes the fitted weight table `nenpi` uses to
-convert Claude token counts into percent.
-
-## Install
-
-```
-uv tool install git+https://github.com/epsalmond/nenpi
-```
-
-or, from a checkout:
-
-```
-uv tool install .
-```
-
-## Example commands
-
-```
-nenpi sessions --harness all --since 7d --top 25
-nenpi prompts --session 0123abcd
-nenpi-bench plan --models claude-haiku-4-5 --contexts 10k,60k --cache cold,warm
-```
+The browser uses the same `config.toml` root and account resolution as the
+terminal reports. Account labels remain attached to the session payloads used
+by the browser.
 
 ## Configuration
 
