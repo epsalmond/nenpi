@@ -46,6 +46,31 @@ from nenpi.config import (
     warn_once,
 )
 
+try:
+    from .scanning import (
+        Cancellation,
+        CancellationToken,
+        ProgressCallback,
+        ScanCancelled,
+        ScanStatus,
+        ScannerRun,
+        check_cancelled,
+        json_progress,
+        serialized_cache,
+    )
+except ImportError:  # bench can load drain.py as a standalone quota module.
+    from nenpi.scanning import (  # type: ignore
+        Cancellation,
+        CancellationToken,
+        ProgressCallback,
+        ScanCancelled,
+        ScanStatus,
+        ScannerRun,
+        check_cancelled,
+        json_progress,
+        serialized_cache,
+    )
+
 CACHE_SCHEMA = 3
 JSON_SCHEMA = 1
 LONG_CONTEXT_THRESHOLD = 200_000
@@ -444,15 +469,35 @@ def calibrated_codex_table(rate_card: Mapping[str, Any], fit: Mapping[str, Any]
 # transcript discovery
 
 
-def claude_transcripts(roots: Sequence[Path]) -> Iterator[Tuple[Path, Path]]:
+def claude_transcripts(
+    roots: Sequence[Path], cancellation: Cancellation = None
+) -> Iterator[Tuple[Path, Path]]:
     """Yield (transcript path, resolved root) for every root's ``projects`` dir."""
     for root in roots:
         leaf = root / "projects"
+        account_root = root
+        if not leaf.is_dir():
+            # Exact UI sources may be the leaf itself or one project below it.
+            leaf = root
+            if root.name == "projects":
+                account_root = root.parent
+            elif root.parent.name == "projects":
+                account_root = root.parent.parent
         if not leaf.is_dir():
             continue
-        for path in sorted(leaf.rglob("*.jsonl")):
-            if path.is_file():
-                yield path, root
+        found = []
+        for directory, directories, filenames in os.walk(str(leaf)):
+            check_cancelled(cancellation)
+            directories.sort()
+            for name in sorted(filenames):
+                check_cancelled(cancellation)
+                if name.endswith(".jsonl"):
+                    path = Path(directory) / name
+                    if path.is_file():
+                        found.append(path)
+        for path in sorted(found):
+            check_cancelled(cancellation)
+            yield path, account_root
 
 
 def codex_day_epoch(path: Path) -> Optional[float]:
@@ -468,31 +513,54 @@ def codex_day_epoch(path: Path) -> Optional[float]:
     return day.timestamp()
 
 
-def codex_transcripts(roots: Sequence[Path], since: Optional[float]
-                      ) -> Iterator[Tuple[Path, Path]]:
+def codex_transcripts(
+    roots: Sequence[Path], since: Optional[float], cancellation: Cancellation = None
+) -> Iterator[Tuple[Path, Path]]:
     """Yield (transcript path, resolved root) for every root's ``sessions`` dir."""
     for root in roots:
         leaf = root / "sessions"
+        account_root = root
+        if not leaf.is_dir():
+            # Exact UI sources may be the leaf itself or one day below it.
+            leaf = root
+            if root.name == "sessions":
+                account_root = root.parent
+            elif root.parent.name in ("sessions", "rollouts"):
+                account_root = root.parent.parent
         if not leaf.is_dir():
             continue
-        for path in sorted(leaf.rglob("rollout-*.jsonl")):
-            if not path.is_file():
-                continue
-            if since is not None:
-                day = codex_day_epoch(path)
-                # A rollout directory is named for the day it opened; allow one
-                # day of slack so a session that spans midnight is not pruned.
-                if day is not None and day < since - 86400:
+        found = []
+        for directory, directories, filenames in os.walk(str(leaf)):
+            check_cancelled(cancellation)
+            directories.sort()
+            for name in sorted(filenames):
+                check_cancelled(cancellation)
+                if not name.startswith("rollout-") or not name.endswith(".jsonl"):
                     continue
+                path = Path(directory) / name
+                if not path.is_file():
+                    continue
+                if since is not None:
+                    day = codex_day_epoch(path)
+                    # A rollout directory is named for the day it opened; allow one
+                    # day of slack so a session that spans midnight is not pruned.
+                    if day is not None and day < since - 86400:
+                        continue
+                found.append(path)
+        for path in sorted(found):
+            check_cancelled(cancellation)
             yield path, root
 
 
-def read_lines_from(path: Path, offset: int) -> Iterator[Tuple[int, bytes]]:
+def read_lines_from(
+    path: Path, offset: int, cancellation: Cancellation = None
+) -> Iterator[Tuple[int, bytes]]:
     """Yield (offset-after-line, raw line) for every complete line from offset."""
     with open(path, "rb") as handle:
         handle.seek(offset)
         position = offset
         for raw in handle:
+            check_cancelled(cancellation)
             if not raw.endswith(b"\n"):
                 # A transcript being appended to right now; stop before the
                 # partial line so the next run re-reads it whole.
@@ -758,12 +826,14 @@ def is_claude_prompt(record: Mapping[str, Any], is_subagent_file: bool) -> bool:
     )
 
 
-def parse_claude_file(path: Path, index: FileIndex) -> FileIndex:
+def parse_claude_file(
+    path: Path, index: FileIndex, cancellation: Cancellation = None
+) -> FileIndex:
     is_subagent_file = "/subagents/" in str(path)
     seen_ids = set(index.carry_ids)
     recent = list(index.carry_ids)
     offset = index.offset
-    for position, raw in read_lines_from(path, index.offset):
+    for position, raw in read_lines_from(path, index.offset, cancellation):
         offset = position
         wants_usage = b'"usage"' in raw or b'"cost-state"' in raw
         wants_prompt = (
@@ -906,13 +976,15 @@ def diff_cumulative(current: Mapping[str, Any], previous: Optional[Mapping[str, 
     return delta
 
 
-def parse_codex_file(path: Path, index: FileIndex) -> FileIndex:
+def parse_codex_file(
+    path: Path, index: FileIndex, cancellation: Cancellation = None
+) -> FileIndex:
     fallback_events = []  # type: List[List[Any]]
     session_id = index.last_session
     model = index.last_model
     cumulative = index.cumulative
     offset = index.offset
-    for position, raw in read_lines_from(path, index.offset):
+    for position, raw in read_lines_from(path, index.offset, cancellation):
         offset = position
         if not any(marker in raw for marker in CODEX_LINE_MARKERS):
             continue
@@ -1202,34 +1274,37 @@ class Cache:
                 return entry, True
         return entry, True
 
-    def drop_old_schemas(self) -> None:
+    def drop_old_schemas(self, cancellation: Cancellation = None) -> None:
         current = "v%d" % CACHE_SCHEMA
-        try:
-            children = list(self.root.iterdir())
-        except OSError:
-            return
-        for child in children:
-            if child.is_dir() and child.name.startswith("v") and child.name != current:
-                shutil.rmtree(str(child), ignore_errors=True)
+        with serialized_cache(self.root, cancellation):
+            try:
+                children = list(self.root.iterdir())
+            except OSError:
+                return
+            for child in children:
+                if child.is_dir() and child.name.startswith("v") and child.name != current:
+                    shutil.rmtree(str(child), ignore_errors=True)
 
-    def prune(self, live: Iterable[str]) -> None:
+    def prune(self, live: Iterable[str], cancellation: Cancellation = None) -> None:
         """Delete shards for transcripts that no longer exist.
 
         Shard names are a pure function of the transcript path, so the live
         set can be compared by name; parsing every shard to read its `path`
         would cost more than the whole scan.
         """
-        root = self.root / ("v%d" % CACHE_SCHEMA)
-        if not root.is_dir():
-            return
-        expected = set(self.shard_path(key).name for key in live)
-        for shard in root.rglob("*.json"):
-            if shard.name in expected:
-                continue
-            try:
-                shard.unlink()
-            except OSError:
-                continue
+        with serialized_cache(self.root, cancellation):
+            root = self.root / ("v%d" % CACHE_SCHEMA)
+            if not root.is_dir():
+                return
+            expected = set(self.shard_path(key).name for key in live)
+            for shard in root.rglob("*.json"):
+                check_cancelled(cancellation)
+                if shard.name in expected:
+                    continue
+                try:
+                    shard.unlink()
+                except OSError:
+                    continue
 
     def mark(self, path: Path) -> None:
         self.dirty.add(str(path))
@@ -1237,7 +1312,7 @@ class Cache:
     def forget(self, path: Path) -> None:
         self.entries.pop(str(path), None)
 
-    def flush(self) -> None:
+    def _flush_unlocked(self) -> None:
         for key in sorted(self.dirty):
             entry = self.entries.get(key)
             if entry is None:
@@ -1246,11 +1321,23 @@ class Cache:
             payload["path"] = key
             destination = self.shard_path(key)
             destination.parent.mkdir(parents=True, exist_ok=True)
-            temporary = destination.with_name(destination.name + ".tmp")
-            with open(temporary, "w", encoding="utf-8") as handle:
-                json.dump(payload, handle, separators=(",", ":"))
-            os.replace(str(temporary), str(destination))
+            temporary = destination.with_name(
+                "%s.%d.%d.tmp" % (destination.name, os.getpid(), time.time_ns())
+            )
+            try:
+                with open(temporary, "w", encoding="utf-8") as handle:
+                    json.dump(payload, handle, separators=(",", ":"))
+                os.replace(str(temporary), str(destination))
+            finally:
+                try:
+                    temporary.unlink()
+                except OSError:
+                    pass
         self.dirty.clear()
+
+    def flush(self) -> None:
+        with serialized_cache(self.root):
+            self._flush_unlocked()
 
 
 class Progress:
@@ -1305,25 +1392,52 @@ class Scan:
         self.bytes_read = 0
 
 
-def collect(args: argparse.Namespace, since: Optional[float]) -> Scan:
+def collect(
+    args: argparse.Namespace,
+    since: Optional[float],
+    run: Optional[ScannerRun] = None,
+) -> Scan:
+    run = run or ScannerRun()
     harness = args.harness
     cache = Cache(cache_dir(), args.rebuild_cache)
-    cache.drop_old_schemas()
+    cache.drop_old_schemas(run.cancellation)
     config = load_config()
+    run.emit("discovery", message="discovering transcript roots")
+    run.check()
 
     targets = []  # type: List[Tuple[Path, str, Path]]
+    target_keys = set()
+
+    def add_target(path: Path, kind: str, root: Path) -> None:
+        key = (kind, str(path.resolve()))
+        if key in target_keys:
+            return
+        target_keys.add(key)
+        targets.append((path, kind, root))
+
     if harness in ("claude", "all"):
-        roots = resolve_roots("claude", args.claude_root, config)
-        for path, root in claude_transcripts(roots):
-            targets.append((path, "claude", root))
+        roots = (
+            [Path(value).expanduser() for value in args.claude_root]
+            if not getattr(args, "discover", True)
+            else resolve_roots("claude", args.claude_root, config)
+        )
+        for path, root in claude_transcripts(roots, run.cancellation):
+            add_target(path, "claude", root)
     if harness in ("codex", "all"):
-        roots = resolve_roots("codex", args.codex_root, config)
-        for path, root in codex_transcripts(roots, since):
-            targets.append((path, "codex", root))
+        roots = (
+            [Path(value).expanduser() for value in args.codex_root]
+            if not getattr(args, "discover", True)
+            else resolve_roots("codex", args.codex_root, config)
+        )
+        for path, root in codex_transcripts(roots, since, run.cancellation):
+            add_target(path, "codex", root)
+    run.files_seen = len(targets)
+    run.emit("discovery", message="found %d transcript files" % len(targets))
 
     stamped = []  # type: List[Tuple[float, str, Path, str, Path, os.stat_result]]
     live = set()
     for path, kind, root in targets:
+        run.check()
         try:
             stat = path.stat()
         except OSError:
@@ -1340,42 +1454,56 @@ def collect(args: argparse.Namespace, since: Optional[float]) -> Scan:
 
     scan = Scan()
     scan.files_seen = len(targets)
-    progress = Progress(sys.stderr.isatty() and not getattr(args, "no_color", False),
-                        len(stamped), "scanning")
+    progress = Progress(
+        sys.stderr.isatty()
+        and not getattr(args, "no_color", False)
+        and run.progress is None,
+        len(stamped), "scanning")
     # One (label, key) lookup per root, however many files it holds - a
     # session's account never opens a second `auth.json`/`.claude.json` read.
     account_cache = {}  # type: Dict[Tuple[str, Path], Tuple[str, str]]
     for _, _, path, kind, root, stat in stamped:
+        run.check()
         progress.step()
-        entry, stale = cache.entry_for(path, kind, stat)
-        if stale:
+        run.emit("scanning", current_file=path.name, message="waiting for cache")
+        with serialized_cache(cache.root, run.cancellation):
+            entry, stale = cache.entry_for(path, kind, stat)
+            if stale:
+                previous_size = entry.size
+                try:
+                    if kind == "claude":
+                        parse_claude_file(path, entry, run.cancellation)
+                    else:
+                        parse_codex_file(path, entry, run.cancellation)
+                except OSError as error:
+                    warn("skipping %s: %s" % (path.name, error.strerror or error.__class__.__name__))
+                    continue
+                scan.bytes_read += max(0, stat.st_size - previous_size)
+                entry.stamp(path, stat)
+                cache.mark(path)
+                scan.files_read += 1
+                run.files_parsed += 1
+                run.cache_misses += 1
+            else:
+                run.cache_hits += 1
+            account_key = (kind, root)
+            if account_key not in account_cache:
+                account_cache[account_key] = account_for_root(root, kind)
+            account_label, account = account_cache[account_key]
+            absorb(scan, entry, kind, account, account_label)
             try:
-                if kind == "claude":
-                    parse_claude_file(path, entry)
-                else:
-                    parse_codex_file(path, entry)
+                cache._flush_unlocked()
             except OSError as error:
-                warn("skipping %s: %s" % (path.name, error.strerror or error.__class__.__name__))
-                continue
-            scan.bytes_read += max(0, stat.st_size - entry.size)
-            entry.stamp(path, stat)
-            cache.mark(path)
-            scan.files_read += 1
-        account_key = (kind, root)
-        if account_key not in account_cache:
-            account_cache[account_key] = account_for_root(root, kind)
-        account_label, account = account_cache[account_key]
-        absorb(scan, entry, kind, account, account_label)
-        try:
-            cache.flush()
-        except OSError as error:
-            warn("cache not written: %s" % error)
-        cache.forget(path)
+                warn("cache not written: %s" % error)
+            cache.forget(path)
+        run.bytes_read = scan.bytes_read
+        run.emit("scanning", current_file=path.name)
     progress.finish()
     if since is None and harness == "all":
         # `live` holds only what this run looked at, so a harness-scoped or
         # range-limited sweep would delete every shard it never visited.
-        cache.prune(live)
+        cache.prune(live, run.cancellation)
+    run.emit("scanning", message="scanned %d files" % len(stamped))
     return scan
 
 
@@ -1427,7 +1555,9 @@ def absorb(scan: Scan, entry: FileIndex, harness: str, account: str, account_lab
         scan.compactions.setdefault((harness, str(row[0])), []).append(float(row[1]))
 
 
-def window_events(scan: Scan, since: Optional[float], until: Optional[float]) -> None:
+def window_events(
+    scan: Scan, since: Optional[float], until: Optional[float], cancellation: Cancellation = None
+) -> None:
     """Drop every event outside the reporting range.
 
     Without this a session selected by its end time still reported the tokens
@@ -1437,6 +1567,7 @@ def window_events(scan: Scan, since: Optional[float], until: Optional[float]) ->
     if since is None and until is None:
         return
     for harness, events in scan.events.items():
+        check_cancelled(cancellation)
         scan.events[harness] = [
             row
             for row in events
@@ -1445,16 +1576,19 @@ def window_events(scan: Scan, since: Optional[float], until: Optional[float]) ->
         ]
 
 
-def rebuild_totals(scan: Scan) -> None:
+def rebuild_totals(scan: Scan, cancellation: Cancellation = None) -> None:
     """Derive per-session token totals and weighted units from surviving events."""
     for summary in scan.sessions.values():
+        check_cancelled(cancellation)
         summary.models = {}
         summary.sub_models = {}
         summary.requests = 0
         summary.sub_requests = 0
     for harness, events in scan.events.items():
+        check_cancelled(cancellation)
         kinds = CLAUDE_KINDS if harness == "claude" else CODEX_KINDS
         for row in events:
+            check_cancelled(cancellation)
             summary = scan.sessions.get((harness, row[EVENT_SESSION]))
             if summary is None:
                 continue
@@ -1471,6 +1605,7 @@ def rebuild_totals(scan: Scan) -> None:
             else:
                 summary.requests += 1
     for (harness, session_id), forks in scan.forks.items():
+        check_cancelled(cancellation)
         summary = scan.sessions.get((harness, session_id))
         if summary is None:
             continue
@@ -1582,7 +1717,7 @@ def cluster_reset_keys(
 
 
 def snapshot_windows(
-    snapshots: Sequence[Mapping[str, Any]]
+    snapshots: Sequence[Mapping[str, Any]], cancellation: Cancellation = None
 ) -> Dict[Tuple[str, str, str, Any], List[Mapping[str, Any]]]:
     """Group snapshot rows into one timeline per quota pool.
 
@@ -1593,10 +1728,12 @@ def snapshot_windows(
     """
     grouped = {}  # type: Dict[Tuple[str, str, str, Any], List[Mapping[str, Any]]]
     for row in snapshots:
+        check_cancelled(cancellation)
         key = (row.get("account") or "default", row.get("limit_id") or "codex",
                row.get("plan_type") or "unknown", row.get("window_minutes"))
         grouped.setdefault(key, []).append(row)
     for rows in grouped.values():
+        check_cancelled(cancellation)
         rows.sort(key=lambda item: item["ts"])
     return grouped
 
@@ -1651,16 +1788,21 @@ def window_matches(window_minutes: Any, wanted: Any) -> bool:
     return left == wanted
 
 
-def build_intervals(snapshots: Sequence[Mapping[str, Any]], window: Any) -> List[Interval]:
+def build_intervals(
+    snapshots: Sequence[Mapping[str, Any]], window: Any,
+    cancellation: Cancellation = None,
+) -> List[Interval]:
     intervals = []
-    groups = snapshot_windows(snapshots)
+    groups = snapshot_windows(snapshots, cancellation)
     for key, rows in groups.items():
+        check_cancelled(cancellation)
         if not window_matches(key[3], window):
             continue
         current = UNSET  # type: Any
         running = 0.0
         anchor_ts = None  # type: Optional[float]
         for row in rows:
+            check_cancelled(cancellation)
             bucket = resets_bucket(row.get("resets_at"))
             used = row["used_percent"]
             if (
@@ -1743,7 +1885,7 @@ def window_start(row: Mapping[str, Any], anchor_ts: Optional[float]) -> Optional
 
 def attribute(
     intervals: Sequence[Interval], events: Sequence[Sequence[Any]], weights: Weights,
-    args: argparse.Namespace
+    args: argparse.Namespace, cancellation: Cancellation = None
 ) -> None:
     """Split each interval's measured drain across the sessions active in it.
 
@@ -1784,6 +1926,7 @@ def attribute(
     stamps = [event[EVENT_TS] for event in ordered]
     computed = {}  # type: Dict[int, Dict[str, Any]]
     for interval in intervals:
+        check_cancelled(cancellation)
         low = bisect.bisect_right(stamps, interval.start)
         high = bisect.bisect_right(stamps, interval.end)
         total = 0.0
@@ -1792,6 +1935,7 @@ def attribute(
         prompted_units = {}  # type: Dict[str, float]
         fallback_sessions = set()  # type: set
         for event in ordered[low:high]:
+            check_cancelled(cancellation)
             account = session_accounts.get(("codex", event[EVENT_SESSION]))
             if account is not None and account[0] != interval.account:
                 continue
@@ -2117,7 +2261,8 @@ def input_side_units(harness: str, model: str, tokens: Mapping[str, int], weight
 
 
 def assemble_prompts(
-    scan: Scan, weights: Weights, args: argparse.Namespace
+    scan: Scan, weights: Weights, args: argparse.Namespace,
+    cancellation: Cancellation = None,
 ) -> Dict[Tuple[str, str], List[Prompt]]:
     """Group API calls under the user prompt that triggered them.
 
@@ -2128,15 +2273,18 @@ def assemble_prompts(
     """
     assembled = {}  # type: Dict[Tuple[str, str], List[Prompt]]
     for harness, events in scan.events.items():
+        check_cancelled(cancellation)
         kinds = CLAUDE_KINDS if harness == "claude" else CODEX_KINDS
-        for session_id, rows in group_events_by_session(events).items():
+        for session_id, rows in group_events_by_session(events, cancellation).items():
+            check_cancelled(cancellation)
             bounds = sorted(scan.boundaries.get((harness, session_id), []))
             groups = group_rows_by_prompt(rows, bounds, harness)
             prompts = []
             for position, (start_ts, group) in enumerate(groups, start=1):
+                check_cancelled(cancellation)
                 prompts.append(
                     build_prompt(harness, session_id, position, start_ts, group, kinds,
-                                 weights, args)
+                                 weights, args, cancellation)
                 )
             if prompts:
                 assembled[(harness, session_id)] = prompts
@@ -2169,12 +2317,14 @@ def build_prompt(
     kinds: Sequence[str],
     weights: Weights,
     args: argparse.Namespace,
+    cancellation: Cancellation = None,
 ) -> Prompt:
     prompt = Prompt(harness, session_id, position)
     prompt.start = start_ts
     baseline = 0.0
     seen_main = False
     for row in group:
+        check_cancelled(cancellation)
         if len(row) <= EVENT_PROMPT:
             row.extend([None] * (EVENT_PROMPT + 1 - len(row)))
         row[EVENT_PROMPT] = position
@@ -2368,11 +2518,15 @@ def estimate_savings(
     reduction.saved_units_upper = per_turn * reduction.turns_after * uncached_rate
 
 
-def group_events_by_session(events: Sequence[Sequence[Any]]) -> Dict[str, List[Sequence[Any]]]:
+def group_events_by_session(
+    events: Sequence[Sequence[Any]], cancellation: Cancellation = None
+) -> Dict[str, List[Sequence[Any]]]:
     grouped = {}  # type: Dict[str, List[Sequence[Any]]]
     for row in events:
+        check_cancelled(cancellation)
         grouped.setdefault(row[EVENT_SESSION], []).append(row)
     for rows in grouped.values():
+        check_cancelled(cancellation)
         rows.sort(key=lambda row: row[EVENT_TS])
     return grouped
 
@@ -3291,49 +3445,70 @@ def filter_by_account(scan: Scan, label: str) -> None:
     )
 
 
-def prepare(args: argparse.Namespace) -> Analysis:
+def prepare(
+    args: argparse.Namespace,
+    progress: Optional[ProgressCallback] = None,
+    cancellation: Cancellation = None,
+) -> Analysis:
+    """Synchronously scan and analyze transcripts for CLI or a worker thread."""
+
+    if progress is None and getattr(args, "json", False):
+        progress = json_progress
+    run = ScannerRun(progress, cancellation)
     now = time.time()
-    since = parse_since(args.since, now)
-    until = parse_since(args.until, now) if getattr(args, "until", None) else None
-    weights = load_weights(getattr(args, "use_calibrated", False))
-    scan = collect(args, since)
-    if getattr(args, "account", None):
-        filter_by_account(scan, args.account)
-    if not getattr(args, "whole_session", False):
-        window_events(scan, since, until)
-    rebuild_totals(scan)
-    analysis = Analysis(scan, weights, since, until, args)
-    # Prompt keys must exist before attribution so measured drain can be split
-    # down to the prompt as well as the session.
-    analysis.prompts = assemble_prompts(scan, weights, args)
-    analysis.window = choose_window(scan.snapshots, args.window)
-    analysis.intervals = [
-        interval
-        for interval in build_intervals(scan.snapshots, analysis.window)
-        if (since is None or interval.end >= since)
-        and (until is None or interval.start <= until)
-    ]
-    for interval in analysis.intervals:
-        if since is not None and interval.start < since:
-            interval.start = since
-    # attribute()'s signature stays (intervals, events, weights, args); the
-    # session -> account map rides on args, the one place with room for it
-    # without widening the positional EVENT_* tuple.
-    args._session_accounts = scan.session_accounts
-    attribute(analysis.intervals, scan.events["codex"], weights, args)
-    apply_prompt_drain(analysis)
-    return analysis
+    try:
+        run.check()
+        since = parse_since(args.since, now)
+        until = parse_since(args.until, now) if getattr(args, "until", None) else None
+        weights = load_weights(getattr(args, "use_calibrated", False))
+        scan = collect(args, since, run)
+        if getattr(args, "account", None):
+            filter_by_account(scan, args.account)
+        run.emit("analysis", message="building analysis")
+        run.check()
+        if not getattr(args, "whole_session", False):
+            window_events(scan, since, until, cancellation)
+        rebuild_totals(scan, cancellation)
+        analysis = Analysis(scan, weights, since, until, args)
+        # Prompt keys must exist before attribution so measured drain can be split
+        # down to the prompt as well as the session.
+        analysis.prompts = assemble_prompts(scan, weights, args, cancellation)
+        run.check()
+        analysis.window = choose_window(scan.snapshots, args.window)
+        analysis.intervals = [
+            interval
+            for interval in build_intervals(scan.snapshots, analysis.window, cancellation)
+            if (since is None or interval.end >= since)
+            and (until is None or interval.start <= until)
+        ]
+        for interval in analysis.intervals:
+            run.check()
+            if since is not None and interval.start < since:
+                interval.start = since
+        # attribute()'s signature stays compatible with its account-aware
+        # implementation; cancellation is an optional final argument.
+        args._session_accounts = scan.session_accounts
+        attribute(analysis.intervals, scan.events["codex"], weights, args, cancellation)
+        apply_prompt_drain(analysis, cancellation)
+        run.emit("done", message="analysis ready")
+        return analysis
+    except (ScanCancelled, KeyboardInterrupt):
+        run.emit("cancelled", message="scan cancelled")
+        raise ScanCancelled() from None
 
 
-def apply_prompt_drain(analysis: Analysis) -> None:
+def apply_prompt_drain(analysis: Analysis, cancellation: Cancellation = None) -> None:
     shares = {}  # type: Dict[Tuple[str, Any], float]
     for interval in analysis.intervals:
+        check_cancelled(cancellation)
         for key, value in interval.prompts.items():
             shares[key] = shares.get(key, 0.0) + value
     for (harness, session_id), prompts in analysis.prompts.items():
+        check_cancelled(cancellation)
         if harness != "codex":
             continue
         for prompt in prompts:
+            check_cancelled(cancellation)
             value = shares.get((session_id, prompt.index))
             if value is not None:
                 prompt.drain_percent = value
@@ -5077,7 +5252,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return 2
     if getattr(args, "harness", None) == "claude" and args.command == "windows":
         warn("windows are a Codex-only measurement")
-    return args.handler(args)
+    try:
+        return args.handler(args)
+    except ScanCancelled:
+        return 130
 
 
 if __name__ == "__main__":
