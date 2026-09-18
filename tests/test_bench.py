@@ -261,13 +261,15 @@ class Harness(unittest.TestCase):
         self.fake_drain.chmod(0o755)
 
         self.environment = dict(os.environ)
+        self.environment.pop("CLAUDE_CONFIG_DIR", None)
+        self.environment.pop("CODEX_HOME", None)
         self.environment.update(
             {
                 "PATH": str(self.bin) + os.pathsep + os.environ.get("PATH", ""),
-                "QUOTA_DRAIN_HOME_DIR": str(self.root / "home"),
-                "QUOTA_DRAIN_CACHE_DIR": str(self.root / "cache"),
-                "QUOTA_DRAIN_STATE_DIR": str(self.root / "state"),
-                "QUOTA_DRAIN_CONFIG_DIR": str(self.root / "config"),
+                "NENPI_HOME_DIR": str(self.root / "home"),
+                "NENPI_CACHE_DIR": str(self.root / "cache"),
+                "NENPI_STATE_DIR": str(self.root / "state"),
+                "NENPI_CONFIG_DIR": str(self.root / "config"),
                 "BENCH_REAL_QUOTA_DRAIN": str(QUOTA_DRAIN),
                 "BENCH_FAKE_LOG": str(self.call_log),
                 "BENCH_FAKE_SEEN": str(self.seen),
