@@ -203,8 +203,16 @@ LABEL_INJECTED_TAGS = frozenset((
     "ide_selection",
     "ide_opened_file",
     "task-notification",
+    "cross-session-message",
 ))
 LABEL_TAG_OPEN = re.compile(r"<\s*([A-Za-z][\w.:-]*)[^>]*>")
+# How much a label is worth, carried beside it rather than read back off its
+# shape: a line the person typed that happens to be parenthesised is still
+# typed text. Codex writes its injected context as its own user message just
+# before the typed one, so both compete for the same prompt.
+LABEL_RANK_NONE = 0
+LABEL_RANK_BLOCK = 1
+LABEL_RANK_TYPED = 2
 # Attachment placeholders the harness substitutes for pasted bulk. Whatever
 # follows one is the paste itself, so the scan stops there.
 LABEL_PASTED_LINE = re.compile(
@@ -286,6 +294,12 @@ def strip_injected_spans(line: str) -> Tuple[str, Optional[str], Optional[str]]:
             continue
         if seen is None:
             seen = name.lower()
+        if match.group(0).rstrip().endswith("/>"):
+            # `<ide_selection ... />` is a block with no body; drop the tag
+            # and keep whatever the person typed around it.
+            line = line[: match.start()] + " " + line[match.end():]
+            position = match.start()
+            continue
         closing = "</%s>" % name
         end = line.find(closing, match.end())
         if end < 0:
@@ -295,7 +309,12 @@ def strip_injected_spans(line: str) -> Tuple[str, Optional[str], Optional[str]]:
 
 
 def prompt_label(text: Any) -> str:
-    """Return a short, redacted label for one user prompt.
+    """The label alone; see `prompt_label_parts` for how it is built."""
+    return prompt_label_parts(text)[0]
+
+
+def prompt_label_parts(text: Any) -> Tuple[str, int]:
+    """Return a short, redacted label for one user prompt, and its rank.
 
     Only what a person typed on the first such line survives: injected blocks
     are stripped, a pasted-content placeholder ends the scan so the paste can
@@ -305,7 +324,7 @@ def prompt_label(text: Any) -> str:
     can reach the cache or the terminal.
     """
     if not isinstance(text, str) or not text:
-        return ""
+        return "", LABEL_RANK_NONE
     lines = text.split("\n")[:LABEL_SCAN_LINES]
     skip_until = None  # type: Optional[str]
     # A turn that is nothing but an injected block - a task notification, a
@@ -318,39 +337,31 @@ def prompt_label(text: Any) -> str:
         if not line:
             continue
         if skip_until is not None:
-            end = line.find(skip_until)
-            if end < 0:
+            # Only a closing tag at the start of a line ends a block. A body
+            # that quotes its own closing tag must not hand the rest of that
+            # line back as a label.
+            if not line.startswith(skip_until):
                 continue
-            line = line[end + len(skip_until):].strip()
+            line = line[len(skip_until):].strip()
             skip_until = None
             if not line:
                 continue
         if LABEL_PASTED_LINE.match(line):
             # The next lines are the pasted body, not a prompt.
-            return ""
+            return "", LABEL_RANK_NONE
         line, unterminated, tag = strip_injected_spans(line)
         if line:
-            return redact_label(" ".join(line.split()))[:PROMPT_LABEL_CHARS]
+            return (
+                redact_label(" ".join(line.split()))[:PROMPT_LABEL_CHARS],
+                LABEL_RANK_TYPED,
+            )
         if injected is None and tag is not None:
             injected = tag
         if unterminated is not None:
-            if not any(unterminated in rest for rest in lines[position + 1:]):
-                # An injected block that never closes in what we will read;
-                # skipping on would only walk its body.
-                break
+            # If it never closes in what we are willing to read, the loop ends
+            # and the block's NAME is the label; no line of its body can be.
             skip_until = unterminated
-    return "(%s)" % injected if injected else ""
-
-
-def label_rank(label: str) -> int:
-    """How much a label is worth: typed text beats a block name beats none.
-
-    Codex writes its injected context as its own user message just before the
-    typed one, so both compete for the same prompt.
-    """
-    if not label:
-        return 0
-    return 1 if label.startswith("(") and label.endswith(")") else 2
+    return ("(%s)" % injected, LABEL_RANK_BLOCK) if injected else ("", LABEL_RANK_NONE)
 
 
 def claude_prompt_text(message: Mapping[str, Any]) -> str:
@@ -971,6 +982,7 @@ class FileIndex:
         # turn_context pair that opens its prompt, and can straddle the resume
         # offset, so the label waits here until a boundary claims it.
         self.pending_label = ""
+        self.pending_label_rank = LABEL_RANK_NONE
         self.thread_id = ""
         self.is_subagent = False
         self.head_hash = ""
@@ -995,6 +1007,7 @@ class FileIndex:
             "tools": self.tools,
             "pending_tools": self.pending_tools,
             "pending_label": self.pending_label,
+            "pending_label_rank": self.pending_label_rank,
             "thread_id": self.thread_id,
             "is_subagent": self.is_subagent,
             "head_hash": self.head_hash,
@@ -1021,6 +1034,7 @@ class FileIndex:
         index.tools = list(payload.get("tools") or [])
         index.pending_tools = list(payload.get("pending_tools") or [])
         index.pending_label = str(payload.get("pending_label", ""))
+        index.pending_label_rank = int(payload.get("pending_label_rank") or 0)
         index.thread_id = str(payload.get("thread_id", ""))
         index.is_subagent = bool(payload.get("is_subagent"))
         index.head_hash = str(payload.get("head_hash", ""))
@@ -1295,10 +1309,10 @@ def parse_claude_file(
             if is_claude_prompt(record, is_subagent_file):
                 epoch = parse_timestamp(record.get("timestamp"))
                 if epoch is not None:
-                    label = prompt_label(
+                    label, rank = prompt_label_parts(
                         claude_prompt_text(record.get("message") or {})
                     )
-                    index.boundaries.append([session_id, epoch, label])
+                    index.boundaries.append([session_id, epoch, label, rank])
                     summary.touch(epoch)
                 expire_pending_tools(index)
                 continue
@@ -1513,9 +1527,10 @@ def parse_codex_file(
             elif item == "message" and payload.get("role") == "user":
                 # Only the label is taken; the message body is never kept.
                 if not index.is_subagent:
-                    label = prompt_label(codex_prompt_text(payload))
-                    if label_rank(label) > label_rank(index.pending_label):
+                    label, rank = prompt_label_parts(codex_prompt_text(payload))
+                    if rank > index.pending_label_rank:
                         index.pending_label = label
+                        index.pending_label_rank = rank
             elif item in CODEX_TOOL_OUTPUT_ITEMS:
                 call_id = payload.get("call_id") or payload.get("id")
                 record_tool(
@@ -1530,8 +1545,10 @@ def parse_codex_file(
 
         if kind == "turn_context":
             if epoch is not None and not index.is_subagent:
-                add_boundary(index.boundaries, session_id, epoch, index.pending_label)
+                add_boundary(index.boundaries, session_id, epoch,
+                             index.pending_label, index.pending_label_rank)
                 index.pending_label = ""
+                index.pending_label_rank = LABEL_RANK_NONE
             candidate = payload.get("model")
             collaboration = payload.get("collaboration_mode")
             if isinstance(collaboration, dict):
@@ -1575,12 +1592,15 @@ def parse_codex_file(
             # its own - an interjection queued mid-turn - must not label the
             # next prompt.
             index.pending_label = ""
+            index.pending_label_rank = LABEL_RANK_NONE
             continue
 
         if kind == "event_msg" and payload.get("type") == "task_started":
             if epoch is not None and not index.is_subagent:
-                add_boundary(index.boundaries, session_id, epoch, index.pending_label)
+                add_boundary(index.boundaries, session_id, epoch,
+                             index.pending_label, index.pending_label_rank)
                 index.pending_label = ""
+                index.pending_label_rank = LABEL_RANK_NONE
             expire_pending_tools(index)
             continue
 
@@ -1669,7 +1689,8 @@ def is_codex_subagent(payload: Mapping[str, Any]) -> bool:
 
 
 def add_boundary(
-    boundaries: List[List[Any]], session_id: str, epoch: float, label: str = ""
+    boundaries: List[List[Any]], session_id: str, epoch: float, label: str = "",
+    rank: int = LABEL_RANK_NONE,
 ) -> None:
     """Record a prompt start, collapsing the task_started/turn_context pair.
 
@@ -1680,10 +1701,10 @@ def add_boundary(
     if boundaries:
         last = boundaries[-1]
         if last[0] == session_id and abs(epoch - last[1]) <= BOUNDARY_DEDUP_SECONDS:
-            if len(last) > 2 and label_rank(label) > label_rank(last[2]):
-                last[2] = label
+            if len(last) > 3 and rank > last[3]:
+                last[2], last[3] = label, rank
             return
-    boundaries.append([session_id, epoch, label])
+    boundaries.append([session_id, epoch, label, rank])
 
 
 def record_event(

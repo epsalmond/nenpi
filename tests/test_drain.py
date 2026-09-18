@@ -4778,6 +4778,46 @@ class PromptLabelText(unittest.TestCase):
         text = "<command-name>/deploy</command-name>\nship it"
         self.assertEqual(QD.prompt_label(text), "ship it")
 
+    def test_cross_session_message_is_a_known_block(self) -> None:
+        text = "<cross-session-message>\nINNER CONTENT\n</cross-session-message>"
+        self.assertEqual(QD.prompt_label(text), "(cross-session-message)")
+        self.assertNotIn("INNER CONTENT", QD.prompt_label(text))
+
+    def test_a_body_quoting_its_closing_tag_leaks_nothing(self) -> None:
+        text = (
+            "<system-reminder>\n"
+            "the body writes </system-reminder> INNER CONTENT here\n"
+            "more body\n"
+        )
+        label = QD.prompt_label(text)
+        self.assertEqual(label, "(system-reminder)")
+        self.assertNotIn("INNER CONTENT", label)
+
+    def test_unterminated_block_yields_only_its_name(self) -> None:
+        text = "<user_instructions>\n" + "\n".join("INNER %d" % n for n in range(80))
+        label = QD.prompt_label(text)
+        self.assertEqual(label, "(user_instructions)")
+        self.assertNotIn("INNER", label)
+
+    def test_self_closing_block_keeps_the_typed_remainder(self) -> None:
+        self.assertEqual(
+            QD.prompt_label('<ide_selection file="a.py" lines="1-3" /> fix this line'),
+            "fix this line",
+        )
+        self.assertEqual(QD.prompt_label("<ide_opened_file/>"), "(ide_opened_file)")
+
+    def test_rank_is_carried_not_read_off_the_label_shape(self) -> None:
+        # A typed line that happens to be parenthesised is typed text, and
+        # must outrank a block name for the same prompt.
+        label, rank = QD.prompt_label_parts("(just a parenthesised ask)")
+        self.assertEqual(label, "(just a parenthesised ask)")
+        self.assertEqual(rank, QD.LABEL_RANK_TYPED)
+        self.assertEqual(
+            QD.prompt_label_parts("<system-reminder>x</system-reminder>")[1],
+            QD.LABEL_RANK_BLOCK,
+        )
+        self.assertEqual(QD.prompt_label_parts("")[1], QD.LABEL_RANK_NONE)
+
     def test_markers_come_from_a_fixed_vocabulary(self) -> None:
         for text in (
             "<system-reminder>\nx\n</system-reminder>",
@@ -5074,6 +5114,51 @@ class PromptRanking(Harness):
         labels = [row["label"] for row in payload["prompts"]]
         self.assertIn("first real prompt", labels)
         self.assertNotIn("orphan interjection", labels)
+
+    def test_parenthesised_typed_prompt_outranks_an_injected_block(self) -> None:
+        session = "abcd2607-1111-2222-3333-444444444444"
+        now = time.time() - 3600
+        self.write_codex(
+            "rollout-rank.jsonl",
+            [
+                codex_session_meta_line(now, session, "/home/agent/project"),
+                codex_user_message_line(
+                    now + 1, "<environment_context>\nINNER\n</environment_context>"
+                ),
+                codex_task_started_line(now + 2),
+                codex_user_message_line(now + 3, "(parenthesised typed ask)"),
+                codex_turn_context_line(now + 4, "gpt-5.6-sol"),
+                codex_usage_record_line(now + 5, session, input_tokens=100,
+                                        cached_input_tokens=0, output_tokens=10,
+                                        turn_id="turn-1"),
+            ],
+            day=now,
+        )
+        payload = self.run_json("prompts", "--harness", "codex", "--json")
+        self.assertEqual(payload["prompts"][0]["label"], "(parenthesised typed ask)")
+
+    def test_block_only_turn_stores_no_inner_content(self) -> None:
+        session = "bcde2608-1111-2222-3333-444444444444"
+        now = time.time() - 3600
+        self.write_claude(
+            "block-only.jsonl",
+            [
+                claude_user_prompt_line(
+                    now, session,
+                    text="<cross-session-message>\nINNER CONTENT\n"
+                         "</cross-session-message>",
+                ),
+                claude_assistant_line(now + 1, session, "msg_block", input_tokens=10,
+                                      output_tokens=5),
+            ],
+        )
+        payload = self.run_json("prompts", "--harness", "claude", "--json")
+        self.assertEqual(payload["prompts"][0]["label"], "(cross-session-message)")
+        self.assertNotIn("INNER CONTENT", json.dumps(payload))
+        shards = "\n".join(
+            path.read_text(encoding="utf-8") for path in (self.root / "cache").rglob("*.json")
+        )
+        self.assertNotIn("INNER CONTENT", shards)
 
     def test_sort_units_is_accepted(self) -> None:
         self.write_two_sessions()

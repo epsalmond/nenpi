@@ -816,16 +816,19 @@ nothing else — the rest of the prompt is discarded before anything is kept:
   `environment_context`, `recommended_plugins`, `pasted_content`,
   `command-name`, `command-message`, `command-args`,
   `local-command-stdout`, `local-command-stderr`, `local-command-caveat`,
-  `ide_selection`, `ide_opened_file`, `task-notification`. Anything else in
-  angle brackets is something the person typed and is kept.
+  `ide_selection`, `ide_opened_file`, `task-notification`,
+  `cross-session-message`. Anything else in angle brackets is something the
+  person typed and is kept, and a self-closing `<tag …/>` is dropped while
+  the typed text beside it stays.
 - A **pasted-content placeholder** (`[Pasted text …]`, `[Image #1]`) ends the
   scan. The lines after it are the paste, and the paste is never a label.
 - A turn that is *only* an injected block — a task notification, a bare
   slash-command expansion — is labelled with the block's name in
   parentheses, e.g. `(task-notification)`. The name comes from the list
   above, so such a label is a fixed vocabulary and carries nothing from
-  inside the block. The same goes for a block that never closes: the scan
-  stops rather than walking its body.
+  inside the block. Only a closing tag at the start of a line ends a block,
+  so a body that quotes its own closing tag cannot hand back a line; a block
+  that never closes yields its name and nothing else.
 - Whitespace is collapsed and the line is cut to 120 characters.
 - These become `[redacted]` first: email addresses, `sk-…`,
   `ghp_`/`gho_`/`github_pat_…`, `xox…` and `AKIA…` keys, JWTs, `Bearer …`
