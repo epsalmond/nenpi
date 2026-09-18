@@ -40,7 +40,14 @@ uv tool install 'nenpi[ui] @ git+https://github.com/epsalmond/nenpi'
 ```sh
 nenpi sessions --harness all --since 7d --top 25
 nenpi prompts --session 0123abcd
+nenpi tools --since 7d --top 15
 ```
+
+`nenpi tools` ranks tool calls by the context their results add, estimated as
+result characters / 4 and, where a later API call measured the growth, split
+across that turn's results. Only tool **names** and result **sizes** are ever
+parsed, cached or printed — never tool input or output text, and never prompt
+text.
 
 `nenpi-bench plan` projects a benchmark without spending quota. A
 `nenpi-bench run` executes controlled `claude -p` calls and **spends real

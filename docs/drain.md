@@ -33,7 +33,9 @@ so cost grows faster than session length. See
 nenpi sessions    [--harness claude|codex|all] [--since 7d|2026-09-10] [--until ...]
                   [--window auto|five_hour|weekly] [--top 25]
                   [--sort drain|tokens|start] [--json] [--no-color] [--width N]
-nenpi prompts     --session <id-prefix> [--top N]
+nenpi prompts     --session <id-prefix> [--top N] [--tools]
+nenpi tools       [--session <id-prefix>] [--prompt N] [--top N]
+                  [--sort context|calls|mean] [--harness ...] [--json]
 nenpi fanout      [--since ...] [--harness ...]
 nenpi reductions  [--since ...]
 nenpi timeline    [--bucket 1h|5h|1d]
@@ -103,6 +105,37 @@ quadratic x^2 term 9.98 (R^2 0.998) | last 20% of prompts = 41% of session cost
 The fit is ordinary least squares of per-prompt weighted units against prompt
 index, once linear and once quadratic; `better` names the higher R², requiring
 at least a 0.01 margin so near-ties report as linear.
+
+### tools
+
+Ranks tool names by the context their results add. `--session` takes the same
+ID prefix as `prompts` (busiest wins when several match) and `--prompt N`
+narrows to one prompt of that session; without either, the report is
+corpus-wide. Columns:
+
+- **calls** — completed calls of that tool in range.
+- **est tokens** — *estimate*: total result characters / 4. Labelled an
+  estimate everywhere; no tokenizer is run.
+- **measured** — the input-token growth actually billed on the next API call
+  of the same thread, split across that turn's tool results in proportion to
+  their sizes. A turn with no following call measures nothing, so measured is
+  0 there; where other things also grew the context (reasoning, assistant
+  output, pasted text) the split charges them to the tools of that turn, so
+  measured reads as an upper bound.
+- **mean** / **max** — mean and largest single result, in estimated tokens.
+- **share** — measured tokens over the total positive input growth of the
+  sessions in scope.
+
+A closing section lists the five largest single results by tool, session and
+prompt index. `--sort` picks `context` (default, estimated tokens), `calls`,
+or `mean`.
+
+`prompts --tools` adds the same numbers per prompt: call count, estimated
+tokens, and the tool behind the largest single result of that prompt. Without
+the flag the `prompts` table is unchanged.
+
+Only tool **names** and result **sizes** are read. Tool inputs and outputs are
+never stored in the cache, printed, or hashed.
 
 ### fanout
 
@@ -398,8 +431,9 @@ next prompt belongs to it, including subagent work started under it.
 Per prompt the tool records wall time, API turns (distinct Claude
 `message.id` / Codex `response_id`), context size at the start and at the
 peak, input tokens summed across the fan-out split into uncached, cache read
-and cache write, output tokens, weighted units, and measured or estimated
-drain.
+and cache write, output tokens, weighted units, measured or estimated drain,
+and the tool-call count, total result size, estimated and measured tool
+context, and largest single result (see [tools](#tools)).
 
 **Resent share** is the fraction of a session's weighted cost that went on
 context it had already sent: for each prompt, the input-side weighted cost of
@@ -723,10 +757,18 @@ A cold full sweep is the price of corpus-wide dedup: every transcript has to
 be read once before a replayed API call can be told from a new one.
 
 Only the structural fields are read: `type`, `message.usage`, `message.id`,
-`message.model`, timestamps, ids, `cwd`, and the Codex `rate_limits` and
-`turn_id`. Prompt text, tool results and message content are never parsed or
-printed. Claude user lines carrying tool results are screened out on the raw
-bytes before `json.loads` ever sees them.
+`message.model`, timestamps, ids, `cwd`, the Codex `rate_limits` and
+`turn_id`, and — for tool accounting — `tool_use.name` / `function_call.name`
+(MCP names kept whole, Codex namespaces qualified as `namespace.name`) with
+the character SIZE of each `tool_result` / `function_call_output`. Prompt
+text, tool result text and message content are never parsed into anything
+stored or printed: a result is measured and dropped. Claude user lines
+carrying tool results still bypass the prompt path on the raw-bytes screen;
+they now go through the size-only tool parser instead of being skipped.
+
+Reading those lines costs something: on a 14-day sweep of a real corpus the
+cold parse went from ~24 s to ~32 s and the cache from 34 MB to 43 MB. Warm
+runs are unchanged.
 
 State lives in `~/.local/state/nenpi/` (`snapshots.jsonl`,
 `codex-weights.json`, `oauth-poll.json`), config in

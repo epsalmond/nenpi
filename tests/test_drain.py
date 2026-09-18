@@ -272,6 +272,107 @@ def rate_limits(used_percent: float, resets_at: int, window_minutes: int = 300) 
     }
 
 
+def claude_tool_use_line(
+    epoch: float,
+    session_id: str,
+    message_id: str,
+    calls: Sequence[Tuple[str, str]],
+    *,
+    input_tokens: int = 0,
+    cache_read: int = 0,
+    output_tokens: int = 0,
+    sidechain: bool = False,
+) -> str:
+    """An assistant line that issues tool calls: (tool_use_id, tool name)."""
+    return json.dumps(
+        {
+            "type": "assistant",
+            "sessionId": session_id,
+            "cwd": "/home/agent/project",
+            "timestamp": iso(epoch),
+            "requestId": "req_" + message_id,
+            "isSidechain": sidechain,
+            "message": {
+                "id": message_id,
+                "role": "assistant",
+                "model": "claude-opus-5",
+                "content": [
+                    {"type": "tool_use", "id": call_id, "name": name, "input": {}}
+                    for call_id, name in calls
+                ],
+                "usage": {
+                    "input_tokens": input_tokens,
+                    "cache_read_input_tokens": cache_read,
+                    "cache_creation_input_tokens": 0,
+                    "output_tokens": output_tokens,
+                },
+            },
+        }
+    )
+
+
+def claude_tool_output_line(
+    epoch: float,
+    session_id: str,
+    call_id: str,
+    payload: Any,
+    *,
+    sidechain: bool = False,
+) -> str:
+    return json.dumps(
+        {
+            "type": "user",
+            "sessionId": session_id,
+            "timestamp": iso(epoch),
+            "isSidechain": sidechain,
+            "toolUseResult": {"stdout": "synthetic"},
+            "message": {
+                "role": "user",
+                "content": [
+                    {"type": "tool_result", "tool_use_id": call_id, "content": payload}
+                ],
+            },
+        }
+    )
+
+
+def codex_tool_call_line(
+    epoch: float,
+    call_id: str,
+    name: str,
+    *,
+    item: str = "function_call",
+    namespace: Optional[str] = None,
+) -> str:
+    payload = {"type": item, "id": "item-" + call_id, "call_id": call_id, "name": name}
+    if namespace is not None:
+        payload["namespace"] = namespace
+    if item == "custom_tool_call":
+        payload["input"] = "synthetic"
+    else:
+        payload["arguments"] = "{}"
+    return json.dumps(
+        {"type": "response_item", "timestamp": iso(epoch), "payload": payload}
+    )
+
+
+def codex_tool_output_line(
+    epoch: float, call_id: str, output: Any, *, item: str = "function_call_output"
+) -> str:
+    return json.dumps(
+        {
+            "type": "response_item",
+            "timestamp": iso(epoch),
+            "payload": {
+                "type": item,
+                "id": "out-" + call_id,
+                "call_id": call_id,
+                "output": output,
+            },
+        }
+    )
+
+
 class Harness(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
@@ -4035,6 +4136,260 @@ class ProfileFlag(Harness):
         )
         self.assertEqual(result.returncode, 0, result.stderr.decode("utf-8", "replace"))
         self.assertIn("nenpi: total", result.stderr.decode("utf-8"))
+
+
+class ToolAttribution(Harness):
+    """Tool names and result SIZES only; never a byte of tool content."""
+
+    def claude_session(self, name: str, session: str) -> float:
+        now = time.time() - 3600
+        self.write_claude(
+            name,
+            [
+                claude_user_prompt_line(now, session),
+                claude_tool_use_line(
+                    now + 1, session, "msg_1",
+                    [("toolu_a", "Bash"), ("toolu_b", "mcp__github__list_issues")],
+                    input_tokens=100, cache_read=1000, output_tokens=20,
+                ),
+                claude_tool_output_line(now + 2, session, "toolu_a", "x" * 400),
+                claude_tool_output_line(
+                    now + 3, session, "toolu_b",
+                    [{"type": "text", "text": "y" * 800}],
+                ),
+                claude_assistant_line(
+                    now + 4, session, "msg_2",
+                    input_tokens=100, cache_read=2200, output_tokens=30,
+                ),
+            ],
+        )
+        return now
+
+    def test_claude_tool_names_and_sizes_are_parsed(self) -> None:
+        session = "10000000-1111-2222-3333-444444444444"
+        self.claude_session("tools.jsonl", session)
+        payload = self.run_json("tools", "--harness", "claude", "--json")
+        names = dict((row["tool"], row) for row in payload["tools"])
+        self.assertEqual(sorted(names), ["Bash", "mcp__github__list_issues"])
+        self.assertEqual(names["Bash"]["result_chars"], 400)
+        self.assertEqual(names["Bash"]["est_tokens"], 100.0)
+        # MCP names survive whole, server and tool.
+        self.assertEqual(names["mcp__github__list_issues"]["result_chars"], 800)
+        self.assertEqual(payload["tool_calls"], 2)
+
+    def test_measured_growth_splits_over_the_turn(self) -> None:
+        session = "11000000-1111-2222-3333-444444444444"
+        self.claude_session("measured.jsonl", session)
+        payload = self.run_json("tools", "--harness", "claude", "--json")
+        names = dict((row["tool"], row) for row in payload["tools"])
+        # Context grew 1100 -> 2300 tokens across the two calls; the split is
+        # proportional to the 400/800 result sizes.
+        self.assertAlmostEqual(names["Bash"]["measured_tokens"], 400.0, places=6)
+        self.assertAlmostEqual(
+            names["mcp__github__list_issues"]["measured_tokens"], 800.0, places=6
+        )
+        self.assertEqual(payload["context_growth_tokens"], 1200)
+
+    def test_unmatched_tool_result_is_kept_as_unknown(self) -> None:
+        session = "12000000-1111-2222-3333-444444444444"
+        now = time.time() - 3600
+        self.write_claude(
+            "orphan.jsonl",
+            [
+                claude_user_prompt_line(now, session),
+                claude_assistant_line(now + 1, session, "msg_1", output_tokens=5),
+                claude_tool_output_line(now + 2, session, "toolu_missing", "z" * 40),
+            ],
+        )
+        payload = self.run_json("tools", "--harness", "claude", "--json")
+        self.assertEqual([row["tool"] for row in payload["tools"]], ["unknown"])
+        self.assertEqual(payload["tools"][0]["result_chars"], 40)
+
+    def test_claude_subagent_spawn_is_flagged(self) -> None:
+        session = "13000000-1111-2222-3333-444444444444"
+        now = time.time() - 3600
+        self.write_claude(
+            "spawn.jsonl",
+            [
+                claude_user_prompt_line(now, session),
+                claude_tool_use_line(
+                    now + 1, session, "msg_1", [("toolu_t", "Task")], output_tokens=5
+                ),
+                claude_tool_output_line(now + 2, session, "toolu_t", "s" * 20),
+            ],
+        )
+        payload = self.run_json("tools", "--harness", "claude", "--json")
+        self.assertEqual(payload["tools"][0]["spawns"], 1)
+        self.assertTrue(payload["largest_results"][0]["spawned_subagent"])
+
+    def codex_session(self, name: str, session: str) -> float:
+        now = time.time() - 3600
+        self.write_codex(
+            name,
+            [
+                codex_session_meta_line(now, session, "/home/agent/project"),
+                codex_turn_context_line(now + 1, "gpt-5-codex"),
+                codex_task_started_line(now + 1),
+                codex_tool_call_line(now + 2, "call_1", "exec", item="custom_tool_call"),
+                codex_tool_output_line(
+                    now + 3, "call_1",
+                    [{"type": "text", "text": "a" * 600}],
+                    item="custom_tool_call_output",
+                ),
+                codex_tool_call_line(
+                    now + 4, "call_2", "search", namespace="mcp__docs"
+                ),
+                codex_tool_output_line(now + 5, "call_2", "b" * 200),
+                codex_usage_record_line(
+                    now + 6, session, input_tokens=5000,
+                    cached_input_tokens=1000, output_tokens=50, turn_id="turn-1",
+                ),
+            ],
+            day=now,
+        )
+        return now
+
+    def test_codex_function_and_custom_tool_calls_are_parsed(self) -> None:
+        session = "20000000-1111-2222-3333-444444444444"
+        self.codex_session("rollout-tools.jsonl", session)
+        payload = self.run_json("tools", "--harness", "codex", "--json")
+        names = dict((row["tool"], row) for row in payload["tools"])
+        self.assertEqual(sorted(names), ["exec", "mcp__docs.search"])
+        self.assertEqual(names["exec"]["result_chars"], 600)
+        self.assertEqual(names["mcp__docs.search"]["result_chars"], 200)
+
+    def test_session_prefix_scopes_the_report(self) -> None:
+        first = "30000000-1111-2222-3333-444444444444"
+        second = "40000000-1111-2222-3333-444444444444"
+        self.claude_session("one.jsonl", first)
+        now = time.time() - 3600
+        self.write_claude(
+            "two.jsonl",
+            [
+                claude_user_prompt_line(now, second),
+                claude_tool_use_line(
+                    now + 1, second, "msg_9", [("toolu_z", "Read")], output_tokens=5
+                ),
+                claude_tool_output_line(now + 2, second, "toolu_z", "q" * 120),
+            ],
+        )
+        payload = self.run_json(
+            "tools", "--harness", "claude", "--session", "40000000", "--json"
+        )
+        self.assertEqual([row["tool"] for row in payload["tools"]], ["Read"])
+        self.assertEqual(payload["session"], "40000000")
+
+    def test_text_output_lists_tools_without_content(self) -> None:
+        session = "50000000-1111-2222-3333-444444444444"
+        self.claude_session("text.jsonl", session)
+        result = self.run_tool("tools", "--harness", "claude", "--no-color")
+        self.assertEqual(result.returncode, 0, result.stderr.decode("utf-8", "replace"))
+        text = result.stdout.decode("utf-8")
+        self.assertIn("Bash", text)
+        self.assertIn("mcp__github__list_issues", text)
+        self.assertIn("largest single results", text)
+        self.assertNotIn("x" * 20, text)
+        self.assertNotIn("y" * 20, text)
+
+    def test_sort_by_calls(self) -> None:
+        session = "51000000-1111-2222-3333-444444444444"
+        now = time.time() - 3600
+        lines = [claude_user_prompt_line(now, session)]
+        for step in range(3):
+            lines.append(
+                claude_tool_use_line(
+                    now + 1 + step, session, "msg_%d" % step,
+                    [("toolu_s%d" % step, "Read")], output_tokens=5,
+                )
+            )
+            lines.append(
+                claude_tool_output_line(now + 1.5 + step, session, "toolu_s%d" % step, "r" * 10)
+            )
+        lines.append(
+            claude_tool_use_line(now + 8, session, "msg_big", [("toolu_big", "Bash")],
+                                 output_tokens=5)
+        )
+        lines.append(claude_tool_output_line(now + 9, session, "toolu_big", "B" * 5000))
+        self.write_claude("sorted.jsonl", lines)
+        by_context = self.run_json("tools", "--harness", "claude", "--json")
+        self.assertEqual(by_context["tools"][0]["tool"], "Bash")
+        by_calls = self.run_json(
+            "tools", "--harness", "claude", "--sort", "calls", "--json"
+        )
+        self.assertEqual(by_calls["tools"][0]["tool"], "Read")
+
+    def test_prompts_tools_columns_are_opt_in(self) -> None:
+        session = "52000000-1111-2222-3333-444444444444"
+        self.claude_session("prompt-tools.jsonl", session)
+        plain = self.run_tool(
+            "prompts", "--session", "52000000", "--harness", "claude", "--no-color"
+        )
+        self.assertEqual(plain.returncode, 0, plain.stderr.decode("utf-8", "replace"))
+        self.assertNotIn("largest tool", plain.stdout.decode("utf-8"))
+        with_tools = self.run_tool(
+            "prompts", "--session", "52000000", "--harness", "claude",
+            "--no-color", "--tools",
+        )
+        self.assertEqual(with_tools.returncode, 0,
+                         with_tools.stderr.decode("utf-8", "replace"))
+        text = with_tools.stdout.decode("utf-8")
+        self.assertIn("largest tool", text)
+        self.assertIn("mcp__github__li", text)
+        payload = self.run_json(
+            "prompts", "--session", "52000000", "--harness", "claude", "--json"
+        )
+        prompt = payload["prompts"][0]
+        self.assertEqual(prompt["tool_calls"], 2)
+        self.assertEqual(prompt["tool_result_chars"], 1200)
+        self.assertEqual(prompt["largest_tool"], "mcp__github__list_issues")
+
+    def test_shard_round_trip_stores_sizes_only(self) -> None:
+        session = "60000000-1111-2222-3333-444444444444"
+        self.claude_session("shard.jsonl", session)
+        first = self.run_json("tools", "--harness", "claude", "--json")
+        shards = list((self.root / "cache").rglob("*.json"))
+        self.assertTrue(shards)
+        blob = "\n".join(path.read_text(encoding="utf-8") for path in shards)
+        self.assertIn("Bash", blob)
+        self.assertNotIn("x" * 20, blob)
+        self.assertNotIn("y" * 20, blob)
+        self.assertNotIn("do the thing", blob)
+        # Second run is served from the shard and must agree.
+        second = self.run_json("tools", "--harness", "claude", "--json")
+        self.assertEqual(first["tools"], second["tools"])
+
+    def test_old_schema_shards_are_rebuilt(self) -> None:
+        session = "61000000-1111-2222-3333-444444444444"
+        self.claude_session("schema.jsonl", session)
+        self.run_json("sessions", "--harness", "claude", "--json")
+        current = self.root / "cache" / ("v%d" % QD.CACHE_SCHEMA)
+        self.assertTrue(current.is_dir())
+        stale = self.root / "cache" / ("v%d" % (QD.CACHE_SCHEMA - 1))
+        stale.mkdir(parents=True, exist_ok=True)
+        (stale / "old.json").write_text("{}", encoding="utf-8")
+        payload = self.run_json("tools", "--harness", "claude", "--json")
+        self.assertFalse(stale.exists())
+        self.assertEqual(payload["tool_calls"], 2)
+
+    def test_replayed_tool_calls_count_once(self) -> None:
+        session = "62000000-1111-2222-3333-444444444444"
+        resumed = "63000000-1111-2222-3333-444444444444"
+        now = time.time() - 3600
+        lines = [
+            claude_user_prompt_line(now, session),
+            claude_tool_use_line(
+                now + 1, session, "msg_1", [("toolu_r", "Grep")], output_tokens=5
+            ),
+            claude_tool_output_line(now + 2, session, "toolu_r", "g" * 100),
+        ]
+        self.write_claude("origin.jsonl", lines)
+        # A resumed transcript replays the same call under a new session id.
+        self.write_claude(
+            "resumed.jsonl",
+            [line.replace(session, resumed) for line in lines],
+        )
+        payload = self.run_json("tools", "--harness", "claude", "--json")
+        self.assertEqual(payload["tool_calls"], 1)
 
 
 if __name__ == "__main__":
