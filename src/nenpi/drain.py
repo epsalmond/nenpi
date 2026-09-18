@@ -1387,6 +1387,12 @@ def absorb(scan: Scan, entry: FileIndex, harness: str, account: str, account_lab
     claimed = scan.claimed
     kept = scan.events[harness]
     for row in entry.events:
+        # Every event's session gets an account stamp here too, not only the
+        # ones with a `SessionSummary` above: `attribute()` treats a session
+        # missing from `session_accounts` as "any pool" (fail-open), so a
+        # session known only through its events - never seen in
+        # `entry.sessions` - must never be credited to every account's pool.
+        scan.session_accounts.setdefault((harness, row[EVENT_SESSION]), (account, account_label))
         call_id = (harness, row[EVENT_ID]) if row[EVENT_ID] else None
         if call_id is not None:
             owner = claimed.get(call_id)
@@ -2899,18 +2905,36 @@ class Analysis:
 
 
 def filter_by_account(scan: Scan, label: str) -> None:
-    """Restrict a scan to one account label's sessions, events, and quota rows.
+    """Restrict a scan to one account's sessions, events, and quota rows.
+
+    `label` is a root's basename (what `--account` takes and what `nenpi
+    config` shows), but quota pools are keyed by account KEY, not label - two
+    roots can share one key (a re-pointed root, or the same login copied to
+    a second config dir) and both must stay in the pool together. So this
+    first resolves the label to its key(s) via the sessions already seen in
+    `scan.session_accounts`, then filters everything downstream by key.
 
     Filtering here, once, covers every report command that goes through
     `prepare` (sessions/prompts/fanout/windows/timeline/verify/calibrate)
     instead of adding a per-command re-check.
     """
-    keep = {
-        key for key, (_, account_label) in scan.session_accounts.items()
+    account_keys = {
+        account_key
+        for account_key, account_label in scan.session_accounts.values()
         if account_label == label
     }
-    if not keep:
-        warn("no sessions found for account %r; see `nenpi config`" % label)
+    if not account_keys:
+        known = sorted({
+            account_label for _, account_label in scan.session_accounts.values()
+        })
+        warn(
+            "%r matches no resolved root's account; known labels: %s (see `nenpi config`)"
+            % (label, ", ".join(known) if known else "none")
+        )
+    keep = {
+        session_key for session_key, (account_key, _) in scan.session_accounts.items()
+        if account_key in account_keys
+    }
     scan.sessions = dict(
         (key, value) for key, value in scan.sessions.items() if key in keep
     )
@@ -2918,7 +2942,7 @@ def filter_by_account(scan: Scan, label: str) -> None:
         scan.events[harness] = [
             row for row in events if (harness, row[EVENT_SESSION]) in keep
         ]
-    scan.snapshots = [row for row in scan.snapshots if row.get("account_label") == label]
+    scan.snapshots = [row for row in scan.snapshots if row.get("account") in account_keys]
     scan.boundaries = dict(
         (key, value) for key, value in scan.boundaries.items() if key in keep
     )
@@ -3120,9 +3144,10 @@ def command_windows(args: argparse.Namespace) -> int:
             continue
         for session_id, share in interval.sessions.items():
             entry["sessions"][session_id] = entry["sessions"].get(session_id, 0.0) + share
+    # `--account` is already applied to `scan` in `prepare` (`filter_by_account`),
+    # so `intervals`/`scan.snapshots` here hold only the selected account's
+    # pool; no re-check against `args.account` is needed.
     ordered = sorted(windows.values(), key=lambda item: item["start"], reverse=True)
-    if getattr(args, "account", None):
-        ordered = [entry for entry in ordered if entry["account_label"] == args.account]
     if args.json:
         payload = {
             "schema": JSON_SCHEMA,
@@ -3146,14 +3171,16 @@ def command_windows(args: argparse.Namespace) -> int:
     if not ordered:
         print("no Codex quota windows observed in range")
         return 0
+    label_width = max(len(entry["account_label"]) for entry in ordered)
     for entry in ordered:
         resets = entry["resets_at"]
         resets_text = local_label(float(resets)) if isinstance(resets, (int, float)) else "-"
         print(
             paint(
-                "window %s min  account %s  start %s  resets %s  peak %.1f%%"
+                "window %s min  account %-*s  start %s  resets %s  peak %.1f%%"
                 % (
                     entry["window_minutes"],
+                    label_width,
                     entry["account_label"],
                     local_label(entry["start"]),
                     resets_text,
@@ -4115,11 +4142,16 @@ def snapshot_from_stdin(destination: Path) -> int:
                              "resets_at": window.get("resets_at")}
         if not windows:
             return 0
-        if windows == last_statusline_windows(destination):
-            # The statusline runs on every prompt; only a change is news.
-            return 0
         config_env = os.environ.get("CLAUDE_CONFIG_DIR")
-        config_label = Path(config_env).expanduser().name if config_env else ".claude"
+        config_label = (
+            Path(config_env).expanduser().name if config_env else default_claude_config_label()
+        )
+        if windows == last_statusline_windows(destination, config_label):
+            # The statusline runs on every prompt; only a change for THIS
+            # account's config dir is news - comparing against the tail
+            # record regardless of account would drop every other reading
+            # once two config dirs start alternating (#9).
+            return 0
         append_snapshot(
             destination,
             {
@@ -4134,8 +4166,26 @@ def snapshot_from_stdin(destination: Path) -> int:
     return 0
 
 
-def last_statusline_windows(destination: Path) -> Optional[Dict[str, Any]]:
-    """The windows of the newest statusline record, read from the file tail."""
+def default_claude_config_label() -> str:
+    """The basename of the first resolved Claude root.
+
+    Used when `$CLAUDE_CONFIG_DIR` is unset, instead of hardcoding
+    `.claude`: a host whose only configured Claude root is renamed (e.g.
+    `.claude-arcade`) must still stamp its own label, not the literal
+    default that happens to be right only for an unconfigured host.
+    """
+    roots = resolve_roots("claude", [], load_config(), quiet=True)
+    return roots[0].name if roots else ".claude"
+
+
+def last_statusline_windows(destination: Path, config_label: str) -> Optional[Dict[str, Any]]:
+    """The windows of the newest statusline record for this config dir.
+
+    Dedup must be account-blind-safe: two config dirs (two accounts) polling
+    the statusline in alternation each keep their own "last seen" record, so
+    comparing only within `config_label` never drops a genuine reading from
+    the other account (#9).
+    """
     try:
         with open(destination, "rb") as handle:
             handle.seek(0, os.SEEK_END)
@@ -4149,7 +4199,11 @@ def last_statusline_windows(destination: Path) -> Optional[Dict[str, Any]]:
             record = json.loads(line)
         except ValueError:
             continue
-        if isinstance(record, dict) and record.get("source") == "statusline":
+        if (
+            isinstance(record, dict)
+            and record.get("source") == "statusline"
+            and record.get("config_dir") == config_label
+        ):
             windows = record.get("windows")
             return windows if isinstance(windows, dict) else None
     return None
