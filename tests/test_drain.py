@@ -6,6 +6,7 @@ data and must never be copied into this repository.
 
 from __future__ import annotations
 
+import argparse
 import contextlib
 import io
 import json
@@ -1068,6 +1069,52 @@ class AttributionCap(Harness):
         self.assertAlmostEqual(
             jump_pool["unattributed"], 29.0 - 0.18 - exempt_raw_share, places=6
         )
+
+    def test_no_codex_events_at_all_leaves_every_interval_fully_unattributed(self) -> None:
+        # `attribute()` used to `return` before the per-interval loop when
+        # there were no Codex usage events at all (not just none active in
+        # a given interval), leaving `interval.unattributed` at its 0.0
+        # default even though real drain was measured. That breaks
+        # sum(shares) + unattributed == drain for every interval.
+        intervals = [
+            QD.Interval(("acct", "lim", "plan", 300), 0.0, 100.0, 12.5, None, False),
+            QD.Interval(("acct", "lim", "plan", 300), 100.0, 200.0, 7.0, None, False),
+        ]
+        weights = QD.Weights({}, [])
+        args = argparse.Namespace(long_context_multiplier=1.0, claude_cache_read_weight=None)
+        QD.attribute(intervals, [], weights, args)
+        for interval in intervals:
+            self.assertAlmostEqual(interval.unattributed, interval.drain, places=6)
+            self.assertEqual(interval.sessions, {})
+
+    def test_prompt_shares_sum_to_the_whole_session_share(self) -> None:
+        # Only main-thread rows carry a prompt key (assigned by
+        # `assemble_prompts` before `attribute()` runs); a row that never
+        # joined a prompt group still counts toward the session's `shares`
+        # total. Dividing a prompt's units by the session's ALL-EVENT units
+        # (including that unkeyed row) used to leave the prompt's share
+        # short of the session's own attributed share. The denominator must
+        # be the session's PROMPT-KEYED units instead.
+        interval = QD.Interval(("acct", "lim", "plan", 300), 0.0, 100.0, 10.0, None, False)
+        session_id = "sess-1"
+        # event without a prompt key (e.g. a sub-thread row outside any
+        # prompt group): row length 13, no EVENT_PROMPT slot at all.
+        no_prompt_event = [session_id, "m", 10.0, 100_000, 0, 0, 0, 0, 0, 0, "", "", ""]
+        # event with a prompt key: row length 14, EVENT_PROMPT set.
+        with_prompt_event = (
+            [session_id, "m", 20.0, 200_000, 0, 0, 0, 0, 0, 0, "", "", ""] + [1]
+        )
+        self.assertEqual(len(no_prompt_event), QD.EVENT_PROMPT)
+        self.assertEqual(len(with_prompt_event), QD.EVENT_PROMPT + 1)
+        weights = QD.Weights({"codex": {"models": {"m": {"input": 1.0}}}}, ["test"])
+        args = argparse.Namespace(long_context_multiplier=1.0, claude_cache_read_weight=None)
+        QD.attribute([interval], [no_prompt_event, with_prompt_event], weights, args)
+        session_share = interval.sessions[session_id]
+        self.assertAlmostEqual(session_share, 10.0, places=6)
+        prompt_total = sum(
+            value for key, value in interval.prompts.items() if key[0] == session_id
+        )
+        self.assertAlmostEqual(prompt_total, session_share, places=6)
 
 
 class Calibration(Harness):

@@ -1771,6 +1771,15 @@ def attribute(
     ordered = sorted((event for event in events if event[EVENT_TS] is not None),
                      key=lambda event: event[EVENT_TS])
     if not ordered:
+        # No Codex usage events at all (a pool with snapshots but nothing
+        # scanned locally) still measured real drain across every interval;
+        # bailing out here used to leave `interval.unattributed` at its 0.0
+        # default, breaking sum(shares) + unattributed == drain. Route it
+        # through the same "whole drain unattributed" outcome the
+        # `total <= 0` path below gives an interval with events but no
+        # local session active.
+        for interval in intervals:
+            interval.unattributed = interval.drain
         return
     stamps = [event[EVENT_TS] for event in ordered]
     computed = {}  # type: Dict[int, Dict[str, Any]]
@@ -1780,6 +1789,7 @@ def attribute(
         total = 0.0
         shares = {}  # type: Dict[str, float]
         prompt_shares = {}  # type: Dict[Tuple[str, Any], float]
+        prompted_units = {}  # type: Dict[str, float]
         fallback_sessions = set()  # type: set
         for event in ordered[low:high]:
             account = session_accounts.get(("codex", event[EVENT_SESSION]))
@@ -1809,6 +1819,7 @@ def attribute(
             if len(event) > EVENT_PROMPT and event[EVENT_PROMPT] is not None:
                 prompt_key = (session_id, event[EVENT_PROMPT])
                 prompt_shares[prompt_key] = prompt_shares.get(prompt_key, 0.0) + units
+                prompted_units[session_id] = prompted_units.get(session_id, 0.0) + units
             for kind in CODEX_FIT_KINDS:
                 feature = (event[EVENT_MODEL], kind)
                 interval.features[feature] = (
@@ -1818,6 +1829,7 @@ def attribute(
             "total": total,
             "shares": shares,
             "prompt_shares": prompt_shares,
+            "prompted_units": prompted_units,
             "fallback_sessions": fallback_sessions,
         }
 
@@ -1864,9 +1876,15 @@ def attribute(
             # Split the SESSION's attributed (possibly capped) share across
             # its own turns, not the interval's raw drain - otherwise a
             # capped session's prompts still summed to the uncapped figure
-            # even though `sessions` reported the capped one.
+            # even though `sessions` reported the capped one. The
+            # denominator is the session's PROMPT-KEYED units, not its whole
+            # (all-event) units - only main-thread rows carry a prompt key,
+            # so an event outside any prompt group (e.g. a sub-thread call
+            # that never joined one) still counts toward `shares` but must
+            # not dilute the prompt split, or the prompts sum to less than
+            # the session's own attributed share.
             session_id = prompt_key[0]
-            session_units = shares.get(session_id, 0.0)
+            session_units = data["prompted_units"].get(session_id, 0.0)
             session_share = attributed.get(session_id, 0.0)
             interval.prompts[prompt_key] = (
                 session_share * units / session_units if session_units > 0 else 0.0
