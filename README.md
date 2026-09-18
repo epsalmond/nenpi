@@ -39,15 +39,24 @@ uv tool install 'nenpi[ui] @ git+https://github.com/epsalmond/nenpi'
 
 ```sh
 nenpi sessions --harness all --since 7d --top 25
+nenpi prompts --since 7d --sort turns --top 20
 nenpi prompts --session 0123abcd
 nenpi tools --since 7d --top 15
 ```
 
+`nenpi prompts` without `--session` ranks every prompt in range by API turns
+(or context, drain, tokens, units) across sessions, each row labelled with
+the first line the person typed, cut to 120 characters and scrubbed of email
+addresses and secret-shaped tokens. Injected blocks and pasted content never
+become a label — a turn that is only an injected block is named, not quoted.
+That short **label** is the only prompt text nenpi stores or prints;
+`--no-label` hides it. With `--session` it is the per-prompt breakdown of one
+session, unchanged.
+
 `nenpi tools` ranks tool calls by the context their results add, estimated as
 result characters / 4 and, where a later API call measured the growth, split
 across that turn's results. Only tool **names** and result **sizes** are ever
-parsed, cached or printed — never tool input or output text, and never prompt
-text.
+parsed, cached or printed — never tool input or output text.
 
 `nenpi-bench plan` projects a benchmark without spending quota. A
 `nenpi-bench run` executes controlled `claude -p` calls and **spends real

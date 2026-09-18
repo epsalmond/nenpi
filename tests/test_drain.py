@@ -4565,7 +4565,9 @@ class ToolAttribution(Harness):
         self.assertIn("Bash", blob)
         self.assertNotIn("x" * 20, blob)
         self.assertNotIn("y" * 20, blob)
-        self.assertNotIn("do the thing", blob)
+        # The redacted one-line prompt label is stored on purpose (#26); the
+        # tool payloads around it still are not.
+        self.assertIn("do the thing", blob)
         # Second run is served from the shard and must agree.
         second = self.run_json("tools", "--harness", "claude", "--json")
         self.assertEqual(first["tools"], second["tools"])
@@ -4602,7 +4604,6 @@ class ToolAttribution(Harness):
         )
         payload = self.run_json("tools", "--harness", "claude", "--json")
         self.assertEqual(payload["tool_calls"], 1)
-
 
 
     def test_tool_input_and_output_never_leave_the_parser(self) -> None:
@@ -4730,6 +4731,405 @@ class ToolAttribution(Harness):
         self.assertIn("UPPER BOUND", text)
         payload = self.run_json("tools", "--json")
         self.assertTrue(payload["measured_is_upper_bound"])
+
+def codex_task_complete_line(epoch: float) -> str:
+    return json.dumps(
+        {"type": "event_msg", "timestamp": iso(epoch),
+         "payload": {"type": "task_complete"}}
+    )
+
+
+def codex_user_message_line(epoch: float, text: str) -> str:
+    """A Codex user turn: the item the prompt label is read from."""
+    return json.dumps(
+        {
+            "type": "response_item",
+            "timestamp": iso(epoch),
+            "payload": {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": text}],
+            },
+        }
+    )
+
+
+class PromptLabelText(unittest.TestCase):
+    """Issue #26: a short redacted label, never the prompt itself."""
+
+    def test_first_line_only(self) -> None:
+        self.assertEqual(
+            QD.prompt_label("fix the parser\nand then rewrite the whole docs tree"),
+            "fix the parser",
+        )
+
+    def test_whitespace_is_collapsed(self) -> None:
+        self.assertEqual(QD.prompt_label("  fix\t  the   parser  "), "fix the parser")
+
+    def test_truncated_to_120_characters(self) -> None:
+        self.assertEqual(len(QD.prompt_label("word " * 200)), QD.PROMPT_LABEL_CHARS)
+        self.assertEqual(QD.PROMPT_LABEL_CHARS, 120)
+
+    def test_multiline_tag_block_is_dropped(self) -> None:
+        text = "<system-reminder>\nbookkeeping noise\n</system-reminder>\nthe real ask"
+        self.assertEqual(QD.prompt_label(text), "the real ask")
+
+    def test_single_line_tag_is_dropped(self) -> None:
+        text = "<command-name>/deploy</command-name>\nship it"
+        self.assertEqual(QD.prompt_label(text), "ship it")
+
+    def test_markers_come_from_a_fixed_vocabulary(self) -> None:
+        for text in (
+            "<system-reminder>\nx\n</system-reminder>",
+            "<local-command-stdout>\nx\n</local-command-stdout>",
+        ):
+            label = QD.prompt_label(text)
+            self.assertTrue(label.startswith("(") and label.endswith(")"), label)
+            self.assertIn(label[1:-1], QD.LABEL_INJECTED_TAGS)
+
+    def test_pasted_placeholder_ends_the_scan(self) -> None:
+        # Whatever follows the placeholder is the paste, never a label.
+        self.assertEqual(QD.prompt_label("[Pasted text +240 lines]\nPASTED BODY"), "")
+        self.assertEqual(QD.prompt_label("[Image #1]\nPASTED BODY"), "")
+
+    def test_typed_text_beside_an_injected_block_survives(self) -> None:
+        self.assertEqual(
+            QD.prompt_label("<system-reminder>noise</system-reminder> the real ask"),
+            "the real ask",
+        )
+        self.assertEqual(QD.prompt_label("do X <user_instructions>y</user_instructions>"),
+                         "do X")
+
+    def test_unknown_tag_is_typed_text(self) -> None:
+        self.assertEqual(QD.prompt_label("<Foo> is not closing"), "<Foo> is not closing")
+        self.assertEqual(QD.prompt_label("<div>markup I typed</div>"),
+                         "<div>markup I typed</div>")
+
+    def test_unterminated_injected_block_stops_the_scan(self) -> None:
+        text = "<system-reminder>\n" + "\n".join("noise %d" % n for n in range(10))
+        self.assertEqual(QD.prompt_label(text), "(system-reminder)")
+        self.assertNotIn("noise", QD.prompt_label(text))
+
+    def test_hex_run_after_an_underscore_is_redacted(self) -> None:
+        self.assertEqual(
+            QD.prompt_label("rotate api_key_" + "ab12" * 8), "rotate api_key_[redacted]"
+        )
+        self.assertEqual(
+            QD.prompt_label("tok_" + "Aa0+" * 12 + " please"), "tok_[redacted] please"
+        )
+
+    def test_injected_only_message_is_named_not_quoted(self) -> None:
+        # A turn that is nothing but an injected block is labelled with the
+        # block's name, from a fixed vocabulary - never its contents.
+        self.assertEqual(
+            QD.prompt_label("<environment_context>\nSECRET\n</environment_context>"),
+            "(environment_context)",
+        )
+        self.assertEqual(
+            QD.prompt_label("<task-notification>\nSECRET\nmore"), "(task-notification)"
+        )
+        self.assertEqual(QD.prompt_label(""), "")
+        self.assertEqual(QD.prompt_label(None), "")
+        self.assertEqual(QD.prompt_label("   \n  "), "")
+
+    def test_email_is_redacted(self) -> None:
+        self.assertEqual(
+            QD.prompt_label("mail nobody@example.invalid about it"),
+            "mail [redacted] about it",
+        )
+
+    def test_api_key_is_redacted(self) -> None:
+        label = QD.prompt_label("use sk-EXAMPLEEXAMPLEEXAMPLE for the call")
+        self.assertEqual(label, "use [redacted] for the call")
+
+    def test_github_token_is_redacted(self) -> None:
+        label = QD.prompt_label("push with ghp_EXAMPLEEXAMPLEEXAMPLE0000")
+        self.assertEqual(label, "push with [redacted]")
+
+    def test_bearer_token_is_redacted(self) -> None:
+        label = QD.prompt_label("send Authorization: Bearer EXAMPLEEXAMPLEEXAMPLE")
+        self.assertEqual(label, "send Authorization: [redacted]")
+
+    def test_long_hex_and_base64_are_redacted(self) -> None:
+        self.assertEqual(QD.prompt_label("token " + "ab12" * 10), "token [redacted]")
+        self.assertEqual(QD.prompt_label("token " + "Aa0+" * 12), "token [redacted]")
+
+    def test_short_words_survive(self) -> None:
+        self.assertEqual(QD.prompt_label("rebase onto main and run the tests"),
+                         "rebase onto main and run the tests")
+
+
+class PromptRanking(Harness):
+    """Issue #26: `prompts` without --session ranks across sessions."""
+
+    BUSY = "aaaa2601-1111-2222-3333-444444444444"
+    BIG = "bbbb2602-1111-2222-3333-444444444444"
+
+    def write_two_sessions(self) -> float:
+        now = time.time() - 3600
+        self.write_claude(
+            "busy.jsonl",
+            [claude_user_prompt_line(now, self.BUSY, text="rank me first please")]
+            + [
+                claude_assistant_line(
+                    now + step, self.BUSY, "msg_busy_%d" % step,
+                    input_tokens=1000, output_tokens=10,
+                )
+                for step in (1, 2, 3)
+            ],
+        )
+        self.write_claude(
+            "big.jsonl",
+            [
+                claude_user_prompt_line(now, self.BIG, text="one huge context prompt"),
+                claude_assistant_line(
+                    now + 1, self.BIG, "msg_big", input_tokens=500000, output_tokens=10
+                ),
+            ],
+        )
+        return now
+
+    def test_default_sort_is_turns(self) -> None:
+        self.write_two_sessions()
+        payload = self.run_json("prompts", "--harness", "claude", "--json")
+        rows = payload["prompts"]
+        self.assertEqual(payload["sort"], "turns")
+        self.assertEqual(rows[0]["session_id"], self.BUSY)
+        self.assertEqual(rows[0]["prompt_index"], 1)
+        self.assertEqual(rows[0]["label"], "rank me first please")
+        self.assertEqual(rows[0]["api_turns"], 3)
+        self.assertEqual(rows[1]["session_id"], self.BIG)
+        self.assertEqual(rows[1]["label"], "one huge context prompt")
+
+    def test_sort_context_and_tokens_promote_the_big_prompt(self) -> None:
+        self.write_two_sessions()
+        for key in ("context", "tokens"):
+            payload = self.run_json("prompts", "--harness", "claude", "--sort", key, "--json")
+            self.assertEqual(payload["prompts"][0]["session_id"], self.BIG, key)
+
+    def test_sort_drain_is_accepted(self) -> None:
+        self.write_two_sessions()
+        payload = self.run_json("prompts", "--harness", "claude", "--sort", "drain", "--json")
+        self.assertEqual(len(payload["prompts"]), 2)
+
+    def test_top_limits_the_ranking(self) -> None:
+        self.write_two_sessions()
+        payload = self.run_json("prompts", "--harness", "claude", "--top", "1", "--json")
+        self.assertEqual(len(payload["prompts"]), 1)
+
+    def test_text_ranking_shows_rank_and_label(self) -> None:
+        self.write_two_sessions()
+        result = self.run_tool("prompts", "--harness", "claude", "--no-color", "--width", "160")
+        self.assertEqual(result.returncode, 0, result.stderr.decode())
+        text = result.stdout.decode("utf-8")
+        self.assertIn("top 10 prompts by turns", text)
+        self.assertIn("rank me first please", text)
+        first = [line for line in text.splitlines() if "rank me first please" in line][0]
+        self.assertTrue(first.startswith("   1 "), first)
+        self.assertIn("claude", first)
+        self.assertIn("aaaa2601", first)
+
+    def test_no_label_hides_the_label_column(self) -> None:
+        self.write_two_sessions()
+        result = self.run_tool(
+            "prompts", "--harness", "claude", "--no-color", "--no-label", "--width", "160"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr.decode())
+        text = result.stdout.decode("utf-8")
+        self.assertNotIn("rank me first please", text)
+        self.assertIn("top 10 prompts by turns", text)
+
+    def test_per_session_output_is_unchanged(self) -> None:
+        self.write_two_sessions()
+        result = self.run_tool(
+            "prompts", "--session", "aaaa2601", "--no-color", "--width", "120"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr.decode())
+        text = result.stdout.decode("utf-8")
+        self.assertIn(
+            "#    start              wall  turns  ctx start   ctx peak input sent"
+            "     units note    ",
+            text,
+        )
+        self.assertNotIn("rank me first please", text)
+        self.assertNotIn("label", text)
+
+    def test_label_flag_adds_a_column_to_the_session_view(self) -> None:
+        self.write_two_sessions()
+        result = self.run_tool(
+            "prompts", "--session", "aaaa2601", "--label", "--no-color", "--width", "160"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr.decode())
+        self.assertIn("rank me first please", result.stdout.decode("utf-8"))
+
+    def test_label_survives_the_cache_shard(self) -> None:
+        self.write_two_sessions()
+        first = self.run_json("prompts", "--harness", "claude", "--json")
+        second = self.run_json("prompts", "--harness", "claude", "--json")
+        self.assertEqual(
+            [row["label"] for row in first["prompts"]],
+            [row["label"] for row in second["prompts"]],
+        )
+        self.assertEqual(second["prompts"][0]["label"], "rank me first please")
+
+    def test_cache_schema_is_five(self) -> None:
+        self.assertEqual(QD.CACHE_SCHEMA, 5)
+
+    def test_codex_label_comes_from_the_user_message(self) -> None:
+        now = time.time() - 3600
+        session = "cccc2603-1111-2222-3333-444444444444"
+        self.write_codex(
+            "rollout-label.jsonl",
+            [
+                codex_session_meta_line(now, session, "/home/agent/project"),
+                codex_user_message_line(now + 1, "<environment_context>\nnoise\n"
+                                                 "</environment_context>"),
+                codex_task_started_line(now + 2),
+                codex_user_message_line(now + 3, "codex please rank this"),
+                codex_turn_context_line(now + 4, "gpt-5.6-sol"),
+                codex_usage_record_line(
+                    now + 5, session, input_tokens=1000, cached_input_tokens=0,
+                    output_tokens=10, turn_id="turn-1",
+                ),
+            ],
+            day=now,
+        )
+        payload = self.run_json("prompts", "--harness", "codex", "--json")
+        self.assertEqual(payload["prompts"][0]["label"], "codex please rank this")
+
+    def test_pasted_body_never_reaches_the_shard_or_json_claude(self) -> None:
+        session = "dddd2604-1111-2222-3333-444444444444"
+        now = time.time() - 3600
+        self.write_claude(
+            "pasted.jsonl",
+            [
+                claude_user_prompt_line(
+                    now, session, text="[Pasted text +900 lines]\nPASTED BODY LINE"
+                ),
+                claude_assistant_line(now + 1, session, "msg_paste", input_tokens=10,
+                                      output_tokens=5),
+            ],
+        )
+        payload = self.run_json("prompts", "--harness", "claude", "--json")
+        blob = json.dumps(payload)
+        self.assertNotIn("PASTED BODY LINE", blob)
+        self.assertEqual(payload["prompts"][0]["label"], "")
+        shards = "\n".join(
+            path.read_text(encoding="utf-8") for path in (self.root / "cache").rglob("*.json")
+        )
+        self.assertNotIn("PASTED BODY LINE", shards)
+
+    def test_pasted_body_never_reaches_the_shard_or_json_codex(self) -> None:
+        session = "eeee2605-1111-2222-3333-444444444444"
+        now = time.time() - 3600
+        self.write_codex(
+            "rollout-pasted.jsonl",
+            [
+                codex_session_meta_line(now, session, "/home/agent/project"),
+                codex_user_message_line(
+                    now + 1, "[Pasted text +900 lines]\nPASTED BODY LINE"
+                ),
+                codex_task_started_line(now + 2),
+                codex_turn_context_line(now + 3, "gpt-5.6-sol"),
+                codex_usage_record_line(now + 4, session, input_tokens=100,
+                                        cached_input_tokens=0, output_tokens=10,
+                                        turn_id="turn-1"),
+            ],
+            day=now,
+        )
+        payload = self.run_json("prompts", "--harness", "codex", "--json")
+        blob = json.dumps(payload)
+        self.assertNotIn("PASTED BODY LINE", blob)
+        self.assertEqual(payload["prompts"][0]["label"], "")
+        shards = "\n".join(
+            path.read_text(encoding="utf-8") for path in (self.root / "cache").rglob("*.json")
+        )
+        self.assertNotIn("PASTED BODY LINE", shards)
+
+    def test_codex_interjection_does_not_label_the_next_prompt(self) -> None:
+        session = "ffff2606-1111-2222-3333-444444444444"
+        now = time.time() - 3600
+        self.write_codex(
+            "rollout-orphan.jsonl",
+            [
+                codex_session_meta_line(now, session, "/home/agent/project"),
+                codex_user_message_line(now + 1, "first real prompt"),
+                codex_task_started_line(now + 2),
+                codex_turn_context_line(now + 3, "gpt-5.6-sol"),
+                codex_usage_record_line(now + 4, session, input_tokens=100,
+                                        cached_input_tokens=0, output_tokens=10,
+                                        turn_id="turn-1"),
+                # Queued mid-turn; it never opens a boundary of its own.
+                codex_user_message_line(now + 5, "orphan interjection"),
+                codex_task_complete_line(now + 6),
+                codex_task_started_line(now + 40),
+                codex_turn_context_line(now + 41, "gpt-5.6-sol"),
+                codex_usage_record_line(now + 42, session, input_tokens=200,
+                                        cached_input_tokens=0, output_tokens=10,
+                                        turn_id="turn-2"),
+            ],
+            day=now,
+        )
+        payload = self.run_json("prompts", "--harness", "codex", "--json")
+        labels = [row["label"] for row in payload["prompts"]]
+        self.assertIn("first real prompt", labels)
+        self.assertNotIn("orphan interjection", labels)
+
+    def test_sort_units_is_accepted(self) -> None:
+        self.write_two_sessions()
+        payload = self.run_json("prompts", "--harness", "claude", "--sort", "units", "--json")
+        self.assertEqual(payload["sort"], "units")
+        self.assertEqual(payload["prompts"][0]["session_id"], self.BIG)
+
+    def test_ranking_shows_and_exports_cwd(self) -> None:
+        self.write_two_sessions()
+        payload = self.run_json("prompts", "--harness", "claude", "--json")
+        self.assertEqual(payload["prompts"][0]["cwd"], "project")
+        result = self.run_tool(
+            "prompts", "--harness", "claude", "--no-color", "--no-label", "--width", "160"
+        )
+        self.assertIn("cwd", result.stdout.decode("utf-8"))
+        self.assertIn("project", result.stdout.decode("utf-8"))
+
+    def test_label_and_no_label_work_in_both_modes(self) -> None:
+        self.write_two_sessions()
+        ranked_off = self.run_tool(
+            "prompts", "--harness", "claude", "--no-label", "--no-color", "--width", "160"
+        )
+        self.assertEqual(ranked_off.returncode, 0)
+        self.assertNotIn("rank me first please", ranked_off.stdout.decode("utf-8"))
+        ranked_on = self.run_tool(
+            "prompts", "--harness", "claude", "--label", "--no-color", "--width", "160"
+        )
+        self.assertEqual(ranked_on.returncode, 0)
+        self.assertIn("rank me first please", ranked_on.stdout.decode("utf-8"))
+        session_off = self.run_tool(
+            "prompts", "--session", "aaaa2601", "--no-label", "--no-color", "--width", "160"
+        )
+        self.assertEqual(session_off.returncode, 0)
+        self.assertNotIn("rank me first please", session_off.stdout.decode("utf-8"))
+        both = self.run_tool(
+            "prompts", "--harness", "claude", "--label", "--no-label", "--no-color"
+        )
+        self.assertNotEqual(both.returncode, 0)
+
+    def test_fanout_sorts_its_top_prompts_by_turns(self) -> None:
+        self.write_two_sessions()
+        default = self.run_json("fanout", "--harness", "claude", "--json")
+        self.assertEqual(default["sort"], "tokens")
+        self.assertEqual(default["top_prompts"][0]["session_id"], self.BIG)
+        by_turns = self.run_json("fanout", "--harness", "claude", "--sort", "turns", "--json")
+        self.assertEqual(by_turns["top_prompts"][0]["session_id"], self.BUSY)
+        self.assertEqual(by_turns["top_prompts"][0]["label"], "rank me first please")
+
+    def test_scanning_prompt_detail_carries_the_label(self) -> None:
+        self.write_two_sessions()
+        from nenpi import scanning
+
+        with self.env_applied():
+            payload = scanning.scan_sources([("claude", str(self.claude_projects))])
+        labels = {row["label"] for row in payload["prompts"]}
+        self.assertIn("rank me first please", labels)
 
 
 if __name__ == "__main__":

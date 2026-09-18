@@ -33,10 +33,11 @@ so cost grows faster than session length. See
 nenpi sessions    [--harness claude|codex|all] [--since 7d|2026-09-10] [--until ...]
                   [--window auto|five_hour|weekly] [--top 25]
                   [--sort drain|tokens|start] [--json] [--no-color] [--width N]
-nenpi prompts     --session <id-prefix> [--first] [--top N] [--tools]
+nenpi prompts     [--sort turns|context|drain|tokens|units] [--top N]
+                  [--label | --no-label] [--session <id-prefix> [--first] [--tools]]
 nenpi tools       [--session <id-prefix>] [--first] [--prompt N] [--top N]
                   [--sort context|calls|mean] [--harness ...] [--json]
-nenpi fanout      [--since ...] [--harness ...]
+nenpi fanout      [--since ...] [--harness ...] [--sort tokens|turns|...]
 nenpi reductions  [--since ...]
 nenpi timeline    [--bucket 1h|5h|1d]
 nenpi windows     [--harness codex]
@@ -93,7 +94,26 @@ largest drainer. The header says so.
 
 ### prompts
 
-Per-prompt breakdown for one session, plus two charts (input tokens sent per
+Without `--session`, every prompt in range is ranked together, one row per
+prompt: rank, harness, short session id, cwd, prompt index, API turns,
+subagent turns, peak context, measured drain, and the prompt's label.
+`--sort` picks `turns` (default), `context`, `drain`, `tokens` (input tokens
+sent) or `units`, `--top N` cuts the list (default 10), and `--no-label`
+drops the label column. `--json` returns the same rows with the full
+`session_id`, `prompt_index`, `cwd` and `label`.
+
+```
+top 10 prompts by turns across 63 sessions
+
+rank harness session    cwd              #  turns    sub   ctx peak    drain prompt
+   1 codex   01a0ab96   nenpi            7    929    713     116.8K    2.26% rerun the tests
+```
+
+The **label** is the one line the person typed that opened the prompt, cut to
+120 characters — see [What is stored](#performance-and-state) for what is
+scrubbed out of it first.
+
+With `--session`, the per-prompt breakdown for that session, plus two charts (input tokens sent per
 prompt, split cached and uncached; peak context per prompt) and a fitted
 growth summary:
 
@@ -132,9 +152,11 @@ A closing section lists the five largest single results by tool, session and
 prompt index. `--sort` picks `context` (default, estimated tokens), `calls`,
 or `mean`.
 
-`prompts --tools` adds the same numbers per prompt: call count, estimated
-tokens, and the tool behind the largest single result of that prompt. Without
-the flag the `prompts` table is unchanged.
+`prompts --session --tools` adds the same numbers per prompt: call count,
+estimated tokens, and the tool behind the largest single result of that
+prompt. `--label` adds the prompt label there too - it is on by default in
+the ranking and off with `--session`, and `--label`/`--no-label` work in
+both. Without either flag the per-session `prompts` table is unchanged.
 
 Only tool **names** and result **sizes** are read. Tool inputs and outputs are
 never stored in the cache, printed, or hashed.
@@ -143,7 +165,8 @@ never stored in the cache, printed, or hashed.
 
 Across every session in range: the turns-per-prompt distribution (histogram
 plus p50/p90/max), the peak-context-per-prompt distribution, and the top 15
-single prompts by input tokens sent.
+single prompts by input tokens sent; `--sort` reranks that table by `turns`,
+`context`, `drain` or `units` instead.
 
 ### reductions
 
@@ -762,11 +785,42 @@ Only the structural fields are read: `type`, `message.usage`, `message.id`,
 `message.model`, timestamps, ids, `cwd`, the Codex `rate_limits` and
 `turn_id`, and — for tool accounting — `tool_use.name` / `function_call.name`
 (MCP names kept whole, Codex namespaces qualified as `namespace.name`) with
-the character SIZE of each `tool_result` / `function_call_output`. Prompt
-text, tool result text and message content are never parsed into anything
-stored or printed: a result is measured and dropped. Claude user lines
-carrying tool results still bypass the prompt path on the raw-bytes screen;
-they now go through the size-only tool parser instead of being skipped.
+the character SIZE of each `tool_result` / `function_call_output`. Tool result
+text and message content are never parsed into anything stored or printed: a
+result is measured and dropped.
+
+One deliberate exception: each prompt's **label** is stored in its shard and
+printed by `prompts`. The label is the first line the person typed, and
+nothing else — the rest of the prompt is discarded before anything is kept:
+
+- Injected blocks are stripped, whether they close on the same line or span
+  several. The list is fixed: `system-reminder`, `user_instructions`,
+  `environment_context`, `recommended_plugins`, `pasted_content`,
+  `command-name`, `command-message`, `command-args`,
+  `local-command-stdout`, `local-command-stderr`, `local-command-caveat`,
+  `ide_selection`, `ide_opened_file`, `task-notification`. Anything else in
+  angle brackets is something the person typed and is kept.
+- A **pasted-content placeholder** (`[Pasted text …]`, `[Image #1]`) ends the
+  scan. The lines after it are the paste, and the paste is never a label.
+- A turn that is *only* an injected block — a task notification, a bare
+  slash-command expansion — is labelled with the block's name in
+  parentheses, e.g. `(task-notification)`. The name comes from the list
+  above, so such a label is a fixed vocabulary and carries nothing from
+  inside the block. The same goes for a block that never closes: the scan
+  stops rather than walking its body.
+- Whitespace is collapsed and the line is cut to 120 characters.
+- These become `[redacted]` first: email addresses, `sk-…`,
+  `ghp_`/`gho_`/`github_pat_…`, `xox…` and `AKIA…` keys, JWTs, `Bearer …`
+  values, hex runs of 32 characters or more, and base64-looking runs of 40 or
+  more. The runs are matched with lookarounds rather than word boundaries, so
+  `api_key_<hex>` is caught too.
+
+`--no-label` hides the column, and nothing longer than the label ever reaches
+the cache; delete `~/.cache/nenpi/` to drop the labels already stored.
+
+Claude user lines carrying tool results still bypass the prompt path on the
+raw-bytes screen; they now go through the size-only tool parser instead of
+being skipped.
 
 Reading those lines costs something: on a 14-day sweep of a real corpus the
 cold parse went from ~24 s to ~32 s and the cache from 34 MB to 43 MB (a
@@ -776,6 +830,10 @@ re-serializing it, which under-counts JSON punctuation by a fraction of a
 percent). Warm runs are unchanged. An issued call is forgotten once the next
 user turn starts in that file, so a result can only be named by a call of
 its own turn.
+
+Labels add two more Codex line kinds to the screen (`"role":"user"` and
+`"task_complete"`, the latter bounding how long a user message can wait for
+the prompt it opens), worth about 12% on a cold Codex-only scan.
 
 State lives in `~/.local/state/nenpi/` (`snapshots.jsonl`,
 `codex-weights.json`, `oauth-poll.json`), config in

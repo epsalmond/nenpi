@@ -199,8 +199,9 @@ def scan_sources(
     The mapping contains ``prompts`` and ``reductions`` drilldown lists;
     prompt rows expose ``turns``, ``input_tokens`` (also
     ``input_side_tokens``), ``context_start``, ``context_peak``, and
-    ``context_growth``, and per-prompt tool counts and result SIZES.  No
-    prompt or tool content is returned.
+    ``context_growth``, ``label`` (the redacted one-line prompt label), and
+    per-prompt tool counts and result SIZES.  No other prompt or tool content
+    is returned.
     Callers that need full structured lifecycle events should call
     ``nenpi.drain.prepare`` with a ``ScanStatus`` callback instead.
     """
@@ -351,6 +352,8 @@ def _prompt_detail(prompt: Any) -> Dict[str, Any]:
         "drain_percent": raw["drain_percent"],
         "model": raw["model"],
         "reduction": raw["reduction"],
+        # The redacted one-line prompt label, never the prompt itself.
+        "label": raw.get("label", ""),
         "tool_calls": raw["tool_calls"],
         "tool_result_chars": raw["tool_result_chars"],
         "tool_est_tokens": raw["tool_est_tokens"],

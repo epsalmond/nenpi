@@ -77,7 +77,7 @@ except ImportError:  # bench can load drain.py as a standalone quota module.
         serialized_cache,
     )
 
-CACHE_SCHEMA = 4
+CACHE_SCHEMA = 5
 JSON_SCHEMA = 1
 LONG_CONTEXT_THRESHOLD = 200_000
 CONTEXT_REDUCTION_FRACTION = 0.30
@@ -161,7 +161,10 @@ CODEX_LINE_MARKERS = (
     b'"token_usage_record"',
     b'"token_count"',
     b'"task_started"',
+    b'"task_complete"',
     b'"compacted"',
+    b'"role":"user"',
+    b'"role": "user"',
 )
 
 # A Claude user line that carries a tool result is a fan-out step, not a new
@@ -176,6 +179,52 @@ CLAUDE_NOT_A_PROMPT = (b'"toolUseResult"', b'"tool_result"')
 # passes the `"usage"` screen, so admitting on `"tool_use"` never let a line
 # through that was otherwise dropped - it only cost a second scan per line.
 CLAUDE_TOOL_MARKERS = (b'"tool_result"',)
+# A prompt label is the one human-typed first line of a user prompt, cut to
+# PROMPT_LABEL_CHARS and scrubbed of anything secret-shaped. The prompt itself
+# is never stored, printed, or hashed - see docs/drain.md, "What is stored".
+PROMPT_LABEL_CHARS = 120
+LABEL_SCAN_LINES = 64
+REDACTED = "[redacted]"
+# Blocks a harness injects into the user turn. Only these are dropped: any
+# other `<...>` in a prompt is something the person typed and is kept.
+LABEL_INJECTED_TAGS = frozenset((
+    "system-reminder",
+    "user_instructions",
+    "user-instructions",
+    "environment_context",
+    "recommended_plugins",
+    "pasted_content",
+    "command-name",
+    "command-message",
+    "command-args",
+    "local-command-stdout",
+    "local-command-stderr",
+    "local-command-caveat",
+    "ide_selection",
+    "ide_opened_file",
+    "task-notification",
+))
+LABEL_TAG_OPEN = re.compile(r"<\s*([A-Za-z][\w.:-]*)[^>]*>")
+# Attachment placeholders the harness substitutes for pasted bulk. Whatever
+# follows one is the paste itself, so the scan stops there.
+LABEL_PASTED_LINE = re.compile(
+    r"^\[(?:pasted|image|attachment|screenshot|file|request interrupted)",
+    re.IGNORECASE,
+)
+# Ordered: a broader pattern must not eat a narrower one's prefix.
+LABEL_REDACTIONS = (
+    re.compile(r"\beyJ[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]+"),
+    re.compile(r"\bsk-[A-Za-z0-9_-]{8,}"),
+    re.compile(r"\b(?:ghp|gho|ghu|ghs|ghr|github_pat)_[A-Za-z0-9_]{8,}"),
+    re.compile(r"\bxox[abprse]-[A-Za-z0-9-]{8,}"),
+    re.compile(r"\bAKIA[0-9A-Z]{12,}"),
+    re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]{8,}"),
+    re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+\.[A-Za-z0-9.-]*[A-Za-z]"),
+    # Lookarounds, not \b: `_` is a word character, so `api_key_<32 hex>`
+    # has no boundary before the run and would otherwise survive.
+    re.compile(r"(?<![0-9a-fA-F])[0-9a-fA-F]{32,}(?![0-9a-fA-F])"),
+    re.compile(r"(?<![A-Za-z0-9+/])[A-Za-z0-9+/]{40,}={0,2}(?![A-Za-z0-9+/])"),
+)
 CHARS_PER_TOKEN = 4.0
 # Tools whose call starts a child agent, so the child's usage can be read back
 # against the call that spawned it.
@@ -208,6 +257,134 @@ _TS_CACHE: Dict[str, float] = {}
 
 
 FRACTIONAL_SECONDS = re.compile(r"\.(\d+)")
+
+
+def redact_label(text: str) -> str:
+    """Replace secret-shaped substrings with `[redacted]`."""
+    for pattern in LABEL_REDACTIONS:
+        text = pattern.sub(REDACTED, text)
+    return text
+
+
+def strip_injected_spans(line: str) -> Tuple[str, Optional[str], Optional[str]]:
+    """Remove whole injected blocks from one line.
+
+    Returns the text a person typed around them, the closing tag still owed
+    when a block opened without closing on this line, and the name of the
+    first injected block seen.
+    """
+    position = 0
+    seen = None  # type: Optional[str]
+    while True:
+        match = LABEL_TAG_OPEN.search(line, position)
+        if match is None:
+            return line.strip(), None, seen
+        name = match.group(1)
+        if name.lower() not in LABEL_INJECTED_TAGS:
+            # Something the person typed that happens to look like a tag.
+            position = match.end()
+            continue
+        if seen is None:
+            seen = name.lower()
+        closing = "</%s>" % name
+        end = line.find(closing, match.end())
+        if end < 0:
+            return line[: match.start()].strip(), closing, seen
+        line = line[: match.start()] + " " + line[end + len(closing):]
+        position = match.start()
+
+
+def prompt_label(text: Any) -> str:
+    """Return a short, redacted label for one user prompt.
+
+    Only what a person typed on the first such line survives: injected blocks
+    are stripped, a pasted-content placeholder ends the scan so the paste can
+    never become the label, the rest of the prompt is dropped, whitespace is
+    collapsed, obvious secrets are redacted, and the result is cut to
+    PROMPT_LABEL_CHARS. The full prompt is never returned, so nothing longer
+    can reach the cache or the terminal.
+    """
+    if not isinstance(text, str) or not text:
+        return ""
+    lines = text.split("\n")[:LABEL_SCAN_LINES]
+    skip_until = None  # type: Optional[str]
+    # A turn that is nothing but an injected block - a task notification, a
+    # slash-command expansion - is labelled with the block's name and nothing
+    # from inside it. The name comes from LABEL_INJECTED_TAGS, so the label
+    # stays a fixed vocabulary rather than transcript text.
+    injected = None  # type: Optional[str]
+    for position, raw_line in enumerate(lines):
+        line = raw_line.strip()
+        if not line:
+            continue
+        if skip_until is not None:
+            end = line.find(skip_until)
+            if end < 0:
+                continue
+            line = line[end + len(skip_until):].strip()
+            skip_until = None
+            if not line:
+                continue
+        if LABEL_PASTED_LINE.match(line):
+            # The next lines are the pasted body, not a prompt.
+            return ""
+        line, unterminated, tag = strip_injected_spans(line)
+        if line:
+            return redact_label(" ".join(line.split()))[:PROMPT_LABEL_CHARS]
+        if injected is None and tag is not None:
+            injected = tag
+        if unterminated is not None:
+            if not any(unterminated in rest for rest in lines[position + 1:]):
+                # An injected block that never closes in what we will read;
+                # skipping on would only walk its body.
+                break
+            skip_until = unterminated
+    return "(%s)" % injected if injected else ""
+
+
+def label_rank(label: str) -> int:
+    """How much a label is worth: typed text beats a block name beats none.
+
+    Codex writes its injected context as its own user message just before the
+    typed one, so both compete for the same prompt.
+    """
+    if not label:
+        return 0
+    return 1 if label.startswith("(") and label.endswith(")") else 2
+
+
+def claude_prompt_text(message: Mapping[str, Any]) -> str:
+    """The text blocks of one Claude user message, for `prompt_label` only."""
+    content = message.get("content")
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return ""
+    parts = []
+    for block in content:
+        if isinstance(block, dict) and block.get("type") == "text":
+            value = block.get("text")
+            if isinstance(value, str):
+                parts.append(value)
+    return "\n".join(parts)
+
+
+def codex_prompt_text(payload: Mapping[str, Any]) -> str:
+    """The text blocks of one Codex user message, for `prompt_label` only."""
+    content = payload.get("content")
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return ""
+    parts = []
+    for block in content:
+        if not isinstance(block, dict):
+            continue
+        if block.get("type") in ("input_text", "text", "output_text"):
+            value = block.get("text")
+            if isinstance(value, str):
+                parts.append(value)
+    return "\n".join(parts)
 
 
 def parse_timestamp(value: Any) -> Optional[float]:
@@ -790,6 +967,10 @@ class FileIndex:
         # not been read yet. Kept across incremental parses because a call and
         # its result can straddle the resume offset.
         self.pending_tools = []  # type: List[List[Any]]
+        # A Codex user message arrives just before the task_started /
+        # turn_context pair that opens its prompt, and can straddle the resume
+        # offset, so the label waits here until a boundary claims it.
+        self.pending_label = ""
         self.thread_id = ""
         self.is_subagent = False
         self.head_hash = ""
@@ -813,6 +994,7 @@ class FileIndex:
             "compactions": self.compactions,
             "tools": self.tools,
             "pending_tools": self.pending_tools,
+            "pending_label": self.pending_label,
             "thread_id": self.thread_id,
             "is_subagent": self.is_subagent,
             "head_hash": self.head_hash,
@@ -838,6 +1020,7 @@ class FileIndex:
         index.compactions = list(payload.get("compactions") or [])
         index.tools = list(payload.get("tools") or [])
         index.pending_tools = list(payload.get("pending_tools") or [])
+        index.pending_label = str(payload.get("pending_label", ""))
         index.thread_id = str(payload.get("thread_id", ""))
         index.is_subagent = bool(payload.get("is_subagent"))
         index.head_hash = str(payload.get("head_hash", ""))
@@ -1112,7 +1295,10 @@ def parse_claude_file(
             if is_claude_prompt(record, is_subagent_file):
                 epoch = parse_timestamp(record.get("timestamp"))
                 if epoch is not None:
-                    index.boundaries.append([session_id, epoch])
+                    label = prompt_label(
+                        claude_prompt_text(record.get("message") or {})
+                    )
+                    index.boundaries.append([session_id, epoch, label])
                     summary.touch(epoch)
                 expire_pending_tools(index)
                 continue
@@ -1324,6 +1510,12 @@ def parse_codex_file(
                 name = codex_tool_name(payload, item)
                 if isinstance(call_id, str):
                     remember_tool(index, call_id, name, index.is_subagent)
+            elif item == "message" and payload.get("role") == "user":
+                # Only the label is taken; the message body is never kept.
+                if not index.is_subagent:
+                    label = prompt_label(codex_prompt_text(payload))
+                    if label_rank(label) > label_rank(index.pending_label):
+                        index.pending_label = label
             elif item in CODEX_TOOL_OUTPUT_ITEMS:
                 call_id = payload.get("call_id") or payload.get("id")
                 record_tool(
@@ -1338,7 +1530,8 @@ def parse_codex_file(
 
         if kind == "turn_context":
             if epoch is not None and not index.is_subagent:
-                add_boundary(index.boundaries, session_id, epoch)
+                add_boundary(index.boundaries, session_id, epoch, index.pending_label)
+                index.pending_label = ""
             candidate = payload.get("model")
             collaboration = payload.get("collaboration_mode")
             if isinstance(collaboration, dict):
@@ -1377,9 +1570,17 @@ def parse_codex_file(
             )
             continue
 
+        if kind == "event_msg" and payload.get("type") == "task_complete":
+            # The turn is over. A user message that never opened a boundary of
+            # its own - an interjection queued mid-turn - must not label the
+            # next prompt.
+            index.pending_label = ""
+            continue
+
         if kind == "event_msg" and payload.get("type") == "task_started":
             if epoch is not None and not index.is_subagent:
-                add_boundary(index.boundaries, session_id, epoch)
+                add_boundary(index.boundaries, session_id, epoch, index.pending_label)
+                index.pending_label = ""
             expire_pending_tools(index)
             continue
 
@@ -1467,17 +1668,22 @@ def is_codex_subagent(payload: Mapping[str, Any]) -> bool:
     return False
 
 
-def add_boundary(boundaries: List[List[Any]], session_id: str, epoch: float) -> None:
+def add_boundary(
+    boundaries: List[List[Any]], session_id: str, epoch: float, label: str = ""
+) -> None:
     """Record a prompt start, collapsing the task_started/turn_context pair.
 
     Codex writes both within a second or two of each other for the same user
-    turn, so a naive append would double every prompt.
+    turn, so a naive append would double every prompt. A label seen after the
+    first of the pair still lands on the boundary it belongs to.
     """
     if boundaries:
-        last_session, last_epoch = boundaries[-1][0], boundaries[-1][1]
-        if last_session == session_id and abs(epoch - last_epoch) <= BOUNDARY_DEDUP_SECONDS:
+        last = boundaries[-1]
+        if last[0] == session_id and abs(epoch - last[1]) <= BOUNDARY_DEDUP_SECONDS:
+            if len(last) > 2 and label_rank(label) > label_rank(last[2]):
+                last[2] = label
             return
-    boundaries.append([session_id, epoch])
+    boundaries.append([session_id, epoch, label])
 
 
 def record_event(
@@ -1759,6 +1965,9 @@ class Scan:
         self.claimed_tools = {}  # type: Dict[Tuple[str, str], str]
         self.snapshots = []  # type: List[Dict[str, Any]]
         self.boundaries = {}  # type: Dict[Tuple[str, str], List[float]]
+        # (harness, session) -> {boundary epoch: redacted prompt label}. One
+        # short line per prompt; see `prompt_label`.
+        self.prompt_labels = {}  # type: Dict[Tuple[str, str], Dict[float, str]]
         self.compactions = {}  # type: Dict[Tuple[str, str], List[float]]
         self.claimed = {}  # type: Dict[Tuple[str, str], str]
         self.forks = {}  # type: Dict[Tuple[str, str], Dict[str, int]]
@@ -1946,7 +2155,12 @@ def absorb(scan: Scan, entry: FileIndex, harness: str, account: str, account_lab
         stamped_row["account_label"] = account_label
         scan.snapshots.append(stamped_row)
     for row in entry.boundaries:
-        scan.boundaries.setdefault((harness, str(row[0])), []).append(float(row[1]))
+        key = (harness, str(row[0]))
+        epoch = float(row[1])
+        scan.boundaries.setdefault(key, []).append(epoch)
+        label = str(row[2]) if len(row) > 2 and row[2] else ""
+        if label:
+            scan.prompt_labels.setdefault(key, {})[epoch] = label
     for row in entry.compactions:
         scan.compactions.setdefault((harness, str(row[0])), []).append(float(row[1]))
 
@@ -2629,6 +2843,11 @@ class Prompt:
         self.drain_percent = None  # type: Optional[float]
         self.model = UNWEIGHTED
         self.reduction = ""
+        # The redacted one-line label of the user prompt; see `prompt_label`.
+        self.label = ""
+        # The session's working directory, basename only, as `cwd_label` cuts
+        # it. "-" when the transcript never named one.
+        self.cwd = "-"
         # Tool aggregates, filled by attribute_tools. Sizes only.
         self.tool_calls = 0
         self.tool_chars = 0
@@ -2671,6 +2890,8 @@ class Prompt:
             "drain_percent": self.drain_percent,
             "model": self.model,
             "reduction": self.reduction,
+            "label": self.label,
+            "cwd": self.cwd,
             "tool_calls": self.tool_calls,
             "tool_result_chars": self.tool_chars,
             "tool_est_tokens": self.tool_est_tokens,
@@ -2894,15 +3115,20 @@ def assemble_prompts(
         for session_id, rows in group_events_by_session(events, cancellation).items():
             check_cancelled(cancellation)
             bounds = sorted(scan.boundaries.get((harness, session_id), []))
+            labels = scan.prompt_labels.get((harness, session_id), {})
+            summary = scan.sessions.get((harness, session_id))
+            cwd = cwd_label(summary.cwd) if summary is not None else "-"
             groups = group_rows_by_prompt(rows, bounds, harness)
             prompts = []
             for position, (start_ts, group) in enumerate(groups, start=1):
                 if watch:
                     check_cancelled(cancellation)
-                prompts.append(
-                    build_prompt(harness, session_id, position, start_ts, group, kinds,
-                                 weights, args, cancellation)
-                )
+                prompt = build_prompt(harness, session_id, position, start_ts, group,
+                                      kinds, weights, args, cancellation)
+                if labels:
+                    prompt.label = labels.get(start_ts, "")
+                prompt.cwd = cwd
+                prompts.append(prompt)
             if prompts:
                 assembled[(harness, session_id)] = prompts
     return assembled
@@ -4097,6 +4323,9 @@ def filter_by_account(scan: Scan, label: str) -> None:
     scan.boundaries = dict(
         (key, value) for key, value in scan.boundaries.items() if key in keep
     )
+    scan.prompt_labels = dict(
+        (key, value) for key, value in scan.prompt_labels.items() if key in keep
+    )
     scan.compactions = dict(
         (key, value) for key, value in scan.compactions.items() if key in keep
     )
@@ -4776,8 +5005,104 @@ def session_unit_totals(analysis: "Analysis") -> Dict[Tuple[str, str], float]:
     return totals
 
 
+PROMPTS_SESSION_TOP = 25
+PROMPTS_RANK_TOP = 10
+PROMPT_RANK_KEYS = {
+    "turns": lambda prompt: (prompt.turns, prompt.sub_turns, prompt.units),
+    "context": lambda prompt: (prompt.context_peak, prompt.turns),
+    "drain": lambda prompt: (prompt.drain_percent or 0.0, prompt.units),
+    "tokens": lambda prompt: (prompt.input_tokens, prompt.turns),
+    "units": lambda prompt: (prompt.units, prompt.turns),
+}
+
+
+def rank_prompts(
+    analysis: "Analysis", sort: str, top: int
+) -> List[Prompt]:
+    """The prompts in range, busiest first by `sort`, cut to `top`."""
+    prompts = [
+        prompt
+        for session_prompts in analysis.prompts.values()
+        for prompt in session_prompts
+        if analysis.in_range(prompt.start) or analysis.in_range(prompt.end)
+    ]
+    # Sorted by identity first so the metric sort, which is stable, breaks
+    # its own ties the same way on every run.
+    prompts.sort(key=lambda prompt: (prompt.harness, prompt.session_id, prompt.index))
+    prompts.sort(key=PROMPT_RANK_KEYS[sort], reverse=True)
+    return prompts[:top] if top else prompts
+
+
+def format_prompt_drain(prompt: Prompt) -> str:
+    if prompt.drain_percent is None:
+        return "-"
+    return "%.2f%%" % prompt.drain_percent
+
+
+def command_prompts_ranked(args: argparse.Namespace, analysis: "Analysis") -> int:
+    """`prompts` with no --session: one row per prompt, across sessions."""
+    top = args.top if args.top is not None else PROMPTS_RANK_TOP
+    shown = rank_prompts(analysis, args.sort, top)
+    if args.json:
+        print(
+            json.dumps(
+                {
+                    "schema": JSON_SCHEMA,
+                    "command": "prompts",
+                    "sort": args.sort,
+                    "top": top,
+                    "prompts": [
+                        dict(prompt.to_json(), prompt_index=prompt.index)
+                        for prompt in shown
+                    ],
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        return 0
+    paint = make_painter(args)
+    print(
+        paint(
+            "top %d prompts by %s across %d sessions"
+            % (top or len(shown), args.sort, len(analysis.prompts)),
+            "bold",
+        )
+    )
+    if not shown:
+        print("no prompts in range")
+        return 0
+    print("")
+    columns = "%4s %-7s %-10s %-14s %5s %6s %6s %10s %8s" % (
+        "rank", "harness", "session", "cwd", "#", "turns", "sub", "ctx peak",
+        "drain")
+    with_label = args.label is not False
+    label_width = max(20, terminal_width(args) - len(columns) - 1)
+    if with_label:
+        columns += " %-*s" % (label_width, "prompt")
+    print(paint(columns.rstrip(), "bold"))
+    for rank, prompt in enumerate(shown, start=1):
+        line = "%4d %-7s %-10s %-14s %5d %6d %6d %10s %8s" % (
+            rank,
+            prompt.harness,
+            short_id(prompt.session_id),
+            prompt.cwd[:14],
+            prompt.index,
+            prompt.turns,
+            prompt.sub_turns,
+            format_tokens(prompt.context_peak),
+            format_prompt_drain(prompt),
+        )
+        if with_label:
+            line += " " + prompt.label[:label_width]
+        print(line.rstrip())
+    return 0
+
+
 def command_prompts(args: argparse.Namespace) -> int:
     analysis = prepare(args)
+    if not getattr(args, "session", None):
+        return command_prompts_ranked(args, analysis)
     candidates = dict(
         (key, sum(prompt.units for prompt in prompts))
         for key, prompts in analysis.prompts.items()
@@ -4789,7 +5114,8 @@ def command_prompts(args: argparse.Namespace) -> int:
     prompts = analysis.prompts[key]
     mark_reductions(prompts, analysis)
     growth = fit_growth(prompts)
-    shown = prompts[-args.top:] if args.top and len(prompts) > args.top else prompts
+    top = args.top if args.top is not None else PROMPTS_SESSION_TOP
+    shown = prompts[-top:] if top and len(prompts) > top else prompts
     if args.json:
         print(
             json.dumps(
@@ -4823,10 +5149,14 @@ def command_prompts(args: argparse.Namespace) -> int:
     )
     print("")
     with_tools = getattr(args, "tools", False)
+    with_label = getattr(args, "label", None) is True
+    label_width = max(20, width - 110)
     header = "%-4s %-16s %6s %6s %10s %10s %10s %9s %-8s" % (
         "#", "start", "wall", "turns", "ctx start", "ctx peak", "input sent", "units", "note")
     if with_tools:
         header += " %6s %10s %-16s" % ("tools", "tool est", "largest tool")
+    if with_label:
+        header += " %-*s" % (label_width, "prompt")
     print(paint(header, "bold"))
     for prompt in shown:
         line = (
@@ -4849,6 +5179,9 @@ def command_prompts(args: argparse.Namespace) -> int:
                 format_tokens(prompt.tool_est_tokens),
                 prompt.top_tool[:16],
             )
+        if with_label:
+            line += " " + prompt.label[:label_width]
+            line = line.rstrip()
         print(line)
     print("")
     bar_width = max(10, width - 30)
@@ -5085,7 +5418,8 @@ def command_fanout(args: argparse.Namespace) -> int:
         return 0
     turns = [float(prompt.turns) for prompt in prompts]
     contexts = [float(prompt.context_peak) for prompt in prompts]
-    top = sorted(prompts, key=lambda prompt: prompt.input_tokens, reverse=True)[:15]
+    sort = getattr(args, "sort", "tokens")
+    top = sorted(prompts, key=PROMPT_RANK_KEYS[sort], reverse=True)[:15]
     cwds = {}  # type: Dict[Tuple[str, str], str]
     for (harness, session_id), summary in analysis.scan.sessions.items():
         cwds[(harness, session_id)] = cwd_label(summary.cwd)
@@ -5103,6 +5437,7 @@ def command_fanout(args: argparse.Namespace) -> int:
             "p90": percentile(contexts, 0.9),
             "max": max(contexts),
         },
+        "sort": sort,
         "turns_histogram": histogram(turns, (1, 2, 3, 5, 10, 20, 50, 100)),
         "context_histogram": histogram(
             contexts, (10_000, 50_000, 100_000, 200_000, 400_000, 800_000)
@@ -5136,7 +5471,9 @@ def command_fanout(args: argparse.Namespace) -> int:
     render_histogram(paint, "peak context per prompt", summary_json["context_histogram"],
                      terminal_width(args), tokens=True)
     print("")
-    print(paint("top 15 single prompts by input tokens sent", "bold"))
+    print(paint(
+        "top 15 single prompts by %s"
+        % ("input tokens sent" if sort == "tokens" else sort), "bold"))
     print(paint("%-7s %-10s %-18s %5s %6s %10s %10s" % (
         "harness", "session", "cwd", "#", "turns", "ctx peak", "input"), "bold"))
     for prompt in top:
@@ -5958,26 +6295,51 @@ def build_parser() -> argparse.ArgumentParser:
     calibrate.set_defaults(handler=command_calibrate, harness="codex")
 
     prompts = sub.add_parser(
-        "prompts", help="inspect fan-out and context growth for one session",
-        description="Show per-prompt input, context, turns, weighted units, and growth fits.",
-        epilog="Example:\n  nenpi prompts --session 0123abcd --top 40 --since 7d",
+        "prompts", help="rank prompts across sessions, or break down one session",
+        description=(
+            "Without --session, rank every prompt in range by turns (or context, "
+            "drain, tokens) with a short redacted label. With --session, show that "
+            "session's per-prompt input, context, turns, weighted units, and "
+            "growth fits."
+        ),
+        epilog="Examples:\n"
+               "  nenpi prompts --since 7d --sort turns --top 20\n"
+               "  nenpi prompts --session 0123abcd --top 40 --since 7d",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     add_common(prompts)
     prompts.add_argument(
-        "--session", required=True, metavar="ID_PREFIX",
-        help="required session ID prefix; an ambiguous prefix is an error",
+        "--session", default=None, metavar="ID_PREFIX",
+        help="break down one session by ID prefix; an ambiguous prefix is an error. "
+             "Without it, prompts from every session in range are ranked together",
     )
     prompts.add_argument(
         "--first", action="store_true",
         help="with an ambiguous --session prefix, use the busiest match instead of failing",
     )
     prompts.add_argument(
+        "--sort", choices=tuple(sorted(PROMPT_RANK_KEYS)), default="turns",
+        help="ranking key without --session: API turns (default), peak context, "
+             "measured drain, input tokens sent, or weighted units",
+    )
+    prompts.add_argument(
         "--tools", action="store_true",
         help="add per-prompt tool columns: call count, estimated tokens added, "
              "and the largest single result's tool",
     )
-    prompts.set_defaults(handler=command_prompts)
+    label_flag = prompts.add_mutually_exclusive_group()
+    label_flag.add_argument(
+        "--label", dest="label", action="store_true", default=None,
+        help="show the redacted prompt label column (the default for the "
+             "cross-session ranking; opt-in with --session)",
+    )
+    label_flag.add_argument(
+        "--no-label", dest="label", action="store_false",
+        help="hide the redacted prompt label column",
+    )
+    # `--top` means "last N of this session" with --session and "top N of the
+    # ranking" without, so its default is resolved in the handler.
+    prompts.set_defaults(handler=command_prompts, top=None)
 
     tools = sub.add_parser(
         "tools", help="rank tool calls by the context they add",
@@ -6015,6 +6377,11 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     add_common(fanout)
+    fanout.add_argument(
+        "--sort", choices=tuple(sorted(PROMPT_RANK_KEYS)), default="tokens",
+        help="rank the top-prompts table by input tokens sent (default), API "
+             "turns, peak context, measured drain, or weighted units",
+    )
     fanout.set_defaults(handler=command_fanout)
 
     reductions = sub.add_parser(
