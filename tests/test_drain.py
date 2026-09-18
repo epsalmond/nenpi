@@ -6,6 +6,7 @@ data and must never be copied into this repository.
 
 from __future__ import annotations
 
+import argparse
 import contextlib
 import io
 import json
@@ -687,6 +688,433 @@ class MeasuredAttribution(Harness):
             window["top_sessions"][0]["drain_percent"],
             window["top_sessions"][1]["drain_percent"],
         )
+
+
+class DrainIntervalRules(Harness):
+    """Unit-level coverage of build_intervals rules (a)/(b)/(c), #16/#17."""
+
+    def make_row(self, ts: float, used: float, resets_at: Any,
+                window_minutes: int = 300) -> Dict[str, Any]:
+        return {
+            "ts": ts, "used_percent": used, "resets_at": resets_at,
+            "window_minutes": window_minutes, "account": "acct",
+            "limit_id": "codex", "plan_type": "pro",
+        }
+
+    def test_decrease_then_rise_starts_the_interval_at_the_low_reading(self) -> None:
+        # 40 -> 30 -> 35: the interval is the 5-point rise from the 30
+        # reading, not 0 (stuck at the old high-water mark) and not 5
+        # measured back from the 40 reading.
+        now = time.time() - 3600
+        resets = int(now) + 7200
+        rows = [
+            self.make_row(now, 40.0, resets),
+            self.make_row(now + 600, 30.0, resets),
+            self.make_row(now + 1200, 35.0, resets),
+        ]
+        intervals = QD.build_intervals(rows, 300)
+        self.assertEqual(len(intervals), 1)
+        self.assertAlmostEqual(intervals[0].drain, 5.0, places=6)
+        self.assertEqual(intervals[0].start, now + 600)
+        self.assertEqual(intervals[0].end, now + 1200)
+        self.assertFalse(intervals[0].rollover)
+
+    def test_jitter_within_tolerance_is_not_a_new_baseline(self) -> None:
+        # 40 -> 39 -> 41: the 1-point dip is vendor jitter (<= JITTER_TOLERANCE)
+        # and must not become the new baseline - if it did, the following
+        # rise would be measured as 39 -> 41 (+2) on top of the 40 already
+        # attributed, over-charging by 2. Keeping the baseline at 40 across
+        # the dip means the rise to 41 is correctly +1 over the 40 already
+        # attributed, and the interval reaches back to the ORIGINAL anchor.
+        now = time.time() - 3600
+        resets = int(now) + 7200
+        rows = [
+            self.make_row(now, 40.0, resets),
+            self.make_row(now + 600, 39.0, resets),
+            self.make_row(now + 1200, 41.0, resets),
+        ]
+        intervals = QD.build_intervals(rows, 300)
+        self.assertEqual(len(intervals), 1)
+        self.assertAlmostEqual(intervals[0].drain, 1.0, places=6)
+        self.assertEqual(intervals[0].start, now)
+        self.assertEqual(intervals[0].end, now + 1200)
+
+    def test_decrease_beyond_tolerance_is_not_jitter(self) -> None:
+        now = time.time() - 3600
+        resets = int(now) + 7200
+        rows = [
+            self.make_row(now, 40.0, resets),
+            # A drop of 10 is well past JITTER_TOLERANCE (2): a real decrease.
+            self.make_row(now + 600, 30.0, resets),
+        ]
+        intervals = QD.build_intervals(rows, 300)
+        self.assertEqual(len(intervals), 0)
+
+    def test_slide_with_unchanged_used_is_not_a_rollover(self) -> None:
+        # resets_at drifts (an idle pool re-stamping resets_at = now + 7d)
+        # but used_percent does not: no drain evidence, so no interval,
+        # regardless of the resets_at churn.
+        now = time.time() - 3600
+        resets = int(now) + 7200
+        rows = [
+            self.make_row(now, 40.0, resets),
+            self.make_row(now + 600, 40.0, resets + 70),
+            self.make_row(now + 1200, 40.0, resets + 140),
+        ]
+        intervals = QD.build_intervals(rows, 300)
+        self.assertEqual(len(intervals), 0)
+
+    def test_idle_zero_used_slide_produces_no_interval(self) -> None:
+        now = time.time() - 3600
+        resets = int(now) + 604800
+        rows = [
+            self.make_row(now + index * 70, 0.0, resets + index * 70)
+            for index in range(5)
+        ]
+        intervals = QD.build_intervals(rows, 300)
+        self.assertEqual(len(intervals), 0)
+
+
+class AttributionCap(Harness):
+    """CLI-level coverage of the attribution cap and the #17 windows fix."""
+
+    def write_dense_phase(self, base: int, session: str, resets: int) -> None:
+        """Three non-rollover intervals at a known 0.1%/unit rate.
+
+        `gpt-5.6-sol` prices `input` at 100.0 credit units per Mtok, so
+        100_000 tokens is 10.0 weighted units; each interval's drain is 1.0,
+        so drain/units == 0.1 for every one of them - enough samples
+        (>= MIN_RATE_INTERVALS) and enough coverage (>= MIN_RATE_UNITS) for
+        the pool to measure its own rate instead of falling back.
+        """
+        lines = [
+            codex_session_meta_line(base, session, "/home/agent/dense"),
+            codex_turn_context_line(base, "gpt-5.6-sol"),
+            codex_token_count_line(base + 5, rate_limits=rate_limits(10.0, resets)),
+        ]
+        used = 10.0
+        for step in range(3):
+            offset = 10 + step * 10
+            lines.append(
+                codex_usage_record_line(
+                    base + offset, session, input_tokens=100_000, cached_input_tokens=0,
+                    output_tokens=0
+                )
+            )
+            used += 1.0
+            lines.append(
+                codex_token_count_line(
+                    base + offset + 5, rate_limits=rate_limits(used, resets)
+                )
+            )
+        self.write_codex("rollout-dense.jsonl", lines)
+
+    def write_jump(self, tiny_start: int, tiny_session: str, tiny_model: str,
+                   tiny_tokens: int, resets: int, used: float) -> None:
+        """One rollover interval, far later, with only a tiny session active."""
+        self.write_codex(
+            "rollout-tiny.jsonl",
+            [
+                codex_session_meta_line(tiny_start, tiny_session, "/home/agent/tiny"),
+                codex_turn_context_line(tiny_start, tiny_model),
+                codex_usage_record_line(
+                    tiny_start + 5, tiny_session, input_tokens=tiny_tokens,
+                    cached_input_tokens=0, output_tokens=0
+                ),
+                codex_token_count_line(tiny_start + 10, rate_limits=rate_limits(used, resets)),
+            ],
+        )
+
+    def test_sparse_reading_drain_is_capped_and_the_rest_unattributed(self) -> None:
+        # Reproduces #16's 01a09886: a handful of turns land inside a big,
+        # far-later jump and would otherwise absorb the whole thing.
+        base = int(time.time()) - 4 * 3600
+        dense_session = "dddddddd-dense-0000-0000-000000000000"
+        resets_a = base + 7200
+        self.write_dense_phase(base, dense_session, resets_a)
+
+        tiny_start = base + 3600
+        opened = tiny_start - 60
+        resets_b = opened + 18000
+        tiny_session = "tttttttt-tiny0-0000-0000-000000000000"
+        self.write_jump(tiny_start, tiny_session, "gpt-5.6-sol", 6_000, resets_b, 29.0)
+
+        payload = self.run_json("sessions", "--harness", "codex", "--json", "--top", "20")
+        tiny_row = self.session_by_short_id(payload, QD.short_id(tiny_session))
+        dense_row = self.session_by_short_id(payload, QD.short_id(dense_session))
+        # allowed = CAP_FACTOR(3) * rate(0.1) * units(0.6) = 0.18
+        self.assertAlmostEqual(tiny_row["drain_percent"], 0.18, places=6)
+        self.assertLessEqual(tiny_row["drain_percent"], 3.0 * 0.1 * 0.6 + 1e-9)
+        self.assertAlmostEqual(dense_row["drain_percent"], 3.0, places=6)
+        # share_of_window's denominator stays interval.drain (29.0), not the
+        # sum of what was actually attributed (0.18): the gap between them
+        # IS the unattributed figure, not renormalized away.
+        self.assertAlmostEqual(
+            tiny_row["share_of_window_percent"], 100.0 * 0.18 / 29.0, places=4
+        )
+        pools = payload["pools"]
+        jump_pool = max(pools, key=lambda item: item["peak"])
+        self.assertAlmostEqual(jump_pool["peak"], 29.0, places=6)
+        self.assertAlmostEqual(jump_pool["unattributed"], 29.0 - 0.18, places=6)
+
+        text = self.run_tool("sessions", "--harness", "codex")
+        self.assertEqual(text.returncode, 0, text.stderr.decode("utf-8", "replace"))
+        self.assertIn(b"unattributed: ", text.stdout)
+        self.assertIn(b"clients not in the scanned roots", text.stdout)
+
+        windows_text = self.run_tool("windows", "--harness", "codex")
+        self.assertEqual(windows_text.returncode, 0)
+        self.assertIn(b"unattributed 28.8%", windows_text.stdout)
+
+    def test_raw_token_fallback_is_exempt_from_the_cap(self) -> None:
+        # A model with no weight prices at ~1e-9 units/token, nowhere near
+        # the weighted-unit scale the cap is calibrated against; capping it
+        # would zero out a session that really did the work.
+        base = int(time.time()) - 4 * 3600
+        dense_session = "dddddddd-dense-1111-1111-111111111111"
+        resets_a = base + 7200
+        self.write_dense_phase(base, dense_session, resets_a)
+
+        tiny_start = base + 3600
+        opened = tiny_start - 60
+        resets_b = opened + 18000
+        exotic_session = "eeeeeeee-exotic-000-000-000000000000"
+        self.write_jump(tiny_start, exotic_session, "gpt-9000-nonexistent", 6_000, resets_b, 29.0)
+
+        payload = self.run_json("sessions", "--harness", "codex", "--json", "--top", "20")
+        exotic_row = self.session_by_short_id(payload, QD.short_id(exotic_session))
+        # Uncapped: the sole session in the interval gets its whole drain.
+        self.assertAlmostEqual(exotic_row["drain_percent"], 29.0, places=6)
+
+    def test_rate_fallback_with_too_little_coverage_warns_once(self) -> None:
+        # Only one non-rollover interval - below MIN_RATE_INTERVALS - and no
+        # calibrated or fitted rate on disk: the pool is left uncapped and
+        # warns exactly once.
+        base = int(time.time()) - 4 * 3600
+        dense_session = "dddddddd-sparse-00-0000-000000000000"
+        resets_a = base + 7200
+        thin_lines = [
+            codex_session_meta_line(base, dense_session, "/home/agent/thin"),
+            codex_turn_context_line(base, "gpt-5.6-sol"),
+            codex_token_count_line(base + 5, rate_limits=rate_limits(10.0, resets_a)),
+            codex_usage_record_line(
+                base + 10, dense_session, input_tokens=100_000, cached_input_tokens=0,
+                output_tokens=0
+            ),
+            codex_token_count_line(base + 15, rate_limits=rate_limits(11.0, resets_a)),
+        ]
+        self.write_codex("rollout-thin.jsonl", thin_lines)
+
+        tiny_start = base + 3600
+        opened = tiny_start - 60
+        resets_b = opened + 18000
+        tiny_session = "tttttttt-fallback-0-0000-000000000000"
+        self.write_jump(tiny_start, tiny_session, "gpt-5.6-sol", 6_000, resets_b, 29.0)
+
+        result = self.run_tool("sessions", "--harness", "codex", "--json", "--top", "20")
+        self.assertEqual(result.returncode, 0, result.stderr.decode("utf-8", "replace"))
+        payload = json.loads(result.stdout.decode("utf-8"))
+        tiny_row = self.session_by_short_id(payload, QD.short_id(tiny_session))
+        # Uncapped: not enough non-rollover coverage to trust a measured rate.
+        self.assertAlmostEqual(tiny_row["drain_percent"], 29.0, places=6)
+        stderr = result.stderr.decode("utf-8", "replace")
+        self.assertEqual(stderr.count("no attribution cap"), 1)
+
+    def test_zero_peak_windows_with_drifting_resets_at_collapse(self) -> None:
+        # #17: an idle pool re-stamps resets_at by roughly a minute per
+        # reading; minute-rounding alone still yields one window per
+        # reading. Clustering resets_at within tolerance collapses the
+        # whole drifting, always-zero run into one window.
+        base = int(time.time()) - 4 * 3600
+        session = "iiiiiiii-idle0-0-0000-000000000000"
+        lines = [
+            codex_session_meta_line(base, session, "/home/agent/idle"),
+            codex_turn_context_line(base, "gpt-5.6-sol"),
+        ]
+        resets = base + 604800
+        for index in range(12):
+            lines.append(
+                codex_token_count_line(
+                    base + index * 70, rate_limits=rate_limits(0.0, resets + index * 70)
+                )
+            )
+        self.write_codex("rollout-idle.jsonl", lines)
+        payload = self.run_json("windows", "--harness", "codex", "--json")
+        self.assertLessEqual(len(payload["windows"]), 1)
+        if payload["windows"]:
+            self.assertAlmostEqual(payload["windows"][0]["peak_used_percent"], 0.0, places=6)
+
+    def test_prompt_drain_respects_the_session_cap(self) -> None:
+        # Follow-on to #16: `attribute()` caps a session's INTERVAL share,
+        # but `apply_prompt_drain`'s per-prompt split still multiplied the
+        # interval's raw drain, so `prompts --session X` kept showing the
+        # uncapped figure even after `sessions` capped it. Two prompts split
+        # a capped 0.18% share 2/3-1/3 by their own tokens - never 29.0%.
+        base = int(time.time()) - 4 * 3600
+        dense_session = "dddddddd-dense-2222-2222-222222222222"
+        resets_a = base + 7200
+        self.write_dense_phase(base, dense_session, resets_a)
+
+        tiny_start = base + 3600
+        opened = tiny_start - 60
+        resets_b = opened + 18000
+        tiny_session = "tttttttt-tinyp-0000-0000-000000000000"
+        self.write_codex(
+            "rollout-tiny-prompts.jsonl",
+            [
+                codex_session_meta_line(tiny_start, tiny_session, "/home/agent/tiny"),
+                codex_task_started_line(tiny_start),
+                codex_turn_context_line(tiny_start, "gpt-5.6-sol"),
+                codex_usage_record_line(
+                    tiny_start + 5, tiny_session, input_tokens=4_000,
+                    cached_input_tokens=0, output_tokens=0
+                ),
+                codex_task_started_line(tiny_start + 30),
+                codex_turn_context_line(tiny_start + 30, "gpt-5.6-sol"),
+                codex_usage_record_line(
+                    tiny_start + 35, tiny_session, input_tokens=2_000,
+                    cached_input_tokens=0, output_tokens=0
+                ),
+                codex_token_count_line(tiny_start + 40, rate_limits=rate_limits(29.0, resets_b)),
+            ],
+        )
+
+        payload = self.run_json("prompts", "--session", QD.short_id(tiny_session), "--json")
+        shares = [prompt["drain_percent"] for prompt in payload["prompts"]]
+        self.assertEqual(len(shares), 2)
+        # allowed = CAP_FACTOR(3) * rate(0.1) * units(0.6) = 0.18, split
+        # 4000:2000 by each prompt's own tokens.
+        self.assertAlmostEqual(sum(shares), 0.18, places=6)
+        self.assertAlmostEqual(shares[0], 0.12, places=6)
+        self.assertAlmostEqual(shares[1], 0.06, places=6)
+
+    def test_interval_with_no_local_sessions_is_fully_unattributed(self) -> None:
+        # A pool can take a reading with no local session active at all (a
+        # client nas cannot see did the work). `attribute()`'s early
+        # per-interval bailout (total <= 0) must still record the whole
+        # drain as unattributed, or sum(shares) + unattributed == drain
+        # breaks for that interval.
+        base = int(time.time()) - 4 * 3600
+        dense_session = "dddddddd-dense-3333-3333-333333333333"
+        resets_a = base + 7200
+        self.write_dense_phase(base, dense_session, resets_a)
+
+        ghost_start = base + 3600
+        opened = ghost_start - 60
+        resets_b = opened + 18000
+        self.write_codex(
+            "rollout-ghost.jsonl",
+            [codex_token_count_line(ghost_start + 10, rate_limits=rate_limits(40.0, resets_b))],
+        )
+
+        payload = self.run_json("sessions", "--harness", "codex", "--json", "--top", "20")
+        pools = payload["pools"]
+        ghost_pool = max(pools, key=lambda item: item["peak"])
+        self.assertAlmostEqual(ghost_pool["peak"], 40.0, places=6)
+        self.assertAlmostEqual(ghost_pool["attributed"], 0.0, places=6)
+        self.assertAlmostEqual(ghost_pool["unattributed"], 40.0, places=6)
+
+        text = self.run_tool("sessions", "--harness", "codex")
+        self.assertEqual(text.returncode, 0, text.stderr.decode("utf-8", "replace"))
+        self.assertIn(b"unattributed: ", text.stdout)
+
+    def test_exempt_session_does_not_absorb_a_capped_sessions_overflow(self) -> None:
+        # #16 could still reproduce if the tiny session ran an unweighted
+        # (raw-token-fallback) model: water_fill used to let any session
+        # with `allowed is None` sit in the unclamped pool, so it absorbed
+        # every clamped session's freed drain instead of `unattributed`.
+        base = int(time.time()) - 4 * 3600
+        dense_session = "dddddddd-dense-4444-4444-444444444444"
+        resets_a = base + 7200
+        self.write_dense_phase(base, dense_session, resets_a)
+
+        tiny_start = base + 3600
+        opened = tiny_start - 60
+        resets_b = opened + 18000
+        capped_session = "cccccccc-capped-0000-0000-00000000000"
+        exempt_session = "eeeeeeee-exempt-0000-0000-00000000000"
+        self.write_codex(
+            "rollout-mixed.jsonl",
+            [
+                codex_session_meta_line(tiny_start, capped_session, "/home/agent/capped"),
+                codex_turn_context_line(tiny_start, "gpt-5.6-sol"),
+                codex_usage_record_line(
+                    tiny_start + 5, capped_session, input_tokens=6_000,
+                    cached_input_tokens=0, output_tokens=0
+                ),
+                codex_session_meta_line(tiny_start + 6, exempt_session, "/home/agent/exempt"),
+                codex_turn_context_line(tiny_start + 6, "gpt-9000-nonexistent"),
+                codex_usage_record_line(
+                    tiny_start + 10, exempt_session, input_tokens=6_000,
+                    cached_input_tokens=0, output_tokens=0
+                ),
+                codex_token_count_line(tiny_start + 15, rate_limits=rate_limits(29.0, resets_b)),
+            ],
+        )
+
+        payload = self.run_json("sessions", "--harness", "codex", "--json", "--top", "20")
+        capped_row = self.session_by_short_id(payload, QD.short_id(capped_session))
+        exempt_row = self.session_by_short_id(payload, QD.short_id(exempt_session))
+        # capped_session's raw share is 29.0 * 0.6/(0.6 + exempt_units); its
+        # cap is 0.18. exempt_session keeps its own raw proportional share
+        # (never touched by water-fill); the capped session's freed drain
+        # becomes unattributed, not a top-up for the exempt session.
+        self.assertAlmostEqual(capped_row["drain_percent"], 0.18, places=6)
+        exempt_units = 6_000 * 1e-9
+        exempt_raw_share = 29.0 * exempt_units / (0.6 + exempt_units)
+        self.assertAlmostEqual(exempt_row["drain_percent"], exempt_raw_share, places=6)
+
+        pools = payload["pools"]
+        jump_pool = max(pools, key=lambda item: item["peak"])
+        self.assertAlmostEqual(
+            jump_pool["unattributed"], 29.0 - 0.18 - exempt_raw_share, places=6
+        )
+
+    def test_no_codex_events_at_all_leaves_every_interval_fully_unattributed(self) -> None:
+        # `attribute()` used to `return` before the per-interval loop when
+        # there were no Codex usage events at all (not just none active in
+        # a given interval), leaving `interval.unattributed` at its 0.0
+        # default even though real drain was measured. That breaks
+        # sum(shares) + unattributed == drain for every interval.
+        intervals = [
+            QD.Interval(("acct", "lim", "plan", 300), 0.0, 100.0, 12.5, None, False),
+            QD.Interval(("acct", "lim", "plan", 300), 100.0, 200.0, 7.0, None, False),
+        ]
+        weights = QD.Weights({}, [])
+        args = argparse.Namespace(long_context_multiplier=1.0, claude_cache_read_weight=None)
+        QD.attribute(intervals, [], weights, args)
+        for interval in intervals:
+            self.assertAlmostEqual(interval.unattributed, interval.drain, places=6)
+            self.assertEqual(interval.sessions, {})
+
+    def test_prompt_shares_sum_to_the_whole_session_share(self) -> None:
+        # Only main-thread rows carry a prompt key (assigned by
+        # `assemble_prompts` before `attribute()` runs); a row that never
+        # joined a prompt group still counts toward the session's `shares`
+        # total. Dividing a prompt's units by the session's ALL-EVENT units
+        # (including that unkeyed row) used to leave the prompt's share
+        # short of the session's own attributed share. The denominator must
+        # be the session's PROMPT-KEYED units instead.
+        interval = QD.Interval(("acct", "lim", "plan", 300), 0.0, 100.0, 10.0, None, False)
+        session_id = "sess-1"
+        # event without a prompt key (e.g. a sub-thread row outside any
+        # prompt group): row length 13, no EVENT_PROMPT slot at all.
+        no_prompt_event = [session_id, "m", 10.0, 100_000, 0, 0, 0, 0, 0, 0, "", "", ""]
+        # event with a prompt key: row length 14, EVENT_PROMPT set.
+        with_prompt_event = (
+            [session_id, "m", 20.0, 200_000, 0, 0, 0, 0, 0, 0, "", "", ""] + [1]
+        )
+        self.assertEqual(len(no_prompt_event), QD.EVENT_PROMPT)
+        self.assertEqual(len(with_prompt_event), QD.EVENT_PROMPT + 1)
+        weights = QD.Weights({"codex": {"models": {"m": {"input": 1.0}}}}, ["test"])
+        args = argparse.Namespace(long_context_multiplier=1.0, claude_cache_read_weight=None)
+        QD.attribute([interval], [no_prompt_event, with_prompt_event], weights, args)
+        session_share = interval.sessions[session_id]
+        self.assertAlmostEqual(session_share, 10.0, places=6)
+        prompt_total = sum(
+            value for key, value in interval.prompts.items() if key[0] == session_id
+        )
+        self.assertAlmostEqual(prompt_total, session_share, places=6)
 
 
 class Calibration(Harness):
@@ -1941,6 +2369,72 @@ class ClaudeCalibration(Harness):
         self.assertEqual(len(intervals), 2)
         self.assertEqual([interval.rollover for interval in intervals], [False, False])
         self.assertEqual([interval.drain for interval in intervals], [2.0, 3.0])
+
+    def write_claude_snapshots(self, rows: Sequence[Tuple[float, float, str]]) -> None:
+        path = self.root / "state" / "snapshots.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as handle:
+            for ts, percent, resets_at in rows:
+                handle.write(
+                    json.dumps(
+                        {
+                            "source": "oauth",
+                            "config_dir": ".claude",
+                            "ts": ts,
+                            "windows": {
+                                "five_hour": {
+                                    "utilization_percent": percent,
+                                    "resets_at": resets_at,
+                                }
+                            },
+                        }
+                    )
+                    + "\n"
+                )
+
+    def test_claude_rollover_with_a_rise_stays_a_rollover(self) -> None:
+        # build_intervals also serves the Claude path (calibrate_claude, over
+        # load_claude_snapshots rows with ANY_WINDOW): a rise across a bucket
+        # change must still be classified as a real rollover (rule a) - the
+        # narrowing of rule (b) to "no drain evidence" must not swallow this
+        # case, the same shape as test_rollover_when_resets_at_changes for
+        # Codex.
+        now = time.time() - 4 * 3600
+        window_a = now + 200
+        window_b = window_a + 18000  # a genuinely new five-hour window
+        self.write_claude_snapshots(
+            [
+                (now, 10.0, iso(window_a)),
+                (now + 600, 10.0, iso(window_a)),  # same window, unchanged: no interval
+                (now + 1200, 14.0, iso(window_b)),  # new window, a rise: rollover
+            ]
+        )
+        with self.env_applied():
+            rows = QD.load_claude_snapshots("five_hour")
+        intervals = QD.build_intervals(rows, QD.ANY_WINDOW)
+        self.assertEqual(len(intervals), 1)
+        self.assertTrue(intervals[0].rollover)
+        self.assertAlmostEqual(intervals[0].drain, 14.0, places=6)
+
+    def test_claude_same_bucket_decrease_then_rise(self) -> None:
+        # Same shape as the Codex decrease test: the interval starts at the
+        # low reading, not at 0 and not measured back from the high reading.
+        now = time.time() - 4 * 3600
+        window_a = now + 200
+        self.write_claude_snapshots(
+            [
+                (now, 40.0, iso(window_a)),
+                (now + 600, 30.0, iso(window_a)),
+                (now + 1200, 35.0, iso(window_a)),
+            ]
+        )
+        with self.env_applied():
+            rows = QD.load_claude_snapshots("five_hour")
+        intervals = QD.build_intervals(rows, QD.ANY_WINDOW)
+        self.assertEqual(len(intervals), 1)
+        self.assertFalse(intervals[0].rollover)
+        self.assertAlmostEqual(intervals[0].drain, 5.0, places=6)
+        self.assertEqual(intervals[0].start, now + 600)
 
     def test_collinear_models_are_flagged_unidentified(self) -> None:
         # Two models that only ever run together cannot be told apart, and a
