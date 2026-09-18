@@ -28,6 +28,7 @@ class SessionRecord:
     requests: int = 0
     prompts: int = 0
     context_peak: int = 0
+    account_label: str = "-"
     payload: Dict[str, Any] = field(default_factory=dict)
 
 
@@ -47,6 +48,7 @@ def _record(value: Any) -> SessionRecord:
     return SessionRecord(
         session_id=str(value.get("session_id", "")), harness=str(value.get("harness", "-")),
         project=str(value.get("cwd", value.get("project", "-"))),
+        account_label=str(value.get("account_label") or value.get("account") or "-"),
         model=str(value.get("primary_model", value.get("model", "-"))),
         start=value.get("start"), end=value.get("end"),
         weighted_units=float(value.get("weighted_units", value.get("units", 0.0)) or 0.0),
@@ -107,7 +109,9 @@ def filter_sessions(rows: Sequence[SessionRecord], query: str = "", sort: str = 
     lower, upper = epoch(since) if since else None, epoch(until) if until else None
     selected = []
     for row in rows:
-        haystack = "%s %s %s" % (row.project, row.model, row.session_id)
+        haystack = "%s %s %s %s" % (
+            row.project, row.account_label, row.model, row.session_id
+        )
         if harness and row.harness.lower() != harness:
             continue
         if project and project not in row.project.lower():
@@ -364,7 +368,9 @@ def build_app(settings: Optional[SourceSettings] = None, scanner: Callable[..., 
                     metric = "%.2f%% drain %s" % (row.drain_percent, qualifier)
                 else:
                     metric = "Codex drain unavailable"
-                view.append(ListItem(Label("%s  %s  %s" % (row.harness, row.project, metric))))
+                identity = row.account_label if row.account_label != "-" else row.project
+                view.append(ListItem(Label("%s  %s  %s  %s" % (
+                    row.harness, identity, row.project, metric))))
 
         def on_list_view_selected(self, event: Any) -> None:
             index = event.list_view.index
@@ -387,9 +393,9 @@ def build_app(settings: Optional[SourceSettings] = None, scanner: Callable[..., 
                       else "%.2f%% drain %s" % (row.drain_percent, "estimated" if row.payload.get("drain_is_estimate") else "measured")
                       if row.drain_percent is not None else "Codex drain unavailable")
             self.query_one("#detail", Static).update(
-                "session %s\n%s / %s\nmodel %s\n%s\n%s to %s\nrequests %d  prompts %d\n"
+                "session %s\n%s / %s\naccount %s\nmodel %s\n%s\n%s to %s\nrequests %d  prompts %d\n"
                 "peak context %d\ntokens %s\nprompt turns:\n%s\nreductions:\n%s"
-                % (row.session_id, row.harness, row.project, row.model, metric,
+                % (row.session_id, row.harness, row.project, row.account_label, row.model, metric,
                    _when(row.start), _when(row.end), row.requests, row.prompts,
                    row.context_peak, tokens or "-", "\n".join(prompt_lines) or "  -",
                    "\n".join(reduction_lines) or "  -")

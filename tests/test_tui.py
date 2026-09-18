@@ -6,7 +6,15 @@ try:
 except ImportError:  # pragma: no cover - exercised only without the optional extra
     textual = None
 
-from nenpi.tui import ScanResult, SessionRecord, build_app
+from nenpi.tui import ScanResult, SessionRecord, build_app, normalize_result
+
+
+class SessionRecordTests(unittest.TestCase):
+    def test_account_label_falls_back_to_account(self):
+        result = normalize_result({"sessions": [{
+            "session_id": "same", "harness": "claude", "account": "alias"
+        }]})
+        self.assertEqual(result.sessions[0].account_label, "alias")
 
 
 @unittest.skipUnless(textual is not None, "nenpi[ui] is optional")
@@ -74,3 +82,24 @@ class BrowserPilotTests(unittest.IsolatedAsyncioTestCase):
             detail = str(app.query_one("#detail").render())
             self.assertIn("input=80", detail)
             self.assertIn("removed=500", detail)
+
+    async def test_account_alias_is_visible_for_same_session_project(self):
+        rows = [
+            SessionRecord("same", "claude", "project", account_label="work"),
+            SessionRecord("same", "claude", "project", account_label="personal"),
+        ]
+        app = build_app(scanner=lambda *args: ScanResult(rows))
+        async with app.run_test() as pilot:
+            await pilot.pause(.1)
+            from textual.widgets import Label
+
+            labels = [str(item.query_one(Label).render())
+                      for item in app.query_one("#sessions").children]
+            self.assertTrue(any("work" in label for label in labels))
+            self.assertTrue(any("personal" in label for label in labels))
+            await pilot.click("#sessions", offset=(10, 1))
+            await pilot.press("enter")
+            await pilot.pause()
+            detail = str(app.query_one("#detail").render())
+            self.assertIn("account", detail)
+            self.assertTrue("work" in detail or "personal" in detail)
