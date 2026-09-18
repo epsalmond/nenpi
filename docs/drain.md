@@ -48,7 +48,10 @@ nenpi config      --init [--force]
 Common flags on every reporting subcommand: `--claude-root PATH` and
 `--codex-root PATH` (both repeatable) *replace* the resolved roots for that
 harness — see [Roots and config.toml](#roots-and-configtoml) for how they are
-resolved when omitted. `--claude-cache-read-weight FLOAT` overrides the
+resolved when omitted. `--account LABEL` limits sessions, events, and quota
+windows to one account's pool, by root basename (e.g. `.codex-arcade`; see
+`nenpi config` for the labels in use). `--claude-cache-read-weight FLOAT`
+overrides the
 disputed cache-read price,
 `--long-context-multiplier FLOAT` scales requests over 200K tokens (a no-op at
 its default of 1.0), `--use-calibrated` prefers a stored fit,
@@ -109,8 +112,13 @@ Points where a session's context shrank sharply — see
 
 ### windows
 
-Each observed Codex quota window: start, `resets_at`, peak `used_percent`, and
-the sessions that drained it.
+Each observed Codex quota window: account, start, `resets_at`, peak
+`used_percent`, and the sessions that drained it. Two roots on different
+accounts always get separate windows, even when they share the same
+`limit_id`/`plan_type`/`window_minutes` - see
+[Roots and config.toml](#roots-and-configtoml) for how a root's account is
+detected. Pass `--account LABEL` (a root's basename, e.g. `.codex-arcade`) to
+any report command to see one pool at a time.
 
 ### verify
 
@@ -643,9 +651,11 @@ wants:
 - Codex `used_percent` arrives in whole percent, which caps how finely drain
   can be attributed; calibration needs multi-day ranges and time bucketing
   before it means anything.
-- Attribution assumes one Codex account per `(limit_id, plan_type)`. Separate
-  accounts under different roots are separated by `plan_type` and by their
-  distinct `resets_at`, but two accounts on the same plan would be merged.
+- Quota timelines are keyed by account first (root's detected `auth.json`
+  `tokens.account_id` / `.claude.json` `oauthAccount.organizationUuid`,
+  falling back to the root's basename), then `limit_id`/`plan_type`/
+  `window_minutes`; two roots on the same account still merge into one pool,
+  which is correct.
 - `unmarked` reductions are heuristic until the Codex fork writes a shake
   marker.
 - A green parse is not proof of a correct model: `nenpi verify` compares
