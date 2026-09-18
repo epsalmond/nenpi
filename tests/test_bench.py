@@ -990,6 +990,28 @@ class Hygiene(Harness):
         self.assertIn(b"no quota-drain at", result.stderr)
 
 
+class Migration(Harness):
+    def test_bench_moves_old_state_dir(self) -> None:
+        """bench.main must migrate state/quota-drain the same as drain.py."""
+        environment = dict(self.environment)
+        environment.pop("NENPI_STATE_DIR")
+        home = self.root / "home"
+        old_state = home / ".local" / "state" / "quota-drain"
+        old_state.mkdir(parents=True)
+        (old_state / "marker.txt").write_text("old", encoding="utf-8")
+        result = subprocess.run(
+            [sys.executable, str(QUOTA_BENCH), "plan", "--quota-drain", str(self.root / "absent")],
+            check=False,
+            capture_output=True,
+            env=environment,
+            timeout=300,
+        )
+        self.assertIn(b"moved", result.stderr)
+        new_state = home / ".local" / "state" / "nenpi"
+        self.assertTrue((new_state / "marker.txt").is_file())
+        self.assertFalse(old_state.exists())
+
+
 class ResultParsing(Harness):
     def test_a_second_model_gets_its_own_row(self) -> None:
         self.environment["BENCH_FAKE_HELPER_MODEL"] = "claude-opus-5"

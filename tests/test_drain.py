@@ -10,6 +10,7 @@ import contextlib
 import io
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -2514,6 +2515,127 @@ class RootsAndConfig(Harness):
 
             flagged = QC.resolve_roots("claude", [str(self.home / ".claude")], configured)
             self.assertEqual(flagged, [self.home / ".claude"])
+
+    def test_codex_only_harness_emits_no_claude_roots_warning(self) -> None:
+        shutil.rmtree(self.home / ".claude")
+        now = time.time() - 600
+        session = "codex-only-0001"
+        self.write_codex(
+            "rollout-1-aaa.jsonl",
+            [
+                codex_session_meta_line(now, session, "/home/agent/repo"),
+                codex_turn_context_line(now, "gpt-5.6-sol"),
+                codex_usage_record_line(
+                    now + 10, session, input_tokens=1_000, cached_input_tokens=0,
+                    output_tokens=100
+                ),
+            ],
+        )
+        result = self.run_tool("sessions", "--harness", "codex")
+        self.assertEqual(result.returncode, 0, result.stderr.decode("utf-8", "replace"))
+        self.assertNotIn(b"no claude roots found", result.stderr)
+
+    def test_config_command_shows_missing_root(self) -> None:
+        missing = self.home / ".claude-typo"
+        self.write_config('[claude]\nroots = ["%s"]\n' % missing)
+        result = self.run_tool("config")
+        self.assertEqual(result.returncode, 0)
+        self.assertIn(b"exists=no", result.stdout)
+        payload = self.run_json("config", "--json")
+        claude_rows = [row for row in payload["roots"] if row["harness"] == "claude"]
+        self.assertTrue(
+            any(row["path"] == str(missing) and row["exists"] is False for row in claude_rows)
+        )
+
+    def test_plan_config_labels_the_header_when_nothing_measured(self) -> None:
+        self.write_config('[plan]\nclaude = "max_20x"\n')
+        now = time.time() - 600
+        self.write_claude(
+            "s.jsonl",
+            [claude_assistant_line(now, "aaaa0001-1111-2222-3333-444444444444", "msg",
+                                   output_tokens=10)],
+        )
+        result = self.run_tool("sessions", "--harness", "claude")
+        self.assertEqual(result.returncode, 0)
+        self.assertIn(b"claude=max_20x", result.stdout)
+
+    def test_plan_config_never_overrides_a_measured_tier(self) -> None:
+        self.write_config('[plan]\nclaude = "max_20x"\n')
+        (self.home / ".claude" / ".claude.json").write_text(
+            json.dumps({"oauthAccount": {"organizationRateLimitTier": "pro_5x"}}),
+            encoding="utf-8",
+        )
+        now = time.time() - 600
+        self.write_claude(
+            "s.jsonl",
+            [claude_assistant_line(now, "aaaa0001-1111-2222-3333-444444444444", "msg",
+                                   output_tokens=10)],
+        )
+        result = self.run_tool("sessions", "--harness", "claude")
+        self.assertEqual(result.returncode, 0)
+        self.assertIn(b"claude=pro_5x", result.stdout)
+        self.assertNotIn(b"max_20x", result.stdout)
+
+    def test_config_init_escapes_special_characters_in_root_path(self) -> None:
+        tricky = self.home / '.claude-weird"name\\dir'
+        (tricky / "projects").mkdir(parents=True)
+        result = self.run_tool("config", "--init")
+        self.assertEqual(result.returncode, 0, result.stderr.decode("utf-8", "replace"))
+        text = self.config_path().read_text(encoding="utf-8")
+        self.assertIn('\\"', text)
+        self.assertIn('\\\\', text)
+        # A malformed escape would make this an invalid TOML string, or would
+        # not round-trip to the same path; loading it back must recover it.
+        with self.env_applied():
+            loaded = QC.load_config()
+        self.assertIn(str(tricky), loaded.claude_roots)
+
+    def test_config_init_refuses_when_target_is_a_directory(self) -> None:
+        directory_path = self.config_path()
+        directory_path.mkdir(parents=True)
+        result = self.run_tool("config", "--init")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(b"directory", result.stderr)
+
+    def test_discover_candidate_roots_includes_env_var_outside_home(self) -> None:
+        outside = self.root / "outside-codex"
+        (outside / "sessions").mkdir(parents=True)
+        environment = dict(self.environment)
+        environment["CODEX_HOME"] = str(outside)
+        result = subprocess.run(
+            DRAIN_COMMAND + ["config", "--init"],
+            check=False,
+            capture_output=True,
+            env=environment,
+            timeout=120,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr.decode("utf-8", "replace"))
+        text = self.config_path().read_text(encoding="utf-8")
+        self.assertIn(str(outside), text)
+
+    def test_legacy_config_file_env_has_no_fallback(self) -> None:
+        environment = dict(self.environment)
+        legacy_path = self.root / "legacy-config.toml"
+        legacy_path.parent.mkdir(parents=True, exist_ok=True)
+        legacy_path.write_text('[claude]\nroots = ["%s"]\n' % (self.home / ".claude"),
+                               encoding="utf-8")
+        environment["QUOTA_DRAIN_CONFIG_FILE"] = str(legacy_path)
+        result = subprocess.run(
+            DRAIN_COMMAND + ["config"],
+            check=False,
+            capture_output=True,
+            env=environment,
+            timeout=120,
+        )
+        self.assertEqual(result.returncode, 0)
+        self.assertNotIn(b"deprecated", result.stderr)
+        self.assertNotEqual(
+            self.config_path(), legacy_path, "legacy CONFIG_FILE must not relocate config_path"
+        )
+
+    def test_warn_once_registry_is_shared_between_drain_and_config(self) -> None:
+        self.assertIs(QD.warn_once, QC.warn_once)
+        self.assertIs(QD.warn, QC.warn)
 
 
 if __name__ == "__main__":

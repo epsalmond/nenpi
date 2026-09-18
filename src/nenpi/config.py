@@ -11,8 +11,10 @@ env var first, deduplicated, and missing directories skipped silently. A
 harness that resolves to zero roots gets one warning.
 
 Test path overrides use the ``NENPI_*`` environment variables (``HOME_DIR``,
-``CACHE_DIR``, ``STATE_DIR``, ``CONFIG_DIR``, ``CONFIG_FILE``); the old
-``QUOTA_DRAIN_*`` names are still honoured, with a deprecation warning.
+``CACHE_DIR``, ``STATE_DIR``, ``CONFIG_DIR``, ``CONFIG_FILE``). The old
+``QUOTA_DRAIN_*`` names are still honoured for ``HOME_DIR``, ``CACHE_DIR``,
+``STATE_DIR``, and ``CONFIG_DIR``, with a deprecation warning;
+``QUOTA_DRAIN_CONFIG_FILE`` has no legacy fallback.
 """
 
 from __future__ import annotations
@@ -137,8 +139,6 @@ _KNOWN_SUBKEYS = {
 
 def config_path() -> Path:
     override = os.environ.get(PREFIX + "CONFIG_FILE")
-    if override is None:
-        override = os.environ.get(LEGACY_PREFIX + "CONFIG_FILE")
     if override:
         return Path(override).expanduser()
     return config_dir() / "config.toml"
@@ -216,7 +216,7 @@ def normalize_root_flag(value: str, harness: str) -> Path:
     return path
 
 
-def _dedup_existing(paths: Sequence[Path]) -> List[Path]:
+def _dedup_existing(paths: Sequence[Path], keep_missing: bool = False) -> List[Path]:
     seen = set()
     result = []
     for path in paths:
@@ -225,7 +225,7 @@ def _dedup_existing(paths: Sequence[Path]) -> List[Path]:
         if key in seen:
             continue
         seen.add(key)
-        if resolved.is_dir():
+        if resolved.is_dir() or keep_missing:
             result.append(resolved)
     return result
 
@@ -245,19 +245,29 @@ def _default_root_candidates(harness: str) -> List[Path]:
     return candidates
 
 
-def resolve_roots(harness: str, flags: Sequence[str], config: Config) -> List[Path]:
+def resolve_roots(
+    harness: str,
+    flags: Sequence[str],
+    config: Config,
+    quiet: bool = False,
+    keep_missing: bool = False,
+) -> List[Path]:
     flag_paths = [normalize_root_flag(value, harness) for value in flags if value]
     if flag_paths:
-        resolved = _dedup_existing(flag_paths)
+        resolved = _dedup_existing(flag_paths, keep_missing=keep_missing)
     else:
         configured = (
             config.claude_roots if harness == "claude" else config.codex_roots
         )
         if configured:
-            resolved = _dedup_existing([Path(item).expanduser() for item in configured])
+            resolved = _dedup_existing(
+                [Path(item).expanduser() for item in configured], keep_missing=keep_missing
+            )
         else:
-            resolved = _dedup_existing(_default_root_candidates(harness))
-    if not resolved:
+            resolved = _dedup_existing(
+                _default_root_candidates(harness), keep_missing=keep_missing
+            )
+    if not resolved and not quiet:
         warn_once("no %s roots found; see `nenpi config`" % harness)
     return resolved
 
@@ -277,6 +287,12 @@ def discover_candidate_roots(harness: str) -> List[Path]:
         candidates = sorted(home.glob(pattern))
     except OSError:
         candidates = []
+    seen = {str(candidate) for candidate in candidates}
+    for candidate in _default_root_candidates(harness):
+        key = str(candidate)
+        if key not in seen:
+            seen.add(key)
+            candidates.append(candidate)
     return [candidate for candidate in candidates if (candidate / leaf).is_dir()]
 
 

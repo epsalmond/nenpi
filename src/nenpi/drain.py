@@ -8,8 +8,8 @@ unknown.
 
 Test path overrides use the ``NENPI_*`` environment variables: ``HOME_DIR``,
 ``CACHE_DIR``, ``STATE_DIR``, ``CONFIG_DIR``, and ``CONFIG_FILE`` (the old
-``QUOTA_DRAIN_*`` names still work, with a deprecation warning). See
-nenpi.config for root resolution and config.toml.
+``QUOTA_DRAIN_*`` names still work for all but ``CONFIG_FILE``, with a
+deprecation warning). See nenpi.config for root resolution and config.toml.
 """
 
 from __future__ import annotations
@@ -41,6 +41,8 @@ from nenpi.config import (
     migrate_dirs,
     resolve_roots,
     state_dir,
+    warn,
+    warn_once,
 )
 
 CACHE_SCHEMA = 3
@@ -425,20 +427,6 @@ def calibrated_codex_table(rate_card: Mapping[str, Any], fit: Mapping[str, Any]
             if isinstance(value, (int, float))
         )
     return {"unit": "percent_per_mtok", "models": models}
-
-
-_WARNED = set()  # type: set
-
-
-def warn(message: str) -> None:
-    sys.stderr.write("nenpi: %s\n" % message)
-
-
-def warn_once(message: str) -> None:
-    if message in _WARNED:
-        return
-    _WARNED.add(message)
-    warn(message)
 
 
 # --------------------------------------------------------------------------
@@ -2571,11 +2559,21 @@ def header_lines(
 ) -> List[str]:
     lines = []
     tiers = []
-    claude_roots = resolve_roots("claude", getattr(args, "claude_root", None) or [], load_config())
+    config = load_config()
+    claude_roots = resolve_roots(
+        "claude",
+        getattr(args, "claude_root", None) or [],
+        config,
+        quiet=getattr(args, "harness", "all") == "codex",
+    )
     claude_tier = "/".join(sorted(set(read_claude_tier(claude_roots).values())))
+    if not claude_tier and config.plan_claude:
+        claude_tier = config.plan_claude
     if claude_tier:
         tiers.append("claude=%s" % claude_tier)
     codex_plan = latest_codex_plan(scan.snapshots)
+    if not codex_plan and config.plan_codex:
+        codex_plan = config.plan_codex
     if codex_plan:
         tiers.append("codex=%s" % codex_plan)
     lines.append(
@@ -3716,7 +3714,7 @@ def detect_claude_version() -> str:
     """
     newest = None
     newest_mtime = 0.0
-    for root in resolve_roots("claude", [], load_config()):
+    for root in resolve_roots("claude", [], load_config(), quiet=True):
         leaf = root / "projects"
         if not leaf.is_dir():
             continue
@@ -3754,7 +3752,7 @@ def oauth_config_dirs(requested: Sequence[str]) -> List[Path]:
     if requested:
         return [Path(item).expanduser() for item in requested]
     found = []
-    for root in resolve_roots("claude", [], load_config()):
+    for root in resolve_roots("claude", [], load_config(), quiet=True):
         if (root / ".credentials.json").is_file():
             found.append(root)
     return found
@@ -4060,7 +4058,7 @@ def compact_snapshots(destination: Path) -> int:
 def snapshot_from_configs(destination: Path) -> int:
     last = last_snapshot_marks(destination)
     written = 0
-    for root in resolve_roots("claude", [], load_config()):
+    for root in resolve_roots("claude", [], load_config(), quiet=True):
         payload = read_claude_config(root / ".claude.json")
         if payload is None:
             continue
@@ -4240,7 +4238,7 @@ def command_config(args: argparse.Namespace) -> int:
     rows = []
     for harness in ("claude", "codex"):
         flags = args.claude_root if harness == "claude" else args.codex_root
-        for root in resolve_roots(harness, flags, config):
+        for root in resolve_roots(harness, flags, config, quiet=True, keep_missing=True):
             label, key = account_for_root(root, harness)
             rows.append(
                 {
@@ -4283,8 +4281,15 @@ def command_config(args: argparse.Namespace) -> int:
     return 0
 
 
+def _toml_escape(value: str) -> str:
+    return value.replace("\\", "\\\\").replace('"', '\\"')
+
+
 def command_config_init(args: argparse.Namespace) -> int:
     path = config_path()
+    if path.is_dir():
+        warn("%s is a directory; cannot write config there" % path)
+        return 1
     if path.exists() and not args.force:
         warn("%s already exists; pass --force to overwrite" % path)
         return 1
@@ -4299,7 +4304,7 @@ def command_config_init(args: argparse.Namespace) -> int:
         lines.append("roots = [")
         for root in candidates:
             label, _key = account_for_root(root, harness)
-            lines.append('    "%s",  # %s' % (root, label))
+            lines.append('    "%s",  # %s' % (_toml_escape(str(root)), label))
         lines.append("]")
         lines.append("")
     lines.append("# [plan]  # optional, display only")

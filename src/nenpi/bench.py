@@ -34,6 +34,8 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
+from nenpi.config import migrate_dirs
+
 
 DEFAULT_MAX_PERCENT = 3.0
 DEFAULT_MAX_PERCENT_WEEKLY = 1.0
@@ -1740,6 +1742,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     global _QD
+    migrate_dirs()
     parser = build_parser()
     args = parser.parse_args(list(sys.argv[1:] if argv is None else argv))
     if not getattr(args, "handler", None):
