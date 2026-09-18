@@ -3390,14 +3390,21 @@ def command_prompts(args: argparse.Namespace) -> int:
         )
     print("")
     bar_width = max(10, width - 30)
+    harness_style = "claude" if harness == "claude" else "codex"
     peak_input = max([prompt.input_tokens for prompt in shown] or [0])
-    print(paint("input tokens sent per prompt (█ uncached, ▒ cached)", "bold"))
+    print(
+        paint("input tokens sent per prompt (", "bold")
+        + paint("█", harness_style)
+        + paint(" uncached, ", "bold")
+        + paint("▒", "dim")
+        + paint(" cached)", "bold")
+    )
     for prompt in shown:
         cached = prompt.tokens.get("cache_read", 0) + prompt.tokens.get("cached_input", 0)
         uncached = max(0, prompt.input_tokens - cached)
         total_cells = int(round(prompt.input_tokens / peak_input * bar_width)) if peak_input else 0
         cached_cells = int(round(total_cells * cached / prompt.input_tokens)) if prompt.input_tokens else 0
-        glyphs = paint("█" * (total_cells - cached_cells), "codex") + paint("▒" * cached_cells, "dim")
+        glyphs = paint("█" * (total_cells - cached_cells), harness_style) + paint("▒" * cached_cells, "dim")
         print("%-4d %10s %s" % (prompt.index, format_tokens(prompt.input_tokens), glyphs))
     print("")
     peak_context = max([prompt.context_peak for prompt in shown] or [0])
@@ -3406,7 +3413,7 @@ def command_prompts(args: argparse.Namespace) -> int:
         cells = int(round(prompt.context_peak / peak_context * bar_width)) if peak_context else 0
         print(
             "%-4d %10s %s"
-            % (prompt.index, format_tokens(prompt.context_peak), paint("▁" * cells, "claude"))
+            % (prompt.index, format_tokens(prompt.context_peak), paint("▁" * cells, harness_style))
         )
     print("")
     print(paint(describe_growth(growth), "bold"))
