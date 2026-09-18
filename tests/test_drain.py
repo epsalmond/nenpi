@@ -335,13 +335,18 @@ class Harness(unittest.TestCase):
             os.environ.clear()
             os.environ.update(saved)
 
-    def run_tool(self, *arguments: str, stdin: Optional[bytes] = None) -> subprocess.CompletedProcess:
+    def run_tool(self, *arguments: str, stdin: Optional[bytes] = None,
+                extra_env: Optional[Dict[str, str]] = None) -> subprocess.CompletedProcess:
+        env = self.environment
+        if extra_env:
+            env = dict(self.environment)
+            env.update(extra_env)
         return subprocess.run(
             DRAIN_COMMAND + list(arguments),
             check=False,
             input=stdin,
             capture_output=True,
-            env=self.environment,
+            env=env,
             timeout=120,
         )
 
@@ -1167,6 +1172,67 @@ class Snapshots(Harness):
         self.run_tool("snapshot", "--stdin", stdin=moved)
         logged = (self.root / "state" / "snapshots.jsonl").read_text(encoding="utf-8")
         self.assertEqual(len(logged.strip().splitlines()), 2)
+
+    def _statusline_payload(self, used_percentage: float) -> bytes:
+        return json.dumps(
+            {"rate_limits": {"five_hour": {"used_percentage": used_percentage,
+                                           "resets_at": "2026-09-16T21:30:00Z"}}}
+        ).encode("utf-8")
+
+    def test_statusline_dedup_is_per_config_dir(self) -> None:
+        # Dedup that ignores the account (#9): comparing only against the
+        # newest record regardless of `config_dir` drops a genuine change
+        # from one account whenever it coincides with the other account's
+        # last-seen value. A: 10% -> B: 30% -> A: 30% (a REAL change for A,
+        # from 10% to 30%, that happens to equal B's last reading) -> B: 10%
+        # (a real change for B). All four are distinct per-account readings
+        # and must all be kept.
+        claude_root = self.home / ".claude"
+        arcade_root = self.home / ".claude-arcade"
+        arcade_root.mkdir(parents=True, exist_ok=True)
+        sequence = [
+            (claude_root, 10.0),
+            (arcade_root, 30.0),
+            (claude_root, 30.0),
+            (arcade_root, 10.0),
+        ]
+        for root, used in sequence:
+            result = self.run_tool(
+                "snapshot", "--stdin", stdin=self._statusline_payload(used),
+                extra_env={"CLAUDE_CONFIG_DIR": str(root)},
+            )
+            self.assertEqual(result.returncode, 0)
+        logged = (self.root / "state" / "snapshots.jsonl").read_text(encoding="utf-8")
+        records = [json.loads(line) for line in logged.strip().splitlines()]
+        self.assertEqual(len(records), len(sequence))
+        seen = [
+            (record["config_dir"], record["windows"]["five_hour"]["utilization_percent"])
+            for record in records
+        ]
+        self.assertEqual(
+            seen,
+            [(".claude", 10.0), (".claude-arcade", 30.0), (".claude", 30.0),
+             (".claude-arcade", 10.0)],
+        )
+
+    def test_statusline_label_falls_back_to_first_resolved_root(self) -> None:
+        # With no $CLAUDE_CONFIG_DIR, the fallback label must come from the
+        # first resolved Claude root, not a hardcoded ".claude" - here the
+        # only configured root is renamed, so the record must carry that
+        # root's own basename.
+        renamed = self.home / ".claude-only"
+        renamed.mkdir(parents=True, exist_ok=True)
+        config_path = self.root / "config" / "config.toml"
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        config_path.write_text(
+            '[claude]\nroots = ["%s"]\n' % str(renamed).replace("\\", "\\\\"),
+            encoding="utf-8",
+        )
+        result = self.run_tool("snapshot", "--stdin", stdin=self._statusline_payload(12.0))
+        self.assertEqual(result.returncode, 0)
+        logged = (self.root / "state" / "snapshots.jsonl").read_text(encoding="utf-8")
+        record = json.loads(logged.strip().splitlines()[-1])
+        self.assertEqual(record["config_dir"], ".claude-only")
 
     def test_compact_drops_repeats_and_stale_entries(self) -> None:
         path = self.root / "state" / "snapshots.jsonl"
@@ -2850,6 +2916,47 @@ class AccountPools(Harness):
         )
         short_ids = [row["short_id"] for row in payload["sessions"]]
         self.assertEqual(short_ids, ["11111111"])
+
+    def test_account_filter_by_either_label_returns_the_shared_key_pool(self) -> None:
+        # Two roots sharing one account key (a re-pointed root, or the same
+        # login copied to a second config dir) must merge into one pool
+        # (`test_same_account_two_roots_merge_into_one_pool` above) - and
+        # `--account` on EITHER root's label must resolve to that shared key
+        # and return sessions from BOTH roots, not just the labelled one.
+        self.write_auth(".codex", "acct-shared")
+        self.write_auth(".codex-mirror", "acct-shared")
+        now = time.time() - 3600
+        resets_at = int(now) + 7 * 86400
+        session_a = "22222222-share-a222-3333-444444444444"
+        session_b = "33333333-share-b222-3333-444444444444"
+        for root_name, session_id, offset in (
+            (".codex", session_a, 5), (".codex-mirror", session_b, 7)
+        ):
+            self.write_codex_root(
+                root_name, "rollout-shared.jsonl",
+                [
+                    codex_session_meta_line(now, session_id, "/home/agent/x"),
+                    codex_turn_context_line(now, "gpt-5.6-sol"),
+                    codex_usage_record_line(
+                        now + offset, session_id, input_tokens=10_000,
+                        cached_input_tokens=0, output_tokens=0,
+                    ),
+                    codex_token_count_line(
+                        now + 10, rate_limits=rate_limits(10.0, resets_at, 10080)
+                    ),
+                ],
+                day=now,
+            )
+        root_args = [
+            "--codex-root", str(self.home / ".codex"),
+            "--codex-root", str(self.home / ".codex-mirror"),
+        ]
+        for label in (".codex", ".codex-mirror"):
+            payload = self.run_json(
+                "sessions", "--harness", "codex", "--json", "--account", label, *root_args
+            )
+            short_ids = sorted(row["short_id"] for row in payload["sessions"])
+            self.assertEqual(short_ids, ["22222222", "33333333"])
 
 
 class ClaudeAccountPools(Harness):
