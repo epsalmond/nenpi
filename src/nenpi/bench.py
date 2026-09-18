@@ -1654,20 +1654,57 @@ def command_report(args: argparse.Namespace) -> int:
 
 
 def add_scenario_arguments(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--models", default="claude-haiku-4-5-20251001", metavar="LIST")
-    parser.add_argument("--contexts", default="10k", metavar="LIST")
-    parser.add_argument("--cache", default="warm", metavar="LIST")
-    parser.add_argument("--outputs", default="short", metavar="LIST")
-    parser.add_argument("--ticks", type=int, default=DEFAULT_TICKS, metavar="N")
-    parser.add_argument("--max-percent", type=float, default=DEFAULT_MAX_PERCENT, metavar="PCT")
-    parser.add_argument("--max-percent-weekly", type=float,
-                        default=DEFAULT_MAX_PERCENT_WEEKLY, metavar="PCT")
-    parser.add_argument("--max-calls", type=int, default=DEFAULT_MAX_CALLS, metavar="N")
-    parser.add_argument("--usd-per-percent", type=float, default=None, metavar="USD")
+    parser.add_argument(
+        "--models", default="claude-haiku-4-5-20251001", metavar="LIST",
+        help="comma-separated Claude model IDs (default: claude-haiku-4-5-20251001)",
+    )
+    parser.add_argument(
+        "--contexts", default="10k", metavar="LIST",
+        help="comma-separated target filler sizes in tokens: 10k, 60k, or 150k "
+             "(default: 10k)",
+    )
+    parser.add_argument(
+        "--cache", default="warm", metavar="LIST",
+        help="comma-separated modes: cold, warm (reuse a prefix), or write-heavy "
+             "(wait for cache expiry); default: warm",
+    )
+    parser.add_argument(
+        "--outputs", default="short", metavar="LIST",
+        help="comma-separated output modes: short (one word) or long (2000-word task) "
+             "(default: short)",
+    )
+    parser.add_argument(
+        "--ticks", type=int, default=DEFAULT_TICKS, metavar="N",
+        help="utilisation percentage ticks to bracket per scenario; 2 gives one full "
+             "bracket (default: 2)",
+    )
+    parser.add_argument(
+        "--max-percent", type=float, default=DEFAULT_MAX_PERCENT, metavar="PERCENT",
+        help="five-hour quota cap for the run and projection, checked before every call "
+             "(default: 3)",
+    )
+    parser.add_argument(
+        "--max-percent-weekly", type=float,
+        default=DEFAULT_MAX_PERCENT_WEEKLY, metavar="PERCENT",
+        help="seven-day quota cap for the run; plan reports it but does not project it "
+             "(default: 1)",
+    )
+    parser.add_argument(
+        "--max-calls", type=int, default=DEFAULT_MAX_CALLS, metavar="N",
+        help="maximum Claude calls per scenario (default: 400)",
+    )
+    parser.add_argument(
+        "--usd-per-percent", type=float, default=None, metavar="USD",
+        help="dollars-per-five-hour-percent assumption for planning only "
+             "(default: stored/live value or $1.40 prior)",
+    )
     parser.add_argument("--no-cold-as-creation", action="store_true",
                         help="project cold calls as uncached input rather than cache "
                              "creation (the default is the conservative 1.25x)")
-    parser.add_argument("--json", action="store_true")
+    parser.add_argument(
+        "--json", action="store_true",
+        help="write plan/report data as indented JSON; run still prints its preflight plan",
+    )
 
 
 def add_fit_arguments(parser: argparse.ArgumentParser) -> None:
@@ -1675,7 +1712,7 @@ def add_fit_arguments(parser: argparse.ArgumentParser) -> None:
                         help="fit rows with fewer than two ticks; their percent is an "
                              "upper bound, not a measurement")
     parser.add_argument("--include-drifted", action="store_true",
-                        help="fit warm scenarios whose calls fell outside the cache TTL")
+                        help="include warm scenarios whose calls fell outside the cache TTL")
 
 
 def add_common_arguments(parser: argparse.ArgumentParser) -> None:
@@ -1683,57 +1720,143 @@ def add_common_arguments(parser: argparse.ArgumentParser) -> None:
                         metavar="PATH",
                         help="quota-drain used for sampling and contamination checks "
                              "(default: the bundled nenpi.drain module)")
-    parser.add_argument("--window", choices=("five_hour", "seven_day"), default="five_hour")
+    parser.add_argument(
+        "--window", choices=("five_hour", "seven_day"), default="five_hour",
+        help="window used to count ticks and project spend (default: five_hour); "
+             "both budget caps still apply",
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="nenpi-bench",
-                                     description=__doc__.splitlines()[0])
-    sub = parser.add_subparsers(dest="command")
+    parser = argparse.ArgumentParser(
+        prog="nenpi-bench",
+        description=(
+            "Measure how many Claude tokens consume one percentage point of plan utilisation. "
+            "plan is a dry run; run spends real quota; report fits stored run logs."
+        ),
+        epilog=(
+            "Examples:\n"
+            "  nenpi-bench plan --contexts 10k,60k --cache cold,warm\n"
+            "  nenpi-bench run --models claude-haiku-4-5 --ticks 2 --yes\n"
+            "  nenpi-bench report --run-id 20260917T120000Z-abcd --json"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    sub = parser.add_subparsers(dest="command", metavar="COMMAND")
 
-    plan = sub.add_parser("plan", help="scenario list and projected cost; spends nothing")
+    plan = sub.add_parser(
+        "plan", help="list scenarios and project quota; spends nothing",
+        description=(
+            "Expand the scenario cross-product and estimate calls and quota before a run. "
+            "No Claude process or snapshot is started."
+        ),
+        epilog=(
+            "Examples:\n"
+            "  nenpi-bench plan --models claude-haiku-4-5 --contexts 10k,60k\n"
+            "  nenpi-bench plan --cache cold,warm --outputs short,long --json"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     add_scenario_arguments(plan)
     add_common_arguments(plan)
     plan.set_defaults(handler=command_plan)
 
-    run = sub.add_parser("run", help="spend quota to measure tokens per percent")
+    run = sub.add_parser(
+        "run", help="spend quota to measure tokens per percent",
+        description=(
+            "Run each scenario with claude -p, sample live utilisation, and bracket the "
+            "tokens between percentage ticks. Every percentage spent is real quota."
+        ),
+        epilog=(
+            "Examples:\n"
+            "  nenpi-bench run --models claude-haiku-4-5 --contexts 10k --yes\n"
+            "  nenpi-bench run --require-idle --sample-interval 90 --yes"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     add_scenario_arguments(run)
     add_common_arguments(run)
-    run.add_argument("--yes", action="store_true", help="confirm the projected spend")
+    run.add_argument(
+        "--yes", action="store_true",
+        help="confirm that the projected calls may spend real quota; required to start",
+    )
     run.add_argument("--require-idle", action="store_true",
-                     help="refuse to start while another Claude session is active")
-    run.add_argument("--claude", default="claude", metavar="PATH")
+                     help="refuse to start unless no other Claude session overlaps each "
+                          "contamination check")
+    run.add_argument(
+        "--claude", default="claude", metavar="PATH",
+        help="Claude executable to invoke (default: claude)",
+    )
     run.add_argument("--allow-tools", action="store_true",
-                     help="leave the built-in tools enabled (they add turns and tokens)")
+                     help="leave built-in tools enabled (default: disabled; tools add turns "
+                          "and tokens)")
     run.add_argument("--force-projection", action="store_true",
-                     help="start even though the projection already exceeds --max-percent")
+                     help="start even when the projected five-hour spend exceeds "
+                          "--max-percent")
     run.add_argument("--claude-arg", action="append", default=[], metavar="ARG",
                      help="extra argument for every claude call; repeatable")
     run.add_argument("--config-dir", action="append", default=[], metavar="PATH",
-                     help="passed through to `quota-drain snapshot --oauth`")
+                     help="Claude config directory passed to snapshot --oauth; repeatable")
     run.add_argument("--sample-interval", type=float, default=DEFAULT_SAMPLE_INTERVAL,
-                     metavar="SECONDS")
+                     metavar="SECONDS",
+                     help="minimum seconds between utilisation polls (default: 60; endpoint "
+                          "also enforces 60)")
     run.add_argument("--max-sample-age", type=float, default=None, metavar="SECONDS",
                      help="stop before the next call when the newest sample is older "
                           "(default: twice --sample-interval, at least 90s)")
     run.add_argument("--call-timeout", type=float, default=DEFAULT_CALL_TIMEOUT,
-                     metavar="SECONDS")
+                     metavar="SECONDS",
+                     help="abort an individual claude call after this many seconds "
+                          "(default: 900)")
     run.add_argument("--write-heavy-gap", type=float, default=WRITE_HEAVY_GAP_SECONDS,
-                     metavar="SECONDS")
+                     metavar="SECONDS",
+                     help="seconds between write-heavy calls so the 5-minute cache expires "
+                          "(default: 360)")
     run.add_argument("--filler-channel", choices=("prompt", "system-prompt-file"),
-                     default="prompt")
+                     default="prompt",
+                     help="send filler on stdin or via --system-prompt-file (default: prompt)")
     run.add_argument("--contamination-since", default=DEFAULT_CONTAMINATION_WINDOW,
-                     metavar="DURATION")
-    run.add_argument("--no-write-weights", action="store_true")
+                     metavar="DURATION",
+                     help="look back this far for other Claude sessions during contamination "
+                          "checks (default: 6h)")
+    run.add_argument(
+        "--no-write-weights", action="store_true",
+        help="do not save a usable fitted Claude weight table after the run",
+    )
     add_fit_arguments(run)
     run.set_defaults(handler=command_run)
 
-    report = sub.add_parser("report", help="table and fit from stored run logs")
-    report.add_argument("--run-id", default=None, metavar="ID")
-    report.add_argument("--ticks", type=int, default=DEFAULT_TICKS, metavar="N")
-    report.add_argument("--no-write-weights", action="store_true")
+    report = sub.add_parser(
+        "report", help="fit and report from stored run logs",
+        description=(
+            "Read the latest stored run, or the run named by --run-id, and fit weights "
+            "from eligible scenario records. This command spends no quota."
+        ),
+        epilog=(
+            "Examples:\n"
+            "  nenpi-bench report\n"
+            "  nenpi-bench report --run-id 20260917T120000Z-abcd --include-unbracketed --json"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    report.add_argument(
+        "--run-id", default=None, metavar="ID",
+        help="stored run ID (default: most recent run under the state directory)",
+    )
+    report.add_argument(
+        "--ticks", type=int, default=DEFAULT_TICKS, metavar="N",
+        help="minimum ticks required for a bracketed estimate (default: 2; normally read "
+             "from the run metadata)",
+    )
+    report.add_argument(
+        "--no-write-weights", action="store_true",
+        help="do not save a usable fitted Claude weight table",
+    )
     add_fit_arguments(report)
-    report.add_argument("--json", action="store_true")
+    report.add_argument(
+        "--json", action="store_true",
+        help="write the report payload as indented JSON",
+    )
     add_common_arguments(report)
     report.set_defaults(handler=command_report)
 

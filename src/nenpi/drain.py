@@ -4749,9 +4749,21 @@ def append_snapshot(destination: Path, record: Mapping[str, Any]) -> None:
 
 
 def add_common(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--harness", choices=("claude", "codex", "all"), default="all")
-    parser.add_argument("--since", default=None, metavar="WHEN")
-    parser.add_argument("--until", default=None, metavar="WHEN")
+    parser.add_argument(
+        "--harness", choices=("claude", "codex", "all"), default="all",
+        help="transcript source to scan (default: all; calibrate defaults to codex "
+             "unless overridden)",
+    )
+    parser.add_argument(
+        "--since", default=None, metavar="WHEN",
+        help="include events from this inclusive lower bound (7d, 12h, or ISO date/time); "
+             "default: no lower bound",
+    )
+    parser.add_argument(
+        "--until", default=None, metavar="WHEN",
+        help="set the inclusive upper event-time cutoff (1d, 2026-09-10, or ISO date/time); "
+             "default: no upper bound",
+    )
     parser.add_argument("--claude-root", action="append", default=[], metavar="PATH",
                         help="a Claude home dir (holds .claude.json and projects/); "
                              "repeatable, replaces config.toml and the defaults")
@@ -4761,71 +4773,191 @@ def add_common(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--account", default=None, metavar="LABEL",
                         help="limit to one account's pool, by root basename "
                              "(e.g. .codex-arcade); see `nenpi config`")
-    parser.add_argument("--rebuild-cache", action="store_true")
-    parser.add_argument("--json", action="store_true")
-    parser.add_argument("--no-color", action="store_true")
+    parser.add_argument(
+        "--rebuild-cache", action="store_true",
+        help="discard cached transcript parses and rebuild them",
+    )
+    parser.add_argument(
+        "--json", action="store_true",
+        help="write the command result as indented JSON",
+    )
+    parser.add_argument(
+        "--no-color", action="store_true",
+        help="disable ANSI colors, including the scan progress display",
+    )
     parser.add_argument("--ascii", action="store_true",
-                        help="draw bars with ASCII; automatic on a non-UTF-8 stdout")
-    parser.add_argument("--width", type=int, default=None, metavar="N")
-    parser.add_argument("--claude-cache-read-weight", type=float, default=None, metavar="FLOAT")
-    parser.add_argument("--long-context-multiplier", type=float, default=1.0, metavar="FLOAT")
-    parser.add_argument("--use-calibrated", action="store_true")
+                        help="draw bars with ASCII; automatic on non-UTF-8 stdout")
+    parser.add_argument(
+        "--width", type=int, default=None, metavar="COLUMNS",
+        help="set text width in columns (default: terminal width, minimum 60)",
+    )
+    parser.add_argument(
+        "--claude-cache-read-weight", type=float, default=None, metavar="RATIO",
+        help="price Claude cache reads at this multiple of uncached input "
+             "(default: API list ratio, usually 0.1)",
+    )
+    parser.add_argument(
+        "--long-context-multiplier", type=float, default=1.0, metavar="MULTIPLIER",
+        help="multiply requests over 200K tokens by this factor (default: 1.0)",
+    )
+    parser.add_argument(
+        "--use-calibrated", action="store_true",
+        help="use a stored usable calibration fit when one exists",
+    )
     parser.add_argument("--window", default="auto", metavar="auto|five_hour|weekly|MINUTES",
-                        help="which quota window to measure; an integer is window_minutes")
-    parser.add_argument("--top", type=int, default=25, metavar="N")
+                        help="quota window for drain attribution: auto, five_hour, weekly, "
+                             "or window_minutes (default: auto)")
+    parser.add_argument(
+        "--top", type=int, default=25, metavar="N",
+        help="limit rows or sessions shown (default: 25)",
+    )
     parser.add_argument("--whole-session", action="store_true",
-                        help="report each selected session's whole life, not just the range")
-    parser.add_argument("--calibrate-bucket-hours", type=float,
-                        default=DEFAULT_CALIBRATION_BUCKET_HOURS, metavar="HOURS")
+                        help="report each selected session's lifetime, not only events in the range")
+    parser.add_argument(
+        "--calibrate-bucket-hours", type=float,
+        default=DEFAULT_CALIBRATION_BUCKET_HOURS, metavar="HOURS",
+        help="time bucket size for calibration fitting (default: 2 hours)",
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="nenpi", description=__doc__.splitlines()[0])
-    sub = parser.add_subparsers(dest="command")
+    parser = argparse.ArgumentParser(
+        prog="nenpi",
+        description=(
+            "Measure subscription-plan quota used by Claude Code and Codex CLI sessions.\n"
+            "Codex drain is measured from rate-limit snapshots; Claude drain is modelled\n"
+            "from transcript usage at API list prices unless sampled."
+        ),
+        epilog=(
+            "Examples:\n"
+            "  nenpi sessions --since 7d --harness all\n"
+            "  nenpi sessions --harness codex --window five_hour --sort tokens --top 10\n"
+            "  nenpi prompts --session 0123abcd --since 7d\n"
+            "  nenpi timeline --since 24h --bucket 1h"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    sub = parser.add_subparsers(dest="command", metavar="COMMAND")
 
-    sessions = sub.add_parser("sessions", help="one row per session, ranked by quota drain")
+    sessions = sub.add_parser(
+        "sessions", help="rank sessions by quota drain",
+        description="Show one row per session, with fan-out and quota-drain details.",
+        epilog="Example:\n  nenpi sessions --since 7d --sort tokens --top 20",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     add_common(sessions)
-    sessions.add_argument("--sort", choices=("drain", "tokens", "start"), default="drain")
+    sessions.add_argument(
+        "--sort", choices=("drain", "tokens", "start"), default="drain",
+        help="sort by within-harness drain share, token count, or newest start "
+             "(default: drain)",
+    )
     sessions.set_defaults(handler=command_sessions)
 
-    timeline = sub.add_parser("timeline", help="one bar per time bucket")
+    timeline = sub.add_parser(
+        "timeline", help="show quota activity over time",
+        description="Aggregate weighted Claude units, Codex units, and observed quota by time bucket.",
+        epilog="Example:\n  nenpi timeline --since 7d --bucket 5h",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     add_common(timeline)
-    timeline.add_argument("--bucket", choices=("1h", "5h", "1d"), default="1h")
+    timeline.add_argument(
+        "--bucket", choices=("1h", "5h", "1d"), default="1h",
+        help="bucket width in hours or days (default: 1h)",
+    )
     timeline.set_defaults(handler=command_timeline)
 
-    windows = sub.add_parser("windows", help="each observed Codex quota window")
+    windows = sub.add_parser(
+        "windows", help="show observed Codex quota windows",
+        description="List observed Codex windows, reset times, peak usage, and attributed sessions.",
+        epilog="Example:\n  nenpi windows --since 30d --window weekly",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     add_common(windows)
     windows.set_defaults(handler=command_windows)
 
-    calibrate = sub.add_parser("calibrate", help="fit weights against measured drain")
+    calibrate = sub.add_parser(
+        "calibrate", help="fit token weights against measured drain",
+        description="Fit percent-per-million-token weights from logged quota snapshots and save them.",
+        epilog=(
+            "Examples:\n"
+            "  nenpi calibrate --harness codex --since 14d\n"
+            "  nenpi calibrate --harness claude --since 30d --json"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     add_common(calibrate)
     calibrate.set_defaults(handler=command_calibrate, harness="codex")
 
-    prompts = sub.add_parser("prompts", help="per-prompt fan-out and context growth for one session")
+    prompts = sub.add_parser(
+        "prompts", help="inspect fan-out and context growth for one session",
+        description="Show per-prompt input, context, turns, weighted units, and growth fits.",
+        epilog="Example:\n  nenpi prompts --session 0123abcd --top 40 --since 7d",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     add_common(prompts)
-    prompts.add_argument("--session", required=True, metavar="ID_PREFIX")
+    prompts.add_argument(
+        "--session", required=True, metavar="ID_PREFIX",
+        help="required session ID prefix; if several match, use the busiest",
+    )
     prompts.set_defaults(handler=command_prompts)
 
-    fanout = sub.add_parser("fanout", help="turns-per-prompt and context distributions")
+    fanout = sub.add_parser(
+        "fanout", help="summarize turns and context per prompt",
+        description="Show distributions and the 15 prompts with the most input tokens sent.",
+        epilog="Example:\n  nenpi fanout --harness claude --since 7d",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     add_common(fanout)
     fanout.set_defaults(handler=command_fanout)
 
-    reductions = sub.add_parser("reductions", help="points where a session's context shrank")
+    reductions = sub.add_parser(
+        "reductions", help="find sharp context reductions",
+        description="List points where a session context shrank by more than 30% across API calls.",
+        epilog="Example:\n  nenpi reductions --since 30d --top 50",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     add_common(reductions)
     reductions.set_defaults(handler=command_reductions)
 
-    verify = sub.add_parser("verify", help="cross-check parsed totals against in-band summaries")
+    verify = sub.add_parser(
+        "verify", help="cross-check parsed totals",
+        description="Compare parsed usage with each harness's in-band summary data.",
+        epilog="Example:\n  nenpi verify --since 7d --harness all",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     add_common(verify)
     verify.set_defaults(handler=command_verify)
 
-    snapshot = sub.add_parser("snapshot", help="log a Claude quota utilisation observation")
-    snapshot.add_argument("--stdin", action="store_true",
-                          help="read statusline JSON on stdin and pass it through unchanged")
-    snapshot.add_argument("--oauth", action="store_true",
-                          help="sample live utilisation from the Claude oauth usage endpoint")
-    snapshot.add_argument("--compact", action="store_true",
-                          help="drop repeated entries and anything past retention")
-    snapshot.add_argument("--config-dir", action="append", default=[], metavar="PATH")
+    snapshot = sub.add_parser(
+        "snapshot", help="record a Claude quota-utilisation observation",
+        description=(
+            "Append Claude quota observations to the local snapshot log. "
+            "Choose --stdin, --oauth, or --compact; with no mode, import cached CLI config data."
+        ),
+        epilog=(
+            "Examples:\n"
+            "  nenpi snapshot --stdin < statusline.json\n"
+            "  nenpi snapshot --oauth --config-dir ~/.claude\n"
+            "  nenpi snapshot --compact"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    snapshot.add_argument(
+        "--stdin", action="store_true",
+        help="read statusline JSON from stdin, echo it unchanged, and log changed rate limits",
+    )
+    snapshot.add_argument(
+        "--oauth", action="store_true",
+        help="read OAuth credentials and sample live utilisation (polls are at least 60s apart)",
+    )
+    snapshot.add_argument(
+        "--compact", action="store_true",
+        help="drop repeated, malformed, and older-than-60-day snapshot records",
+    )
+    snapshot.add_argument(
+        "--config-dir", action="append", default=[], metavar="PATH",
+        help="Claude config directory for --oauth; repeatable (default: discovered configs)",
+    )
     snapshot.set_defaults(handler=command_snapshot)
 
     config_cmd = sub.add_parser(
