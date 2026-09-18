@@ -473,6 +473,9 @@ roots = ["~/.codex", "~/.codex-arcade"]
 [plan]            # optional, display only
 claude = "max_20x"
 codex = "pro"
+
+[general]
+ignore_unconfigured = true     # silence the unconfigured-sibling note
 ```
 
 This one file is the whole store. The Textual Sources screen reads and
@@ -500,8 +503,8 @@ Writing the file (the Sources screen, or `nenpi config --init --force`)
 preserves every table and key, including ones this version does not
 recognise, but not comments: `--init` re-seeds `roots` and rewrites the rest
 from what it parsed, so hand-written comments are lost. `--init --force`
-keeps `disabled`, `ignored`, `[plan]` and unknown tables, and never
-re-seeds a root that is listed as disabled or ignored.
+keeps `disabled`, `ignored`, `[plan]`, `[general]` and unknown tables, and
+never re-seeds a root that is listed as disabled or ignored.
 
 A missing file falls back to the defaults above. A malformed file is a hard
 error naming the file and the parse problem; an unknown key is a warning, not
@@ -517,6 +520,20 @@ account it authenticates as: a label (the root's basename) and a key (Codex:
 label). Tokens are never read or printed. `nenpi config --init` writes a
 starter `config.toml`, seeded with every root the old glob would have found
 on this host (refuses to overwrite an existing file without `--force`).
+
+When a `~/.claude-*` or `~/.codex-*` directory that looks like a harness
+home (it has `projects/` or `sessions/`) is present but in nothing's
+resolved set, one line goes to stderr per run:
+
+```
+nenpi: found unconfigured harness dirs: ~/.claude-arcade, ~/.codex-arcade; run `nenpi config --init` to include them (or set [general] ignore_unconfigured = true)
+```
+
+It costs one glob per harness, is suppressed for `--json` output and for
+`snapshot --stdin`, never fires for roots given with `--claude-root` /
+`--codex-root`, and skips the default locations and anything listed under
+`disabled` or `ignored`. `nenpi config` prints the same set as an
+`unconfigured:` line (`unconfigured_roots` in `--json`).
 
 **Breaking change:** with defaults narrowed to one location per harness, a
 host that relied on the old glob picking up e.g. `~/.codex-arcade` or

@@ -14,7 +14,9 @@ harness that resolves to zero roots gets one warning.
 sources are ``roots``, sources switched off in the UI are ``disabled``, and
 discovered roots the user removed are ``ignored``. An empty ``roots`` in a
 table the file has means "scan nothing"; only a missing table falls back to
-the defaults. Writing the file keeps unknown tables and keys (so a newer or
+the defaults. ``[general] ignore_unconfigured`` silences the note about
+sibling harness dirs that are present on the host but in nothing's resolved
+set. Writing the file keeps unknown tables and keys (so a newer or
 hand-written setting survives) but not comments.
 
 Test path overrides use the ``NENPI_*`` environment variables (``HOME_DIR``,
@@ -39,6 +41,18 @@ LEGACY_PREFIX = "QUOTA_DRAIN_"
 MAX_JSON_BYTES = 128 * 1024 * 1024
 
 _WARNED = set()  # type: set
+
+# Advisory notices (as opposed to warnings about broken input) are muted for
+# machine-readable output; ``drain.main`` flips this off for ``--json``.
+_NOTICES = [True]
+
+
+def set_notices_enabled(enabled: bool) -> None:
+    _NOTICES[0] = bool(enabled)
+
+
+def notices_enabled() -> bool:
+    return _NOTICES[0]
 
 
 def warn(message: str) -> None:
@@ -140,6 +154,7 @@ class Config:
         codex_disabled: Optional[Sequence[str]] = None,
         claude_ignored: Optional[Sequence[str]] = None,
         codex_ignored: Optional[Sequence[str]] = None,
+        ignore_unconfigured: bool = False,
         tables_present: Optional[Sequence[str]] = None,
         extras: Optional[Dict[str, Any]] = None,
     ):
@@ -152,6 +167,7 @@ class Config:
         self.codex_disabled = list(codex_disabled or [])
         self.claude_ignored = list(claude_ignored or [])
         self.codex_ignored = list(codex_ignored or [])
+        self.ignore_unconfigured = bool(ignore_unconfigured)
         # Which harness tables the file actually had: an empty ``roots`` in a
         # table the user wrote is a choice ("scan nothing"), while an absent
         # table means "no opinion" and falls back to the defaults.
@@ -173,11 +189,12 @@ class Config:
         return name in self.tables_present
 
 
-_KNOWN_TOP_KEYS = ("claude", "codex", "plan")
+_KNOWN_TOP_KEYS = ("claude", "codex", "plan", "general")
 _KNOWN_SUBKEYS = {
     "claude": ("roots", "disabled", "ignored"),
     "codex": ("roots", "disabled", "ignored"),
     "plan": ("claude", "codex"),
+    "general": ("ignore_unconfigured",),
 }
 
 
@@ -226,6 +243,7 @@ def load_config(path: Optional[Path] = None) -> Config:
     claude_block = data.get("claude") if isinstance(data.get("claude"), dict) else {}
     codex_block = data.get("codex") if isinstance(data.get("codex"), dict) else {}
     plan_block = data.get("plan") if isinstance(data.get("plan"), dict) else {}
+    general_block = data.get("general") if isinstance(data.get("general"), dict) else {}
 
     plan_claude = plan_block.get("claude")
     plan_codex = plan_block.get("codex")
@@ -240,6 +258,7 @@ def load_config(path: Optional[Path] = None) -> Config:
         codex_disabled=_string_list(codex_block.get("disabled")),
         claude_ignored=_string_list(claude_block.get("ignored")),
         codex_ignored=_string_list(codex_block.get("ignored")),
+        ignore_unconfigured=general_block.get("ignore_unconfigured") is True,
         tables_present=tables_present,
         extras=extras,
     )
@@ -362,6 +381,7 @@ def dump_config(
             lines.append("%s = %s" % (key, rendered))
         lines.append("")
     plan_extras = config.extras.get("plan") or {}
+    general_extras = config.extras.get("general") or {}
     if config.plan_claude or config.plan_codex or plan_extras:
         lines.append("[plan]  # display only")
         if config.plan_claude:
@@ -377,6 +397,19 @@ def dump_config(
         lines.append("# [plan]  # optional, display only")
         lines.append('# claude = "max_20x"')
         lines.append('# codex = "pro"')
+        lines.append("")
+    if config.ignore_unconfigured or general_extras:
+        lines.append("[general]")
+        if config.ignore_unconfigured:
+            lines.append("ignore_unconfigured = true")
+        for key, value in general_extras.items():
+            rendered = toml_value(value)
+            if rendered is not None:
+                lines.append("%s = %s" % (key, rendered))
+        lines.append("")
+    else:
+        lines.append("# [general]")
+        lines.append("# ignore_unconfigured = true  # silence the unconfigured-dir note")
         lines.append("")
     for key, value in config.extras.items():
         if key in _KNOWN_TOP_KEYS:
@@ -463,6 +496,7 @@ def resolve_roots(
     config: Config,
     quiet: bool = False,
     keep_missing: bool = False,
+    notify: bool = True,
 ) -> List[Path]:
     flag_paths = [normalize_root_flag(value, harness) for value in flags if value]
     if flag_paths:
@@ -486,6 +520,8 @@ def resolve_roots(
             )
     if not resolved and not quiet:
         warn_once("no %s roots found; see `nenpi config`" % harness)
+    if notify and not quiet and not flag_paths:
+        warn_unconfigured_roots(config)
     return resolved
 
 
@@ -511,6 +547,66 @@ def discover_candidate_roots(harness: str) -> List[Path]:
             seen.add(key)
             candidates.append(candidate)
     return [candidate for candidate in candidates if (candidate / leaf).is_dir()]
+
+
+def display_path(path: Path) -> str:
+    """``~``-shorten a path for messages, without resolving symlinks."""
+
+    home = str(home_dir())
+    text = str(path)
+    if text == home:
+        return "~"
+    if text.startswith(home + os.sep):
+        return "~" + text[len(home) :]
+    return text
+
+
+def unconfigured_roots(config: Config) -> Dict[str, List[Path]]:
+    """Harness dirs that exist on this host but are not in the resolved set.
+
+    One glob per harness plus an ``is_dir`` per hit; no directory walks.
+    Roots the user disabled or removed in the UI are not "unconfigured".
+    """
+
+    result = {}  # type: Dict[str, List[Path]]
+    for harness in ("claude", "codex"):
+        resolved = {
+            str(path)
+            for path in resolve_roots(
+                harness, [], config, quiet=True, keep_missing=True, notify=False
+            )
+        }
+        known = set(resolved)
+        for item in list(config.disabled(harness)) + list(config.ignored(harness)):
+            known.add(str(Path(item).expanduser()))
+        # A config file that names roots and leaves out ~/.claude left it out
+        # on purpose; the note is about siblings nothing knows about.
+        known.update(str(path) for path in _default_root_candidates(harness))
+        missing = [
+            candidate
+            for candidate in discover_candidate_roots(harness)
+            if str(candidate) not in known
+        ]
+        if missing:
+            result[harness] = missing
+    return result
+
+
+def warn_unconfigured_roots(config: Config) -> None:
+    """Emit one stderr note about harness dirs that nothing will scan."""
+
+    if config.ignore_unconfigured or not notices_enabled():
+        return
+    found = unconfigured_roots(config)
+    paths = [display_path(path) for harness in ("claude", "codex")
+             for path in found.get(harness, [])]
+    if not paths:
+        return
+    warn_once(
+        "found unconfigured harness dirs: %s; run `nenpi config --init` to "
+        "include them (or set [general] ignore_unconfigured = true)"
+        % ", ".join(paths)
+    )
 
 
 # --------------------------------------------------------------------------

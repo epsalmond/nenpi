@@ -39,11 +39,14 @@ from nenpi.config import (
     config_dir,
     config_path,
     discover_candidate_roots,
+    display_path,
     load_config,
     migrate_dirs,
     resolve_roots,
     save_config,
+    set_notices_enabled,
     state_dir,
+    unconfigured_roots,
     warn,
     warn_once,
 )
@@ -5181,6 +5184,12 @@ def command_config(args: argparse.Namespace) -> int:
                     "account_key": key,
                 }
             )
+    unconfigured = unconfigured_roots(config)
+    unconfigured_rows = [
+        {"harness": harness, "path": str(root)}
+        for harness in ("claude", "codex")
+        for root in unconfigured.get(harness, [])
+    ]
     if args.json:
         print(
             json.dumps(
@@ -5189,6 +5198,7 @@ def command_config(args: argparse.Namespace) -> int:
                     "config_path": str(path),
                     "config_present": path.is_file(),
                     "roots": rows,
+                    "unconfigured_roots": unconfigured_rows,
                 },
                 indent=2,
                 sort_keys=True,
@@ -5210,6 +5220,12 @@ def command_config(args: argparse.Namespace) -> int:
                 row["account_key"],
             )
         )
+    if unconfigured_rows:
+        print(
+            "unconfigured: %s (run `nenpi config --init`, add them to "
+            "[claude]/[codex] roots, or set [general] ignore_unconfigured = true)"
+            % ", ".join(display_path(Path(row["path"])) for row in unconfigured_rows)
+        )
     return 0
 
 
@@ -5229,6 +5245,7 @@ def command_config_init(args: argparse.Namespace) -> int:
         path=path,
         plan_claude=existing.plan_claude,
         plan_codex=existing.plan_codex,
+        ignore_unconfigured=existing.ignore_unconfigured,
         claude_disabled=existing.claude_disabled,
         codex_disabled=existing.codex_disabled,
         claude_ignored=existing.claude_ignored,
@@ -5280,6 +5297,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     migrate_json_store()
     parser = build_parser()
     args = parser.parse_args(arguments)
+    # Advisory notes belong on a human's stderr, not in a --json run.
+    set_notices_enabled(not getattr(args, "json", False))
     if not getattr(args, "handler", None):
         parser.print_help()
         return 2

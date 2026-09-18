@@ -94,6 +94,9 @@ roots = ["~/.codex", "~/.codex-arcade"]
 ```
 
 `--claude-root`/`--codex-root` flags override this file for one invocation.
+A `~/.claude-*` or `~/.codex-*` directory that exists but is in no resolved
+set gets one stderr note per run; `[general] ignore_unconfigured = true`
+turns it off.
 Run `nenpi config` to see which roots are resolved and what account each one
 authenticates as, or `nenpi config --init` to write a starter file seeded
 from every `~/.claude*`/`~/.codex*` directory found on this host. See

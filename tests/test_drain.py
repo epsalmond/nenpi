@@ -3526,6 +3526,19 @@ class ClaudeAccountPools(Harness):
         self.assertNotIn("org-arcade", raw)
 
 
+class _StdinWithBuffer:
+    def __init__(self, payload: bytes) -> None:
+        self.buffer = io.BytesIO(payload)
+
+
+class _StdoutWithBuffer:
+    def __init__(self) -> None:
+        self.buffer = io.BytesIO()
+
+    def flush(self) -> None:
+        pass
+
+
 class UnifiedConfigStore(RootsAndConfig):
     """One store for the CLI and the Sources screen (issue #23)."""
 
@@ -3538,6 +3551,7 @@ class UnifiedConfigStore(RootsAndConfig):
             claude_disabled=["/tmp/off"],
             codex_ignored=["/tmp/gone"],
             plan_claude="max_20x",
+            ignore_unconfigured=True,
         )
         data = tomllib.loads(QC.dump_config(config))
         self.assertEqual(data["claude"]["roots"], config.claude_roots)
@@ -3545,6 +3559,7 @@ class UnifiedConfigStore(RootsAndConfig):
         self.assertEqual(data["codex"]["roots"], [])
         self.assertEqual(data["codex"]["ignored"], ["/tmp/gone"])
         self.assertEqual(data["plan"]["claude"], "max_20x")
+        self.assertTrue(data["general"]["ignore_unconfigured"])
 
     def test_save_config_then_load_config_is_identity(self) -> None:
         with self.env_applied():
@@ -3703,6 +3718,96 @@ class UnifiedConfigStore(RootsAndConfig):
         with self.env_applied():
             self.assertIsNone(migrate_json_store(self.config_path()))
         self.assertTrue(legacy.is_file())
+
+
+class UnconfiguredSiblingNotice(RootsAndConfig):
+    """One stderr note about harness dirs nothing will scan (issue #24)."""
+
+    NOTE = "unconfigured harness dirs"
+
+    def stderr_of(self, *arguments: str) -> str:
+        result = self.run_tool(*arguments)
+        self.assertEqual(result.returncode, 0,
+                         result.stderr.decode("utf-8", "replace"))
+        return result.stderr.decode("utf-8", "replace")
+
+    def test_sibling_dirs_are_reported_once_on_stderr(self) -> None:
+        self.make_extra_claude_root(".claude-extra")
+        self.make_extra_codex_root(".codex-extra")
+        stderr = self.stderr_of("sessions", "--harness", "all")
+        self.assertIn(self.NOTE, stderr)
+        self.assertIn("~/.claude-extra", stderr)
+        self.assertIn("~/.codex-extra", stderr)
+        self.assertEqual(stderr.count(self.NOTE), 1)
+
+    def test_no_note_when_every_sibling_is_configured(self) -> None:
+        extra = self.make_extra_claude_root(".claude-extra")
+        self.write_config(
+            '[claude]\nroots = ["%s", "%s"]\n' % (self.home / ".claude", extra)
+        )
+        self.assertNotIn(self.NOTE, self.stderr_of("sessions", "--harness", "claude"))
+
+    def test_json_output_carries_no_note(self) -> None:
+        self.make_extra_claude_root(".claude-extra")
+        result = self.run_tool("sessions", "--harness", "claude", "--json")
+        self.assertEqual(result.returncode, 0)
+        self.assertNotIn(self.NOTE, result.stderr.decode("utf-8", "replace"))
+
+    def test_ignore_unconfigured_silences_the_note(self) -> None:
+        self.make_extra_claude_root(".claude-extra")
+        self.write_config("[general]\nignore_unconfigured = true\n")
+        self.assertNotIn(self.NOTE, self.stderr_of("sessions", "--harness", "claude"))
+
+    def test_disabled_and_ignored_roots_are_not_unconfigured(self) -> None:
+        extra = self.make_extra_claude_root(".claude-extra")
+        other = self.make_extra_codex_root(".codex-extra")
+        self.write_config(
+            '[claude]\nroots = ["%s"]\ndisabled = ["%s"]\n\n'
+            '[codex]\nroots = ["%s"]\nignored = ["%s"]\n'
+            % (self.home / ".claude", extra, self.home / ".codex", other)
+        )
+        self.assertNotIn(self.NOTE, self.stderr_of("sessions", "--harness", "all"))
+
+    def test_snapshot_stdin_never_globs_or_warns(self) -> None:
+        """The statusline path resolves its own root quietly and globs never.
+
+        It does read the default Claude root to label the snapshot, but that
+        lookup is quiet; the sibling glob must not run on a path the
+        statusline takes on every prompt.
+        """
+
+        self.make_extra_claude_root(".claude-extra")
+        payload = json.dumps({"rate_limits": {"five_hour": {
+            "used_percentage": 10.0, "resets_at": "2026-01-01T00:00:00Z"}}})
+
+        def forbidden(*arguments: Any, **keywords: Any) -> None:
+            raise AssertionError("snapshot --stdin globbed for sibling roots")
+
+        errors = io.StringIO()
+        saved_in, saved_out, saved_err = sys.stdin, sys.stdout, sys.stderr
+        saved_discover = QC.discover_candidate_roots
+        sys.stdin = _StdinWithBuffer(payload.encode("utf-8"))
+        sys.stdout = _StdoutWithBuffer()
+        sys.stderr = errors
+        QC.discover_candidate_roots = forbidden
+        try:
+            with self.env_applied():
+                self.assertEqual(QD.main(["snapshot", "--stdin"]), 0)
+        finally:
+            sys.stdin, sys.stdout, sys.stderr = saved_in, saved_out, saved_err
+            QC.discover_candidate_roots = saved_discover
+        self.assertEqual(errors.getvalue(), "")
+        self.assertTrue((self.root / "state" / "snapshots.jsonl").is_file())
+
+    def test_config_lists_unconfigured_roots(self) -> None:
+        extra = self.make_extra_claude_root(".claude-extra")
+        payload = self.run_json("config", "--json")
+        self.assertEqual(
+            [row["path"] for row in payload["unconfigured_roots"]], [str(extra)]
+        )
+        result = self.run_tool("config")
+        self.assertIn("unconfigured: ~/.claude-extra",
+                      result.stdout.decode("utf-8", "replace"))
 
 
 if __name__ == "__main__":
