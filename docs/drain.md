@@ -181,15 +181,38 @@ and optional `secondary` window with `used_percent`, `window_minutes`
 (300 = five-hour, 10080 = weekly) and `resets_at` (Unix seconds).
 
 Observations from every Codex root are merged into one timeline per
-`(limit_id, plan_type, window_minutes)`. Within a timeline the tool walks
-forward, keeping a running maximum:
+`(account, limit_id, plan_type, window_minutes)`. Within a timeline the tool
+walks forward, keeping a running maximum:
 
-- A reading whose `resets_at` moves forward starts a new window; its
-  `used_percent` is that window's drain so far and is attributed as a
-  `rollover` interval.
+- **(a) A bucket change with drain evidence** (`used_percent` dropped, or rose
+  by more than nothing) **is a rollover.** Its own `used_percent` is that
+  window's drain so far, attributed as a `rollover` interval that never
+  reaches back past the moment the window opened (`resets_at` minus its
+  length).
+- **(b) A bucket change with no drain evidence is not a rollover.** Both
+  vendors re-stamp `resets_at` on every poll even for an idle pool - Codex
+  slides an untouched window's stamp toward `now + 7d`, drifting by roughly a
+  minute per reading - so a bucket change where `used_percent` is unchanged,
+  or an always-zero pool, carries no evidence anything reset. No interval is
+  emitted, and the running maximum and its anchor timestamp carry forward
+  unchanged, so the next real rise still spans back to the last reading that
+  actually moved.
+- **(c) Within one bucket, a decrease is bounded jitter, not a reset.** A
+  same-bucket decrease of `JITTER_TOLERANCE` (2 points) or less is vendor
+  jitter and is ignored, keeping the running maximum and its anchor; a larger
+  decrease is a real drop and becomes the new baseline (but still emits no
+  interval - a same-bucket reset cannot happen), so the next rise is not
+  re-charged against percent already attributed to the old high-water mark.
 - A reading from a window that has already rolled over is a stale poll from a
   concurrent session and is dropped.
-- Otherwise drain is the increase over the running maximum.
+- Otherwise (same bucket, a rise past the running maximum) drain is the
+  increase over it.
+
+`windows` and `sessions --json`'s `pools` group readings by `resets_at`,
+clustered within a five-minute tolerance per `(account, window_minutes)`
+rather than rounded to the minute: the same continuous drift that rule (b)
+keeps from creating phantom intervals would otherwise still fragment one
+idle window's `windows` output into dozens of near-identical, zero-peak rows.
 
 Exactly one `window_minutes` value is ever used — whichever the snapshots
 report most often, or the one `--window` names — because a five-hour percent
@@ -201,9 +224,53 @@ minute count.
 Each interval's drain is split across the sessions that recorded token deltas
 inside it, in proportion to their weighted tokens. A session's measured drain
 is the sum of its shares; `share_of_window` is its share of everything
-attributed to the same window instance. A rolled-over window's interval starts
+attributed to the same window instance - the denominator is the interval's
+*measured* drain, not the sum of what got attributed, so a capped window's
+shares do not have to sum to 100%. A rolled-over window's interval starts
 no earlier than the moment that window opened (`resets_at` minus its length),
 so its drain is never charged to sessions that had already finished.
+
+**The attribution cap.** Sparse readings can still make a proportional split
+implausible: the whole jump between two readings is split only across the
+sessions with a token delta inside that interval, so a handful of turns that
+happened to land inside a big jump can outrank a session that did a thousand
+times the work in a smaller one. After the proportional split, each session's
+share is capped at `CAP_FACTOR` (3) times its *plausible cost* - a per-account
+rate, in measured percent per weighted unit, times its own weighted units in
+that interval. A session over its cap is clamped to it; the freed drain is
+redistributed proportionally among the sessions still under theirs, which can
+repeat until none are over. Whatever the cap will not let any session absorb
+becomes `interval.unattributed` - usage from a client of *this* account that
+was never scanned (another machine, another login copy of the same
+credentials). It is never another account's drain: an interval only ever
+holds events from its own account's sessions (`account_for_root`), so this is
+not the cross-account bleed a per-account pool key already rules out.
+
+The rate is the median of each qualifying interval's own drain/units ratio
+(not a pooled sum/sum, which one foreign-contaminated interval could drag
+up), taken over that account's own non-rollover intervals whose units are all
+on the weighted-unit scale. A pool needs at least 3 such intervals and at
+least 1 weighted unit of coverage before its own rate is trusted; short of
+that, `--use-calibrated`'s implied rate (1.0 - a calibrated table is already
+percent per weighted unit) or a usable stored fit's `fallback_scale` is used
+instead, and with neither, capping is skipped for that pool with a single
+warning. A session whose weighted units came from the raw-token fallback (a
+model with no weight, or a zeroed fitted coefficient) is exempt from the cap
+in either direction - that fallback's scale is not the weighted-unit scale, so
+capping against it would silently zero out a session that really did the
+work.
+
+Surfaced wherever drain is: the `sessions` header adds a line per account with
+measurable unattributed drain (`unattributed: .codex 14.2% (usage from
+clients not in the scanned roots)`); `windows` prints an `unattributed N%`
+line under any window that has one; `sessions --json` adds a top-level
+`pools` array, one entry per (account, window instance), with
+`account_label`, `window_resets_at`, `peak`, `attributed`, and `unattributed`.
+`calibrate --harness codex` fits weights against measured drain unchanged -
+the cap only reshuffles one interval's drain across its own sessions and
+never reaches the fit, and subtracting `unattributed` from the fit target
+would be circular - but reports the corpus's overall unattributed share as a
+diagnostic, since a large one means a contaminated corpus.
 
 Two details matter and are easy to get wrong:
 
@@ -629,9 +696,15 @@ applied above 200K tokens so it can be tested later.
 
 ## Known limitations
 
-Three known-wrong behaviours, none of them blocking, each with the fix it
+Four known-wrong behaviours, none of them blocking, each with the fix it
 wants:
 
+- **The attribution cap's rate is per account, not per model or session.** A
+  pool that mixes a cheap, chatty model with an expensive, quiet one measures
+  one blended rate; a session on the expensive model in a sparse interval
+  could still be capped tighter than its real cost. The fix is a per-model
+  rate, which needs enough non-rollover coverage per model to be worth
+  fitting - most pools do not have it yet.
 - **An interval that straddles `--since` keeps its whole drain, but only the
   in-range events share it.** The interval's start is clamped to the range
   while its measured percent is not, so at most one interval per window group

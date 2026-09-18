@@ -22,6 +22,7 @@ import math
 import os
 import re
 import shutil
+import statistics
 import sys
 import textwrap
 import time
@@ -62,6 +63,16 @@ OAUTH_TIMEOUT_SECONDS = 15.0
 OAUTH_WINDOWS = ("five_hour", "seven_day", "seven_day_opus", "seven_day_sonnet")
 SNAPSHOT_RETENTION_DAYS = 60
 FALLBACK_CLAUDE_VERSION = "unknown"
+JITTER_TOLERANCE = 2.0  # percent; a same-bucket decrease this small or smaller
+# is vendor jitter, not a real drop, and must not become a new baseline (#16).
+RESET_CLUSTER_TOLERANCE_SECONDS = 300.0  # 5 minutes; collapses a resets_at that
+# drifts continuously (an idle pool re-stamping resets_at = now + 7d) into one
+# window instead of one entry per drifting reading (#17).
+CAP_FACTOR = 3.0  # a session's attributed share of an interval's drain is
+# capped at this multiple of its plausible cost (rate * weighted units, #16).
+MIN_RATE_INTERVALS = 3  # a pool needs at least this many non-rollover
+# intervals before its own measured rate is trusted for capping.
+MIN_RATE_UNITS = 1.0  # ...and at least this much weighted-unit coverage.
 DEDUP_CARRY_IDS = 64
 PROGRESS_INTERVAL_SECONDS = 0.5
 
@@ -1485,6 +1496,11 @@ class Interval:
         self.sessions = {}  # type: Dict[str, float]
         self.prompts = {}  # type: Dict[Tuple[str, Any], float]
         self.features = {}  # type: Dict[Tuple[str, str], float]
+        # Drain the attribution cap could not place on any session - not a
+        # foreign account (that's cross-account bleed, #9), but usage from a
+        # client of THIS account that was never scanned (another machine,
+        # another login copy). See attribute()/water_fill().
+        self.unattributed = 0.0
 
 
 UNSET = object()
@@ -1519,6 +1535,50 @@ def resets_epoch(value: Any) -> Optional[float]:
     if isinstance(value, str):
         return parse_timestamp(value)
     return None
+
+
+def cluster_reset_keys(
+    items: Iterable[Tuple[Any, Any, Any]],
+    tolerance_seconds: float = RESET_CLUSTER_TOLERANCE_SECONDS,
+) -> Dict[Tuple[Any, Any, Any], Any]:
+    """Map each (account, window_minutes, resets_at) triple to a cluster key.
+
+    `resets_bucket` rounds to the minute, which is enough for the second or
+    two of jitter both vendors put on a genuinely stable window, but an idle
+    Codex pool re-stamps `resets_at` to `now + 7d` on *every* snapshot, so it
+    drifts by roughly a minute per reading and still produces one fresh
+    bucket after another (#17) - dozens of `windows` rows for one
+    continuously-idle window. Within one (account, window_minutes) pool,
+    chain-cluster `resets_at` values sorted by time: a value within
+    `tolerance_seconds` of its predecessor joins the same cluster as that
+    predecessor, so a slow, continuous drift collapses into a single
+    cluster while a real rollover (days away) starts a new one. Every member
+    of a cluster is keyed on the earliest member's minute-rounded bucket, so
+    the result is still a stable, comparable key.
+    """
+    groups = {}  # type: Dict[Tuple[Any, Any], List[Tuple[float, Any]]]
+    result = {}  # type: Dict[Tuple[Any, Any, Any], Any]
+    seen = set()  # type: set
+    for account, window_minutes, resets_at in items:
+        triple = (account, window_minutes, resets_at)
+        if triple in seen:
+            continue
+        seen.add(triple)
+        epoch = resets_epoch(resets_at)
+        if epoch is None:
+            result[triple] = resets_bucket(resets_at)
+            continue
+        groups.setdefault((account, window_minutes), []).append((epoch, resets_at))
+    for group_key, values in groups.items():
+        values.sort(key=lambda item: item[0])
+        cluster_key = None  # type: Any
+        last_epoch = None  # type: Optional[float]
+        for epoch, resets_at in values:
+            if cluster_key is None or epoch - last_epoch > tolerance_seconds:
+                cluster_key = resets_bucket(resets_at)
+            result[(group_key[0], group_key[1], resets_at)] = cluster_key
+            last_epoch = epoch
+    return result
 
 
 def snapshot_windows(
@@ -1616,6 +1676,19 @@ def build_intervals(snapshots: Sequence[Mapping[str, Any]], window: Any) -> List
                 current, running, anchor_ts = bucket, used, row["ts"]
                 continue
             if bucket != current:
+                if used == running:
+                    # No drain evidence: `resets_at` moved (an idle pool
+                    # re-stamping resets_at = now + 7d, or a slide) but the
+                    # reading itself did not, so this is not a rollover.
+                    # Carry running/anchor_ts forward instead of resetting
+                    # them to this reading, so the next real rise still spans
+                    # back to the last reading that actually moved (#16/#17).
+                    # `used == 0` with `running` already 0 (the only case an
+                    # idle, never-active pool can hit) lands here too; a
+                    # `used == 0` bucket change with `running > 0` is a real
+                    # reset and falls through below instead.
+                    current = bucket
+                    continue
                 drain = min(100.0, max(0.0, used))
                 start = window_start(row, anchor_ts)
                 if drain > 0 and start is not None and row["ts"] > start:
@@ -1626,6 +1699,14 @@ def build_intervals(snapshots: Sequence[Mapping[str, Any]], window: Any) -> List
                 continue
             delta = used - running
             if delta <= 0:
+                # A same-bucket reset cannot happen, so a decrease is vendor
+                # jitter unless it is bigger than JITTER_TOLERANCE. A jitter
+                # decrease (or a flat reading, delta == 0) keeps both running
+                # and anchor_ts; a real decrease takes the new, lower reading
+                # as the baseline so the next rise is not re-charged for
+                # percent already attributed against the old high-water mark.
+                if delta < 0 and (running - used) > JITTER_TOLERANCE:
+                    running, anchor_ts = used, row["ts"]
                 continue
             # `used_percent` is reported in whole percent, so a step covers
             # everything since the last change, not just the last poll.
@@ -1673,6 +1754,18 @@ def attribute(
     set by `prepare` just before this call - the signature stays
     `(intervals, events, weights, args)` and the EVENT_* tuple stays
     positional and unwidened; args is the one place with room for it.
+
+    A sparse reading can still make one session's proportional share
+    implausible: the whole jump between two readings is split only across
+    whichever sessions had a token delta inside that interval, so a handful
+    of turns that happened to fall inside a big jump can outrank a session
+    that did a thousand times the work in a smaller one (#16). After the
+    proportional split, each session's share is capped at `CAP_FACTOR` times
+    its plausible cost (a per-account rate, in percent per weighted unit,
+    times its own weighted units); drain the cap will not let any session
+    absorb is `interval.unattributed` - usage from a client of this account
+    that was never scanned, not cross-account bleed (that is #9, handled by
+    the per-account `interval.account` filter above).
     """
     session_accounts = getattr(args, "_session_accounts", None) or {}
     ordered = sorted((event for event in events if event[EVENT_TS] is not None),
@@ -1680,12 +1773,14 @@ def attribute(
     if not ordered:
         return
     stamps = [event[EVENT_TS] for event in ordered]
+    computed = {}  # type: Dict[int, Dict[str, Any]]
     for interval in intervals:
         low = bisect.bisect_right(stamps, interval.start)
         high = bisect.bisect_right(stamps, interval.end)
         total = 0.0
         shares = {}  # type: Dict[str, float]
         prompt_shares = {}  # type: Dict[Tuple[str, Any], float]
+        fallback_sessions = set()  # type: set
         for event in ordered[low:high]:
             account = session_accounts.get(("codex", event[EVENT_SESSION]))
             if account is not None and account[0] != interval.account:
@@ -1694,29 +1789,181 @@ def attribute(
             units = weighted_units(
                 "codex", event[EVENT_MODEL], tokens, weights, args, bool(event[EVENT_LONG])
             )
+            used_fallback = False
             if units <= 0:
                 # A model with no weight, or one whose fitted coefficient is
                 # zero, still ran inside this interval; fall back to raw
-                # tokens so it is never treated as free.
+                # tokens so it is never treated as free. That fallback's
+                # scale (tokens * 1e-9) is nowhere near the weighted-unit
+                # scale, so it is exempted from the cap below rather than
+                # capped to near-zero.
                 units = float(sum(tokens.get(kind, 0) for kind in CODEX_FIT_KINDS)) * 1e-9
+                used_fallback = True
             if units <= 0:
                 continue
+            session_id = event[EVENT_SESSION]
             total += units
-            shares[event[EVENT_SESSION]] = shares.get(event[EVENT_SESSION], 0.0) + units
+            shares[session_id] = shares.get(session_id, 0.0) + units
+            if used_fallback:
+                fallback_sessions.add(session_id)
             if len(event) > EVENT_PROMPT and event[EVENT_PROMPT] is not None:
-                prompt_key = (event[EVENT_SESSION], event[EVENT_PROMPT])
+                prompt_key = (session_id, event[EVENT_PROMPT])
                 prompt_shares[prompt_key] = prompt_shares.get(prompt_key, 0.0) + units
             for kind in CODEX_FIT_KINDS:
                 feature = (event[EVENT_MODEL], kind)
                 interval.features[feature] = (
                     interval.features.get(feature, 0.0) + tokens.get(kind, 0) / 1_000_000.0
                 )
+        computed[id(interval)] = {
+            "total": total,
+            "shares": shares,
+            "prompt_shares": prompt_shares,
+            "fallback_sessions": fallback_sessions,
+        }
+
+    rates = attribution_rates(intervals, computed, weights)
+    warned_no_rate = False
+    for interval in intervals:
+        data = computed[id(interval)]
+        total = data["total"]
         if total <= 0:
             continue
-        for session_id, units in shares.items():
-            interval.sessions[session_id] = interval.drain * units / total
-        for prompt_key, units in prompt_shares.items():
+        shares = data["shares"]
+        fallback_sessions = data["fallback_sessions"]
+        raw = dict(
+            (session_id, interval.drain * units / total) for session_id, units in shares.items()
+        )
+        rate = rates.get(interval.account)
+        if rate is None:
+            if not warned_no_rate:
+                warn_once(
+                    "no attribution cap for one or more account pools: too little "
+                    "non-rollover coverage to measure a plausible-cost rate, and no "
+                    "calibrated or fitted rate is available; sessions in that pool "
+                    "are not capped (see docs/drain.md)"
+                )
+                warned_no_rate = True
+            attributed = raw
+        else:
+            allowed = dict(
+                (session_id, None if session_id in fallback_sessions
+                 else CAP_FACTOR * rate * units)
+                for session_id, units in shares.items()
+            )
+            attributed = water_fill(raw, allowed)
+        for session_id, value in attributed.items():
+            interval.sessions[session_id] = interval.sessions.get(session_id, 0.0) + value
+        interval.unattributed = max(0.0, interval.drain - sum(attributed.values()))
+        for prompt_key, units in data["prompt_shares"].items():
             interval.prompts[prompt_key] = interval.drain * units / total
+
+
+def water_fill(
+    raw: Mapping[str, float], allowed: Mapping[str, Optional[float]]
+) -> Dict[str, float]:
+    """Clamp each session's share to its cap, redistributing what is freed.
+
+    A session whose proportional share exceeds `allowed[session]` (`None`
+    means no cap - the raw-token fallback, exempted because its unit scale
+    is not comparable) is clamped to the cap; the drain that clamp frees is
+    redistributed proportionally among the sessions still under their cap,
+    which can push one of them over its own cap in turn, so this repeats
+    until none are left over. Two guards keep it safe: it stops as soon as
+    every session is clamped (the rest is `interval.unattributed`, not
+    renormalized), and it never runs more than one round per session, so
+    float residue cannot spin it.
+    """
+    result = dict(raw)
+    clamped = set()  # type: set
+    for _ in range(len(raw) + 1):
+        over = [
+            session_id for session_id, value in result.items()
+            if session_id not in clamped
+            and allowed.get(session_id) is not None
+            and value > allowed[session_id]
+        ]
+        if not over:
+            break
+        freed = 0.0
+        for session_id in over:
+            freed += result[session_id] - allowed[session_id]
+            result[session_id] = allowed[session_id]
+            clamped.add(session_id)
+        unclamped = [session_id for session_id in result if session_id not in clamped]
+        if not unclamped:
+            break
+        headroom_total = sum(result[session_id] for session_id in unclamped)
+        if headroom_total <= 0:
+            break
+        for session_id in unclamped:
+            result[session_id] += freed * (result[session_id] / headroom_total)
+    return result
+
+
+def attribution_rates(
+    intervals: Sequence[Interval], computed: Mapping[int, Mapping[str, Any]], weights: Weights
+) -> Dict[str, Optional[float]]:
+    """One plausible-cost rate (percent of quota per weighted unit) per pool.
+
+    The rate is the median of each qualifying interval's own drain/units
+    ratio, not a pooled sum(drain)/sum(units): a single foreign-contaminated
+    interval (bigger delta, same local tokens - the interval is still real,
+    just not fully explained by the sessions this tool can see) drags a
+    pooled ratio up and blunts the cap, while a median of ratios does not.
+    Rollover intervals and intervals where any session's units came from the
+    raw-token fallback are excluded - the latter is not on the weighted-unit
+    scale, so mixing it in would corrupt the rate, not just that session's
+    cap. A pool with fewer than MIN_RATE_INTERVALS qualifying intervals, or
+    under MIN_RATE_UNITS of weighted-unit coverage across them, has too
+    little evidence to measure its own rate and falls back to
+    `fallback_rate`; `None` means capping is skipped for that pool.
+    """
+    ratios = {}  # type: Dict[str, List[float]]
+    coverage = {}  # type: Dict[str, float]
+    accounts = set()
+    for interval in intervals:
+        accounts.add(interval.account)
+        if interval.rollover:
+            continue
+        data = computed.get(id(interval))
+        if not data or data["fallback_sessions"] or data["total"] <= 0 or interval.drain <= 0:
+            continue
+        ratios.setdefault(interval.account, []).append(interval.drain / data["total"])
+        coverage[interval.account] = coverage.get(interval.account, 0.0) + data["total"]
+    rates = {}  # type: Dict[str, Optional[float]]
+    for account in accounts:
+        samples = ratios.get(account) or []
+        if len(samples) >= MIN_RATE_INTERVALS and coverage.get(account, 0.0) >= MIN_RATE_UNITS:
+            rate = statistics.median(samples)
+        else:
+            rate = fallback_rate(weights)
+        rates[account] = rate if rate and rate > 0 else None
+    return rates
+
+
+def fallback_rate(weights: Weights) -> Optional[float]:
+    """The rate to use when a pool has too little coverage to measure its own.
+
+    A calibrated weights table is already expressed in percent per weighted
+    unit (`calibrated_codex_table`), so its implied rate is exactly 1.0. Short
+    of that, a usable stored fit's `fallback_scale` is "percent per
+    rate-card unit" - the same conversion `calibrated_codex_table` applies to
+    an unidentified model - so it converts too. With neither, the caller
+    leaves the pool uncapped.
+    """
+    if "calibrated" in weights.sources:
+        return 1.0
+    fit_file = state_dir() / "codex-weights.json"
+    if not fit_file.is_file():
+        return None
+    try:
+        fit = json.loads(fit_file.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(fit, Mapping) or not fit.get("usable"):
+        return None
+    scale = fit.get("fallback_scale")
+    return float(scale) if isinstance(scale, (int, float)) and scale > 0 else None
 
 
 # --------------------------------------------------------------------------
@@ -2482,16 +2729,37 @@ def resent_share(row: Row) -> float:
     return min(1.0, row.resent_units / row.units)
 
 
-def apply_codex_drain(rows: Sequence[Row], intervals: Sequence[Interval]) -> None:
+def apply_codex_drain(rows: Sequence[Row], intervals: Sequence[Interval]) -> Dict[str, float]:
+    """Write each session's measured drain, and return per-account unattributed.
+
+    `share_of_window`'s denominator is `interval.drain`, not the sum of what
+    got attributed to sessions: after the attribution cap (#16), a capped
+    session's share can leave some of `interval.drain` unattributed, and that
+    gap must show up as the window not summing to 100% rather than being
+    silently renormalized away.
+    """
     drained = {}  # type: Dict[str, float]
     window_totals = {}  # type: Dict[Any, float]
     session_window = {}  # type: Dict[str, Dict[Any, float]]
     labels = {}  # type: Dict[Any, Any]
+    unattributed = {}  # type: Dict[str, float]
+    # The account is part of the bucket key so two pools whose `resets_at`
+    # happens to round to the same minute never share a window total; the
+    # resets_at itself is clustered (not just minute-rounded) so an idle
+    # pool's continuously drifting re-stamp does not fragment one window's
+    # drain across many buckets (#17).
+    cluster_map = cluster_reset_keys(
+        (interval.account, interval.key[3], interval.resets_at) for interval in intervals
+    )
     for interval in intervals:
-        # The account is part of the bucket key so two pools whose
-        # `resets_at` happens to round to the same minute never share a
-        # window total.
-        bucket = (interval.account, resets_bucket(interval.resets_at))
+        unattributed[interval.account] = (
+            unattributed.get(interval.account, 0.0) + interval.unattributed
+        )
+        cluster_key = cluster_map.get(
+            (interval.account, interval.key[3], interval.resets_at),
+            resets_bucket(interval.resets_at),
+        )
+        bucket = (interval.account, cluster_key)
         labels[bucket] = interval.resets_at
         window_totals[bucket] = window_totals.get(bucket, 0.0) + interval.drain
         for session_id, share in interval.sessions.items():
@@ -2512,6 +2780,7 @@ def apply_codex_drain(rows: Sequence[Row], intervals: Sequence[Interval]) -> Non
             total = window_totals.get(resets_at) or 0.0
             if total > 0:
                 row.share_of_window = 100.0 * windows[resets_at] / total
+    return unattributed
 
 
 def claude_dollars_per_percent(
@@ -2617,9 +2886,20 @@ def cwd_label(cwd: str) -> str:
     return Path(cwd).name or cwd
 
 
+def account_labels(scan: Scan) -> Dict[str, str]:
+    """Map each account key seen in this scan to its display label."""
+    labels = {}  # type: Dict[str, str]
+    for row in scan.snapshots:
+        account = row.get("account")
+        if account and account not in labels:
+            labels[account] = row.get("account_label") or account
+    return labels
+
+
 def header_lines(
     scan: Scan, rows: Sequence[Row], weights: Weights, args: argparse.Namespace,
-    dollars_per_percent: Optional[float], window: Optional[str] = None
+    dollars_per_percent: Optional[float], window: Optional[str] = None,
+    unattributed: Optional[Mapping[str, float]] = None,
 ) -> List[str]:
     lines = []
     tiers = []
@@ -2691,6 +2971,16 @@ def header_lines(
             "caveat: long-context multiplier %.2fx applied above %s tokens"
             % (args.long_context_multiplier, format_tokens(LONG_CONTEXT_THRESHOLD))
         )
+    if unattributed:
+        labels = account_labels(scan)
+        for account in sorted(unattributed, key=lambda key: labels.get(key, key)):
+            value = unattributed[account]
+            if value <= 0:
+                continue
+            lines.append(
+                "unattributed: %s %.1f%% (usage from clients not in the scanned roots)"
+                % (labels.get(account, account), value)
+            )
     return lines
 
 
@@ -3006,7 +3296,7 @@ def command_sessions(args: argparse.Namespace) -> int:
     window, intervals = analysis.window, analysis.intervals
     rows = session_rows(scan, weights, args, since, until)
     attach_fanout(rows, analysis)
-    apply_codex_drain(rows, intervals)
+    unattributed = apply_codex_drain(rows, intervals)
     dollars_per_percent = claude_dollars_per_percent(since, until)
     apply_claude_estimate(rows, dollars_per_percent)
     score_rows(rows)
@@ -3022,12 +3312,13 @@ def command_sessions(args: argparse.Namespace) -> int:
             "files_scanned": scan.files_seen,
             "files_parsed": scan.files_read,
             "sessions": [row_json(row) for row in rows],
+            "pools": codex_pools(scan, intervals, since, window),
         }
         print(json.dumps(payload, indent=2, sort_keys=True))
         return 0
     paint = make_painter(args)
     width = terminal_width(args)
-    for line in header_lines(scan, rows, weights, args, dollars_per_percent, window):
+    for line in header_lines(scan, rows, weights, args, dollars_per_percent, window, unattributed):
         for wrapped in textwrap.wrap(line, width, subsequent_indent="  ") or [""]:
             print(paint(wrapped, "dim"))
     if not rows:
@@ -3107,47 +3398,99 @@ def command_timeline(args: argparse.Namespace) -> int:
     return 0
 
 
-def command_windows(args: argparse.Namespace) -> int:
-    analysis = prepare(args)
-    scan = analysis.scan
-    since = analysis.since
-    window, intervals = analysis.window, analysis.intervals
+def codex_window_entries(
+    scan: Scan, intervals: Sequence[Interval], since: Optional[float], window: Any
+) -> List[Dict[str, Any]]:
+    """One entry per (account, window instance): peak, sessions, unattributed.
+
+    Grouped by `resets_at` cluster, not just `resets_bucket`'s minute
+    rounding: an idle Codex pool re-stamps `resets_at` to `now + 7d` on every
+    snapshot, drifting by roughly a minute per reading, which minute-rounding
+    still slices into dozens of windows for one continuously-idle pool
+    (#17). Account is still first in the key so two pools reporting the same
+    window_minutes and cluster never merge into one window (#9).
+    """
+    filtered = [
+        row for row in scan.snapshots
+        if (since is None or row["ts"] >= since)
+        and window_matches(row.get("window_minutes"), window)
+    ]
+    cluster_map = cluster_reset_keys(
+        [
+            (row.get("account") or "default", row.get("window_minutes"), row.get("resets_at"))
+            for row in filtered
+        ]
+        + [
+            (interval.account, interval.key[3], interval.resets_at)
+            for interval in intervals
+        ]
+    )
     windows = {}  # type: Dict[Tuple[Any, Any, Any], Dict[str, Any]]
-    for row in scan.snapshots:
-        if since is not None and row["ts"] < since:
-            continue
-        if not window_matches(row.get("window_minutes"), window):
-            continue
-        # Account first: two pools reporting the same window_minutes and
-        # rounding to the same resets_bucket must not be merged into one
-        # window (#9).
-        key = (row.get("account") or "default", row.get("window_minutes"),
-               resets_bucket(row.get("resets_at")))
+    for row in filtered:
+        account = row.get("account") or "default"
+        window_minutes = row.get("window_minutes")
+        resets_at = row.get("resets_at")
+        cluster_key = cluster_map.get(
+            (account, window_minutes, resets_at), resets_bucket(resets_at)
+        )
+        key = (account, window_minutes, cluster_key)
         entry = windows.setdefault(
             key,
             {
-                "account": row.get("account") or "default",
+                "account": account,
                 "account_label": row.get("account_label") or "default",
-                "window_minutes": row.get("window_minutes"),
-                "resets_at": row.get("resets_at"),
+                "window_minutes": window_minutes,
+                "resets_at": resets_at,
                 "start": row["ts"],
                 "peak_used_percent": 0.0,
                 "sessions": {},
+                "attributed_percent": 0.0,
+                "unattributed_percent": 0.0,
             },
         )
         entry["start"] = min(entry["start"], row["ts"])
         entry["peak_used_percent"] = max(entry["peak_used_percent"], row["used_percent"])
     for interval in intervals:
-        key = (interval.account, interval.key[3], resets_bucket(interval.resets_at))
+        cluster_key = cluster_map.get(
+            (interval.account, interval.key[3], interval.resets_at),
+            resets_bucket(interval.resets_at),
+        )
+        key = (interval.account, interval.key[3], cluster_key)
         entry = windows.get(key)
         if entry is None:
             continue
         for session_id, share in interval.sessions.items():
             entry["sessions"][session_id] = entry["sessions"].get(session_id, 0.0) + share
+        entry["attributed_percent"] += sum(interval.sessions.values())
+        entry["unattributed_percent"] += interval.unattributed
+    return sorted(windows.values(), key=lambda item: item["start"], reverse=True)
+
+
+def codex_pools(
+    scan: Scan, intervals: Sequence[Interval], since: Optional[float], window: Any
+) -> List[Dict[str, Any]]:
+    """`--json`'s `pools`: one row per (account, window instance)."""
+    return [
+        {
+            "account_label": entry["account_label"],
+            "window_resets_at": entry["resets_at"],
+            "peak": entry["peak_used_percent"],
+            "attributed": entry["attributed_percent"],
+            "unattributed": entry["unattributed_percent"],
+        }
+        for entry in codex_window_entries(scan, intervals, since, window)
+    ]
+
+
+def command_windows(args: argparse.Namespace) -> int:
+    analysis = prepare(args)
+    scan = analysis.scan
+    since = analysis.since
+    window, intervals = analysis.window, analysis.intervals
     # `--account` is already applied to `scan` in `prepare` (`filter_by_account`),
     # so `intervals`/`scan.snapshots` here hold only the selected account's
     # pool; no re-check against `args.account` is needed.
-    ordered = sorted(windows.values(), key=lambda item: item["start"], reverse=True)
+    ordered = codex_window_entries(scan, intervals, since, window)
     if args.json:
         payload = {
             "schema": JSON_SCHEMA,
@@ -3160,6 +3503,7 @@ def command_windows(args: argparse.Namespace) -> int:
                     "resets_at": entry["resets_at"],
                     "start": entry["start"],
                     "peak_used_percent": entry["peak_used_percent"],
+                    "unattributed_percent": entry["unattributed_percent"],
                     "top_sessions": top_session_list(entry["sessions"], args.top),
                 }
                 for entry in ordered
@@ -3191,6 +3535,8 @@ def command_windows(args: argparse.Namespace) -> int:
         )
         for item in top_session_list(entry["sessions"], args.top):
             print("    %-10s %6.3f%%" % (item["short_id"], item["drain_percent"]))
+        if entry["unattributed_percent"] > 0:
+            print("    unattributed %.1f%%" % entry["unattributed_percent"])
     return 0
 
 
@@ -3222,6 +3568,16 @@ def command_calibrate(args: argparse.Namespace) -> int:
             "--calibrate-bucket-hours is needed before these weights mean anything"
             % (fit["r_squared"], fit["identified"])
         )
+    # The fit target is measured drain, unchanged by the attribution cap: the
+    # cap only redistributes ONE interval's drain across ITS OWN sessions and
+    # never reaches `fit_percent_weights` (it reads `interval.drain`/
+    # `interval.features`, never `interval.sessions`), and subtracting
+    # unattributed from the target would be circular (unattributed depends on
+    # the rate, which depends on these very weights). Report it instead, so a
+    # corpus where a lot of drain has no local explanation is visible.
+    total_drain = sum(interval.drain for interval in usable)
+    total_unattributed = sum(interval.unattributed for interval in usable)
+    unattributed_share = (total_unattributed / total_drain) if total_drain > 0 else 0.0
     payload = {
         "schema": JSON_SCHEMA,
         "version": 1,
@@ -3234,6 +3590,7 @@ def command_calibrate(args: argparse.Namespace) -> int:
         "unit": "percent_per_mtok",
         "bucket_hours": args.calibrate_bucket_hours,
         "fallback_scale": fit["fallback_scale"],
+        "unattributed_share": unattributed_share,
         "diagnostics": fit["diagnostics"],
         "codex": {"unit": "percent_per_mtok", "models": fit["models"]},
     }
@@ -3258,6 +3615,13 @@ def command_calibrate(args: argparse.Namespace) -> int:
         "fallback scale %.8f %%/rate-card unit; unidentified coefficients use it"
         % fit["fallback_scale"]
     )
+    if unattributed_share > 0:
+        print(
+            "diagnostic: %.1f%% of measured drain in this corpus is unattributed "
+            "(usage from clients not in the scanned roots); the fit target is "
+            "unchanged, but a large share here means a contaminated corpus"
+            % (100.0 * unattributed_share)
+        )
     print("%-22s %-14s %14s %8s %8s %6s %s" % (
         "model", "kind", "fit %/Mtok", "buckets", "share", "corr", "status"))
     for model in sorted(fitted):
