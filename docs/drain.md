@@ -238,13 +238,21 @@ times the work in a smaller one. After the proportional split, each session's
 share is capped at `CAP_FACTOR` (3) times its *plausible cost* - a per-account
 rate, in measured percent per weighted unit, times its own weighted units in
 that interval. A session over its cap is clamped to it; the freed drain is
-redistributed proportionally among the sessions still under theirs, which can
-repeat until none are over. Whatever the cap will not let any session absorb
-becomes `interval.unattributed` - usage from a client of *this* account that
-was never scanned (another machine, another login copy of the same
-credentials). It is never another account's drain: an interval only ever
-holds events from its own account's sessions (`account_for_root`), so this is
-not the cross-account bleed a per-account pool key already rules out.
+redistributed proportionally among the *other capped* sessions still under
+their own cap, which can repeat until none are over. Whatever the cap will
+not let any session absorb becomes `interval.unattributed` - usage from a
+client of *this* account that was never scanned (another machine, another
+login copy of the same credentials). It is never another account's drain: an
+interval only ever holds events from its own account's sessions
+(`account_for_root`), so this is not the cross-account bleed a per-account
+pool key already rules out. An interval with drain but no local session at
+all (every byte of it came from a client nas never saw) reports its whole
+drain as `unattributed` rather than silently dropping it - the invariant
+`sum(session shares) + unattributed == interval drain` holds for every
+interval, not only the ones with local activity. `nenpi prompts --session`
+splits a session's own turns out of its *capped* share, so a session's
+prompts always sum to the same figure `sessions` reports for it, never the
+interval's uncapped drain.
 
 The rate is the median of each qualifying interval's own drain/units ratio
 (not a pooled sum/sum, which one foreign-contaminated interval could drag
@@ -258,7 +266,16 @@ warning. A session whose weighted units came from the raw-token fallback (a
 model with no weight, or a zeroed fitted coefficient) is exempt from the cap
 in either direction - that fallback's scale is not the weighted-unit scale, so
 capping against it would silently zero out a session that really did the
-work.
+work. That exemption also keeps such a session out of the water-fill
+redistribution pool: it always keeps its own raw proportional share (never
+more, even when another session's overflow is freed alongside it), and a
+capped session's freed drain goes only to other sessions with a finite,
+unmet cap, or to `unattributed` when none remain - an exempt session must
+never become an uncapped sink for everyone else's overflow. The one
+exception is a fallback session with no other session to share the interval
+with: there is nothing to cap it against, so it keeps its raw (i.e. full)
+share, which is what falls out of the loop naturally rather than a special
+case.
 
 Surfaced wherever drain is: the `sessions` header adds a line per account with
 measurable unattributed drain (`unattributed: .codex 14.2% (usage from

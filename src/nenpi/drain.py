@@ -1827,6 +1827,12 @@ def attribute(
         data = computed[id(interval)]
         total = data["total"]
         if total <= 0:
+            # No local session had a token event inside this interval at
+            # all (a client nas cannot see did all of it) - the whole
+            # drain is unattributed, not silently dropped, so
+            # sum(shares) + unattributed == drain still holds for every
+            # interval, not just the ones with local activity.
+            interval.unattributed = interval.drain
             continue
         shares = data["shares"]
         fallback_sessions = data["fallback_sessions"]
@@ -1855,7 +1861,16 @@ def attribute(
             interval.sessions[session_id] = interval.sessions.get(session_id, 0.0) + value
         interval.unattributed = max(0.0, interval.drain - sum(attributed.values()))
         for prompt_key, units in data["prompt_shares"].items():
-            interval.prompts[prompt_key] = interval.drain * units / total
+            # Split the SESSION's attributed (possibly capped) share across
+            # its own turns, not the interval's raw drain - otherwise a
+            # capped session's prompts still summed to the uncapped figure
+            # even though `sessions` reported the capped one.
+            session_id = prompt_key[0]
+            session_units = shares.get(session_id, 0.0)
+            session_share = attributed.get(session_id, 0.0)
+            interval.prompts[prompt_key] = (
+                session_share * units / session_units if session_units > 0 else 0.0
+            )
 
 
 def water_fill(
@@ -1866,12 +1881,22 @@ def water_fill(
     A session whose proportional share exceeds `allowed[session]` (`None`
     means no cap - the raw-token fallback, exempted because its unit scale
     is not comparable) is clamped to the cap; the drain that clamp frees is
-    redistributed proportionally among the sessions still under their cap,
-    which can push one of them over its own cap in turn, so this repeats
-    until none are left over. Two guards keep it safe: it stops as soon as
-    every session is clamped (the rest is `interval.unattributed`, not
-    renormalized), and it never runs more than one round per session, so
-    float residue cannot spin it.
+    redistributed proportionally among the sessions still under their own,
+    finite cap, which can push one of them over its own cap in turn, so
+    this repeats until none are left over. Two guards keep it safe: it
+    stops as soon as no capped session remains to receive the freed drain
+    (the rest is `interval.unattributed`, not renormalized), and it never
+    runs more than one round per session, so float residue cannot spin it.
+
+    Exempt (`allowed is None`) sessions never join the redistribution pool.
+    They have no cap to measure headroom against, so letting them soak up a
+    capped session's overflow would just recreate #16 for whichever session
+    happens to run an unweighted model: the freed drain becomes
+    `interval.unattributed` instead. An exempt session keeps its raw
+    proportional share untouched - including the degenerate case where it
+    is the ONLY session in the interval, where there is no other session's
+    cap to measure it against, so raw is the only defensible behaviour and
+    is what falls out of this loop naturally (it is never `over`).
     """
     result = dict(raw)
     clamped = set()  # type: set
@@ -1889,7 +1914,14 @@ def water_fill(
             freed += result[session_id] - allowed[session_id]
             result[session_id] = allowed[session_id]
             clamped.add(session_id)
-        unclamped = [session_id for session_id in result if session_id not in clamped]
+        # Only sessions with a finite, unmet cap can receive freed drain;
+        # exempt sessions (allowed is None) are excluded even though they
+        # are technically "unclamped", or they would become an uncapped
+        # sink for everyone else's overflow.
+        unclamped = [
+            session_id for session_id in result
+            if session_id not in clamped and allowed.get(session_id) is not None
+        ]
         if not unclamped:
             break
         headroom_total = sum(result[session_id] for session_id in unclamped)

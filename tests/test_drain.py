@@ -943,6 +943,132 @@ class AttributionCap(Harness):
         if payload["windows"]:
             self.assertAlmostEqual(payload["windows"][0]["peak_used_percent"], 0.0, places=6)
 
+    def test_prompt_drain_respects_the_session_cap(self) -> None:
+        # Follow-on to #16: `attribute()` caps a session's INTERVAL share,
+        # but `apply_prompt_drain`'s per-prompt split still multiplied the
+        # interval's raw drain, so `prompts --session X` kept showing the
+        # uncapped figure even after `sessions` capped it. Two prompts split
+        # a capped 0.18% share 2/3-1/3 by their own tokens - never 29.0%.
+        base = int(time.time()) - 4 * 3600
+        dense_session = "dddddddd-dense-2222-2222-222222222222"
+        resets_a = base + 7200
+        self.write_dense_phase(base, dense_session, resets_a)
+
+        tiny_start = base + 3600
+        opened = tiny_start - 60
+        resets_b = opened + 18000
+        tiny_session = "tttttttt-tinyp-0000-0000-000000000000"
+        self.write_codex(
+            "rollout-tiny-prompts.jsonl",
+            [
+                codex_session_meta_line(tiny_start, tiny_session, "/home/agent/tiny"),
+                codex_task_started_line(tiny_start),
+                codex_turn_context_line(tiny_start, "gpt-5.6-sol"),
+                codex_usage_record_line(
+                    tiny_start + 5, tiny_session, input_tokens=4_000,
+                    cached_input_tokens=0, output_tokens=0
+                ),
+                codex_task_started_line(tiny_start + 30),
+                codex_turn_context_line(tiny_start + 30, "gpt-5.6-sol"),
+                codex_usage_record_line(
+                    tiny_start + 35, tiny_session, input_tokens=2_000,
+                    cached_input_tokens=0, output_tokens=0
+                ),
+                codex_token_count_line(tiny_start + 40, rate_limits=rate_limits(29.0, resets_b)),
+            ],
+        )
+
+        payload = self.run_json("prompts", "--session", QD.short_id(tiny_session), "--json")
+        shares = [prompt["drain_percent"] for prompt in payload["prompts"]]
+        self.assertEqual(len(shares), 2)
+        # allowed = CAP_FACTOR(3) * rate(0.1) * units(0.6) = 0.18, split
+        # 4000:2000 by each prompt's own tokens.
+        self.assertAlmostEqual(sum(shares), 0.18, places=6)
+        self.assertAlmostEqual(shares[0], 0.12, places=6)
+        self.assertAlmostEqual(shares[1], 0.06, places=6)
+
+    def test_interval_with_no_local_sessions_is_fully_unattributed(self) -> None:
+        # A pool can take a reading with no local session active at all (a
+        # client nas cannot see did the work). `attribute()`'s early
+        # per-interval bailout (total <= 0) must still record the whole
+        # drain as unattributed, or sum(shares) + unattributed == drain
+        # breaks for that interval.
+        base = int(time.time()) - 4 * 3600
+        dense_session = "dddddddd-dense-3333-3333-333333333333"
+        resets_a = base + 7200
+        self.write_dense_phase(base, dense_session, resets_a)
+
+        ghost_start = base + 3600
+        opened = ghost_start - 60
+        resets_b = opened + 18000
+        self.write_codex(
+            "rollout-ghost.jsonl",
+            [codex_token_count_line(ghost_start + 10, rate_limits=rate_limits(40.0, resets_b))],
+        )
+
+        payload = self.run_json("sessions", "--harness", "codex", "--json", "--top", "20")
+        pools = payload["pools"]
+        ghost_pool = max(pools, key=lambda item: item["peak"])
+        self.assertAlmostEqual(ghost_pool["peak"], 40.0, places=6)
+        self.assertAlmostEqual(ghost_pool["attributed"], 0.0, places=6)
+        self.assertAlmostEqual(ghost_pool["unattributed"], 40.0, places=6)
+
+        text = self.run_tool("sessions", "--harness", "codex")
+        self.assertEqual(text.returncode, 0, text.stderr.decode("utf-8", "replace"))
+        self.assertIn(b"unattributed: ", text.stdout)
+
+    def test_exempt_session_does_not_absorb_a_capped_sessions_overflow(self) -> None:
+        # #16 could still reproduce if the tiny session ran an unweighted
+        # (raw-token-fallback) model: water_fill used to let any session
+        # with `allowed is None` sit in the unclamped pool, so it absorbed
+        # every clamped session's freed drain instead of `unattributed`.
+        base = int(time.time()) - 4 * 3600
+        dense_session = "dddddddd-dense-4444-4444-444444444444"
+        resets_a = base + 7200
+        self.write_dense_phase(base, dense_session, resets_a)
+
+        tiny_start = base + 3600
+        opened = tiny_start - 60
+        resets_b = opened + 18000
+        capped_session = "cccccccc-capped-0000-0000-00000000000"
+        exempt_session = "eeeeeeee-exempt-0000-0000-00000000000"
+        self.write_codex(
+            "rollout-mixed.jsonl",
+            [
+                codex_session_meta_line(tiny_start, capped_session, "/home/agent/capped"),
+                codex_turn_context_line(tiny_start, "gpt-5.6-sol"),
+                codex_usage_record_line(
+                    tiny_start + 5, capped_session, input_tokens=6_000,
+                    cached_input_tokens=0, output_tokens=0
+                ),
+                codex_session_meta_line(tiny_start + 6, exempt_session, "/home/agent/exempt"),
+                codex_turn_context_line(tiny_start + 6, "gpt-9000-nonexistent"),
+                codex_usage_record_line(
+                    tiny_start + 10, exempt_session, input_tokens=6_000,
+                    cached_input_tokens=0, output_tokens=0
+                ),
+                codex_token_count_line(tiny_start + 15, rate_limits=rate_limits(29.0, resets_b)),
+            ],
+        )
+
+        payload = self.run_json("sessions", "--harness", "codex", "--json", "--top", "20")
+        capped_row = self.session_by_short_id(payload, QD.short_id(capped_session))
+        exempt_row = self.session_by_short_id(payload, QD.short_id(exempt_session))
+        # capped_session's raw share is 29.0 * 0.6/(0.6 + exempt_units); its
+        # cap is 0.18. exempt_session keeps its own raw proportional share
+        # (never touched by water-fill); the capped session's freed drain
+        # becomes unattributed, not a top-up for the exempt session.
+        self.assertAlmostEqual(capped_row["drain_percent"], 0.18, places=6)
+        exempt_units = 6_000 * 1e-9
+        exempt_raw_share = 29.0 * exempt_units / (0.6 + exempt_units)
+        self.assertAlmostEqual(exempt_row["drain_percent"], exempt_raw_share, places=6)
+
+        pools = payload["pools"]
+        jump_pool = max(pools, key=lambda item: item["peak"])
+        self.assertAlmostEqual(
+            jump_pool["unattributed"], 29.0 - 0.18 - exempt_raw_share, places=6
+        )
+
 
 class Calibration(Harness):
     TRUE_WEIGHTS = {
