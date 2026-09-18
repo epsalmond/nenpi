@@ -2573,7 +2573,7 @@ class RootsAndConfig(Harness):
         )
         result = self.run_tool("sessions", "--harness", "claude")
         self.assertEqual(result.returncode, 0)
-        self.assertIn(b"claude=pro_5x", result.stdout)
+        self.assertIn(b"claude[.claude]=pro_5x", result.stdout)
         self.assertNotIn(b"max_20x", result.stdout)
 
     def test_config_init_escapes_special_characters_in_root_path(self) -> None:
@@ -2821,15 +2821,20 @@ class AccountPools(Harness):
         resets_at = int(now) + 7 * 86400
         session_a = "ffffffff-filt-a222-3333-444444444444"
         session_b = "11111111-filt-b222-3333-444444444444"
-        for root_name, session_id in ((".codex", session_a), (".codex-arcade", session_b)):
+        # Distinct offsets per root: the usage record's epoch feeds a
+        # synthetic call id (`resp-%f`), and two roots sharing one would
+        # collide in the corpus-wide dedup and silently drop one session.
+        for root_name, session_id, offset in (
+            (".codex", session_a, 5), (".codex-arcade", session_b, 7)
+        ):
             self.write_codex_root(
                 root_name, "rollout-r.jsonl",
                 [
                     codex_session_meta_line(now, session_id, "/home/agent/x"),
                     codex_turn_context_line(now, "gpt-5.6-sol"),
                     codex_usage_record_line(
-                        now + 5, session_id, input_tokens=10_000, cached_input_tokens=0,
-                        output_tokens=0,
+                        now + offset, session_id, input_tokens=10_000,
+                        cached_input_tokens=0, output_tokens=0,
                     ),
                     codex_token_count_line(
                         now + 10, rate_limits=rate_limits(10.0, resets_at, 10080)
