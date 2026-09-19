@@ -39,8 +39,49 @@ uv tool install 'nenpi[ui] @ git+https://github.com/epsalmond/nenpi'
 
 ```sh
 nenpi sessions --harness all --since 7d --top 25
+nenpi prompts --since 7d --sort turns --top 20
 nenpi prompts --session 0123abcd
+nenpi tools --since 7d --top 15
 ```
+
+`nenpi prompts` without `--session` ranks every prompt in range by API turns
+(or context, drain, tokens, units) across sessions, each row labelled with
+the first line the person typed, cut to 120 characters and scrubbed of email
+addresses and secret-shaped tokens. Injected blocks and pasted content never
+become a label — a turn that is only an injected block is named, not quoted.
+That short **label** is the only prompt text nenpi stores or prints;
+`--no-label` hides it. With `--session` it is the per-prompt breakdown of one
+session, unchanged.
+
+`nenpi tools` ranks tool calls by the context their results add, estimated as
+result characters / 4 and, where a later API call measured the growth, split
+across that turn's results. Only tool **names** and result **sizes** are ever
+parsed, cached or printed — never tool input or output text.
+
+### Exploring
+
+Every command ends with a short **"what to run next"** footer on **stderr**,
+built from the rows it just printed: `sessions` names its top sessions and
+hands you the `prompts --session` line for the biggest one, that view names
+the busiest prompt and hands you the `tools --session ... --prompt N` line,
+and so on. The suggestions repeat the `--since`/`--until`/`--harness`/
+`--account` flags you passed, so each one is runnable as printed and stays in
+the same scope.
+
+```sh
+nenpi sessions --since 7d          # next: nenpi prompts --session 0123abcd --since 7d
+nenpi prompts --session 0123abcd --since 7d   # next: nenpi tools --session 0123abcd --prompt 27 --since 7d
+nenpi tools --session 0123abcd --prompt 27 --since 7d
+```
+
+Each suggested `--session` uses the shortest prefix that resolves to one
+session, and every value is shell-quoted, so the line runs as printed.
+
+Because the footer is on stderr, stdout stays pipeable. `--quiet`/`-q` or
+`NENPI_QUIET=1` turns it off; under `--json` nothing is written to stderr and
+the same suggestions ride along as the payload's `next` list of
+`{"cmd", "why"}` entries. `nenpi snapshot --stdin`, the statusline
+passthrough, never prints a footer.
 
 `nenpi-bench plan` projects a benchmark without spending quota. A
 `nenpi-bench run` executes controlled `claude -p` calls and **spends real
@@ -64,8 +105,10 @@ nenpi-web --host 127.0.0.1 --port 8000
 Open `http://127.0.0.1:8000/` in your browser. `HOST` and `PORT` refer to the
 machine running nenpi, which can differ from the machine displaying the page.
 The browser discovers Claude and Codex transcript roots under that host's home
-directory and persists source choices in `~/.config/nenpi/config.json` (or
-`$NENPI_CONFIG`). Filter the session table with free text or
+directory and persists source choices in the same `~/.config/nenpi/config.toml`
+the CLI reads (or `$NENPI_CONFIG`; an older `config.json` is imported once and
+renamed to `config.json.migrated`). Switching every root of a harness off
+leaves the CLI scanning nothing for it, not the defaults. Filter the session table with free text or
 `harness:claude`, `project:name`, `since:YYYY-MM-DD`, and
 `until:YYYY-MM-DD`; use the sort button to change the ordering. A scan runs in
 a worker and cancellation keeps the previous result visible. Date filters
@@ -92,6 +135,9 @@ roots = ["~/.codex", "~/.codex-arcade"]
 ```
 
 `--claude-root`/`--codex-root` flags override this file for one invocation.
+A `~/.claude-*` or `~/.codex-*` directory that exists but is in no resolved
+set gets one stderr note per run; `[general] ignore_unconfigured = true`
+turns it off.
 Run `nenpi config` to see which roots are resolved and what account each one
 authenticates as, or `nenpi config --init` to write a starter file seeded
 from every `~/.claude*`/`~/.codex*` directory found on this host. See

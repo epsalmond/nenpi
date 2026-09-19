@@ -1,5 +1,5 @@
-import json
 import tempfile
+import tomllib
 import unittest
 from pathlib import Path
 
@@ -38,7 +38,7 @@ class SourceSettingsTests(unittest.TestCase):
             config = home / ".config" / "nenpi" / "config.toml"
             config.parent.mkdir(parents=True)
             config.write_text('[claude]\nroots = ["%s"]\n' % custom)
-            settings_path = home / "browser.json"
+            settings_path = home / "browser.toml"
             source = SourceSettings(
                 [SourceSettings.load(settings_path, home).sources[0]]
             ).sources[0]
@@ -63,7 +63,7 @@ class SourceSettingsTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / "transcripts"
             root.mkdir()
-            path = Path(directory) / "config.json"
+            path = Path(directory) / "config.toml"
             settings = SourceSettings()
             source = settings.add(root, "codex")
             settings.set_enabled(source.id, False)
@@ -71,7 +71,9 @@ class SourceSettingsTests(unittest.TestCase):
             restored = SourceSettings.load(path, Path(directory) / "empty-home")
             self.assertEqual(restored.enabled_sources(), [])
             self.assertFalse(restored.get(source.id).enabled)
-            self.assertEqual(json.loads(path.read_text())["version"], 1)
+            data = tomllib.loads(path.read_text(encoding="utf-8"))
+            self.assertEqual(data["codex"]["roots"], [])
+            self.assertEqual(data["codex"]["disabled"], [str(root)])
 
     def test_relative_and_missing_paths_are_rejected(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -86,7 +88,7 @@ class SourceSettingsTests(unittest.TestCase):
             home = Path(directory)
             root = home / ".claude" / "projects"
             root.mkdir(parents=True)
-            path = home / "config.json"
+            path = home / "config.toml"
             settings = SourceSettings.load(path, home)
             source = settings.sources[0]
             settings.remove(source.id)

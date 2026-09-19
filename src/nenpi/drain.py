@@ -16,11 +16,13 @@ from __future__ import annotations
 
 import argparse
 import bisect
+import contextlib
 import hashlib
 import json
 import math
 import os
 import re
+import shlex
 import shutil
 import statistics
 import sys
@@ -30,18 +32,23 @@ import urllib.error
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, Iterator, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterable, Iterator, List, Mapping, Optional, Sequence, Tuple
 
 from nenpi.config import (
+    Config,
     account_for_root,
     cache_dir,
     config_dir,
     config_path,
     discover_candidate_roots,
+    display_path,
     load_config,
     migrate_dirs,
     resolve_roots,
+    save_config,
+    set_notices_enabled,
     state_dir,
+    unconfigured_roots,
     warn,
     warn_once,
 )
@@ -71,7 +78,7 @@ except ImportError:  # bench can load drain.py as a standalone quota module.
         serialized_cache,
     )
 
-CACHE_SCHEMA = 4
+CACHE_SCHEMA = 7
 JSON_SCHEMA = 1
 LONG_CONTEXT_THRESHOLD = 200_000
 CONTEXT_REDUCTION_FRACTION = 0.30
@@ -148,11 +155,17 @@ CODEX_DAY_DIR = re.compile(r"/(\d{4})/(\d{2})/(\d{2})/[^/]+$")
 
 CODEX_LINE_MARKERS = (
     b'"session_meta"',
+    b'"function_call',
+    b'"custom_tool_call',
+    b'"local_shell_call',
     b'"turn_context"',
     b'"token_usage_record"',
     b'"token_count"',
     b'"task_started"',
+    b'"task_complete"',
     b'"compacted"',
+    b'"role":"user"',
+    b'"role": "user"',
 )
 
 # A Claude user line that carries a tool result is a fan-out step, not a new
@@ -160,6 +173,74 @@ CODEX_LINE_MARKERS = (
 # out before json.loads keeps the scan cheap.
 CLAUDE_USER_MARKERS = (b'"type":"user"', b'"type": "user"')
 CLAUDE_NOT_A_PROMPT = (b'"toolUseResult"', b'"tool_result"')
+# Tool bookkeeping reads the same lines the prompt screen rejects, but only
+# for the tool's name and the SIZE of its result; no input or output text is
+# kept, hashed, or printed.
+# Only the result marker: an assistant line issuing a tool call already
+# passes the `"usage"` screen, so admitting on `"tool_use"` never let a line
+# through that was otherwise dropped - it only cost a second scan per line.
+CLAUDE_TOOL_MARKERS = (b'"tool_result"',)
+# A prompt label is the one human-typed first line of a user prompt, cut to
+# PROMPT_LABEL_CHARS and scrubbed of anything secret-shaped. The prompt itself
+# is never stored, printed, or hashed - see docs/drain.md, "What is stored".
+PROMPT_LABEL_CHARS = 120
+LABEL_SCAN_LINES = 64
+REDACTED = "[redacted]"
+# Blocks a harness injects into the user turn. Only these are dropped: any
+# other `<...>` in a prompt is something the person typed and is kept.
+LABEL_INJECTED_TAGS = frozenset((
+    "system-reminder",
+    "user_instructions",
+    "user-instructions",
+    "environment_context",
+    "recommended_plugins",
+    "pasted_content",
+    "command-name",
+    "command-message",
+    "command-args",
+    "local-command-stdout",
+    "local-command-stderr",
+    "local-command-caveat",
+    "ide_selection",
+    "ide_opened_file",
+    "task-notification",
+    "cross-session-message",
+))
+LABEL_TAG_OPEN = re.compile(r"<\s*([A-Za-z][\w.:-]*)[^>]*>")
+# How much a label is worth, carried beside it rather than read back off its
+# shape: a line the person typed that happens to be parenthesised is still
+# typed text. Codex writes its injected context as its own user message just
+# before the typed one, so both compete for the same prompt.
+LABEL_RANK_NONE = 0
+LABEL_RANK_BLOCK = 1
+LABEL_RANK_TYPED = 2
+# Attachment placeholders the harness substitutes for pasted bulk. Whatever
+# follows one is the paste itself, so the scan stops there.
+LABEL_PASTED_LINE = re.compile(
+    r"^\[(?:pasted|image|attachment|screenshot|file|request interrupted)",
+    re.IGNORECASE,
+)
+# Ordered: a broader pattern must not eat a narrower one's prefix.
+LABEL_REDACTIONS = (
+    re.compile(r"\beyJ[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]+"),
+    re.compile(r"\bsk-[A-Za-z0-9_-]{8,}"),
+    re.compile(r"\b(?:ghp|gho|ghu|ghs|ghr|github_pat)_[A-Za-z0-9_]{8,}"),
+    re.compile(r"\bxox[abprse]-[A-Za-z0-9-]{8,}"),
+    re.compile(r"\bAKIA[0-9A-Z]{12,}"),
+    re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]{8,}"),
+    re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+\.[A-Za-z0-9.-]*[A-Za-z]"),
+    # Lookarounds, not \b: `_` is a word character, so `api_key_<32 hex>`
+    # has no boundary before the run and would otherwise survive.
+    re.compile(r"(?<![0-9a-fA-F])[0-9a-fA-F]{32,}(?![0-9a-fA-F])"),
+    re.compile(r"(?<![A-Za-z0-9+/])[A-Za-z0-9+/]{40,}={0,2}(?![A-Za-z0-9+/])"),
+)
+CHARS_PER_TOKEN = 4.0
+# Tools whose call starts a child agent, so the child's usage can be read back
+# against the call that spawned it.
+SPAWN_TOOL_NAMES = frozenset(
+    ("task", "agent", "spawn_agent", "collaboration.spawn_agent")
+)
+MAX_PENDING_TOOLS = 512
 
 ANSI = {
     "reset": "\033[0m",
@@ -185,6 +266,137 @@ _TS_CACHE: Dict[str, float] = {}
 
 
 FRACTIONAL_SECONDS = re.compile(r"\.(\d+)")
+
+
+def redact_label(text: str) -> str:
+    """Replace secret-shaped substrings with `[redacted]`."""
+    for pattern in LABEL_REDACTIONS:
+        text = pattern.sub(REDACTED, text)
+    return text
+
+
+def strip_injected_spans(line: str) -> Tuple[str, Optional[str], Optional[str]]:
+    """Remove whole injected blocks from one line.
+
+    Returns the text a person typed around them, the closing tag still owed
+    when a block opened without closing on this line, and the name of the
+    first injected block seen.
+    """
+    position = 0
+    seen = None  # type: Optional[str]
+    while True:
+        match = LABEL_TAG_OPEN.search(line, position)
+        if match is None:
+            return line.strip(), None, seen
+        name = match.group(1)
+        if name.lower() not in LABEL_INJECTED_TAGS:
+            # Something the person typed that happens to look like a tag.
+            position = match.end()
+            continue
+        if seen is None:
+            seen = name.lower()
+        if match.group(0).rstrip().endswith("/>"):
+            # `<ide_selection ... />` is a block with no body; drop the tag
+            # and keep whatever the person typed around it.
+            line = line[: match.start()] + " " + line[match.end():]
+            position = match.start()
+            continue
+        closing = "</%s>" % name
+        end = line.find(closing, match.end())
+        if end < 0:
+            return line[: match.start()].strip(), closing, seen
+        line = line[: match.start()] + " " + line[end + len(closing):]
+        position = match.start()
+
+
+def prompt_label(text: Any) -> str:
+    """The label alone; see `prompt_label_parts` for how it is built."""
+    return prompt_label_parts(text)[0]
+
+
+def prompt_label_parts(text: Any) -> Tuple[str, int]:
+    """Return a short, redacted label for one user prompt, and its rank.
+
+    Only what a person typed on the first such line survives: injected blocks
+    are stripped, a pasted-content placeholder ends the scan so the paste can
+    never become the label, the rest of the prompt is dropped, whitespace is
+    collapsed, obvious secrets are redacted, and the result is cut to
+    PROMPT_LABEL_CHARS. The full prompt is never returned, so nothing longer
+    can reach the cache or the terminal.
+    """
+    if not isinstance(text, str) or not text:
+        return "", LABEL_RANK_NONE
+    lines = text.split("\n")[:LABEL_SCAN_LINES]
+    skip_until = None  # type: Optional[str]
+    # A turn that is nothing but an injected block - a task notification, a
+    # slash-command expansion - is labelled with the block's name and nothing
+    # from inside it. The name comes from LABEL_INJECTED_TAGS, so the label
+    # stays a fixed vocabulary rather than transcript text.
+    injected = None  # type: Optional[str]
+    for position, raw_line in enumerate(lines):
+        line = raw_line.strip()
+        if not line:
+            continue
+        if skip_until is not None:
+            # Only a closing tag at the start of a line ends a block. A body
+            # that quotes its own closing tag must not hand the rest of that
+            # line back as a label.
+            if not line.startswith(skip_until):
+                continue
+            line = line[len(skip_until):].strip()
+            skip_until = None
+            if not line:
+                continue
+        if LABEL_PASTED_LINE.match(line):
+            # The next lines are the pasted body, not a prompt.
+            return "", LABEL_RANK_NONE
+        line, unterminated, tag = strip_injected_spans(line)
+        if line:
+            return (
+                redact_label(" ".join(line.split()))[:PROMPT_LABEL_CHARS],
+                LABEL_RANK_TYPED,
+            )
+        if injected is None and tag is not None:
+            injected = tag
+        if unterminated is not None:
+            # If it never closes in what we are willing to read, the loop ends
+            # and the block's NAME is the label; no line of its body can be.
+            skip_until = unterminated
+    return ("(%s)" % injected, LABEL_RANK_BLOCK) if injected else ("", LABEL_RANK_NONE)
+
+
+def claude_prompt_text(message: Mapping[str, Any]) -> str:
+    """The text blocks of one Claude user message, for `prompt_label` only."""
+    content = message.get("content")
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return ""
+    parts = []
+    for block in content:
+        if isinstance(block, dict) and block.get("type") == "text":
+            value = block.get("text")
+            if isinstance(value, str):
+                parts.append(value)
+    return "\n".join(parts)
+
+
+def codex_prompt_text(payload: Mapping[str, Any]) -> str:
+    """The text blocks of one Codex user message, for `prompt_label` only."""
+    content = payload.get("content")
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return ""
+    parts = []
+    for block in content:
+        if not isinstance(block, dict):
+            continue
+        if block.get("type") in ("input_text", "text", "output_text"):
+            value = block.get("text")
+            if isinstance(value, str):
+                parts.append(value)
+    return "\n".join(parts)
 
 
 def parse_timestamp(value: Any) -> Optional[float]:
@@ -352,21 +564,103 @@ def claude_price(entry: Mapping[str, Any], model: str, kind: str) -> float:
 
 
 class Weights:
-    """Per-model price tables plus the provenance shown in the report header."""
+    """Per-model price tables plus the provenance shown in the report header.
+
+    Every lookup here is a pure function of `table`, and the analysis phase
+    asks the same handful of questions a million times (one model per API
+    call, a few dozen distinct models in a whole corpus). So the resolved
+    entry and the per-kind price row are memoized; `invalidate()` drops the
+    memos for anyone who mutates `table` in place after construction.
+    """
 
     def __init__(self, table: Dict[str, Any], sources: Sequence[str]):
+        # Treat this as frozen once constructed: the memos below are only
+        # correct while it does not change, so any in-place edit must be
+        # followed by `invalidate()`. Nothing in the tool edits it today.
         self.table = table
         self.sources = list(sources)
+        self._entries = {}  # type: Dict[Tuple[str, str], Optional[Mapping[str, Any]]]
+        self._price_rows = {}  # type: Dict[Tuple[str, str, Any], Optional[Tuple[float, ...]]]
+        self._vectors = {}  # type: Dict[Tuple[str, str, Any, bool], Optional[Tuple[Any, ...]]]
+
+    def invalidate(self) -> None:
+        """Forget every memoized lookup; call after mutating `table` in place."""
+        self._entries.clear()
+        self._price_rows.clear()
+        self._vectors.clear()
 
     @property
     def source_label(self) -> str:
         return " + ".join(self.sources) if self.sources else "default"
 
     def model_entry(self, harness: str, model: str) -> Optional[Mapping[str, Any]]:
+        key = (harness, model)
+        entries = self._entries
+        if key in entries:
+            return entries[key]
         section = self.table.get(harness) or {}
         models = section.get("models") or {}
         entry = models.get(model)
-        return entry if isinstance(entry, Mapping) else None
+        resolved = entry if isinstance(entry, Mapping) else None
+        entries[key] = resolved
+        return resolved
+
+    def price_row(
+        self, harness: str, model: str, cache_read_weight: Optional[float] = None
+    ) -> Optional[Tuple[float, ...]]:
+        """Per-kind prices for one model, aligned to the harness' fit kinds.
+
+        Claude rows line up with `CLAUDE_KINDS`, Codex rows with
+        `CODEX_FIT_KINDS`. `None` means the model has no weight at all, which
+        the callers report as zero units rather than as a zero price.
+        """
+        key = (harness, model, cache_read_weight)
+        rows = self._price_rows
+        if key in rows:
+            return rows[key]
+        entry = self.model_entry(harness, model)
+        if entry is None:
+            row = None  # type: Optional[Tuple[float, ...]]
+        elif harness == "claude":
+            cache_read = claude_price(entry, model, "cache_read")
+            if cache_read_weight is not None:
+                cache_read = claude_price(entry, model, "input") * cache_read_weight
+            row = tuple(
+                cache_read if kind == "cache_read" else claude_price(entry, model, kind)
+                for kind in CLAUDE_KINDS
+            )
+        else:
+            row = tuple(float(entry.get(kind, 0.0)) for kind in CODEX_FIT_KINDS)
+        rows[key] = row
+        return row
+
+    def event_vector(
+        self, harness: str, model: str, cache_read_weight: Optional[float] = None,
+        input_only: bool = False,
+    ) -> Optional[Tuple[Tuple[int, float], ...]]:
+        """`(token slot, price)` pairs for pricing an event row in place.
+
+        The slot is an absolute index into the event row's token area, so a
+        hot loop can weigh a call without first materializing a token dict.
+        `input_only` prices generated output at zero, which is exactly what
+        `input_side_units` does by dropping "output" from its token dict.
+        """
+        key = (harness, model, cache_read_weight, input_only)
+        vectors = self._vectors
+        if key in vectors:
+            return vectors[key]
+        row = self.price_row(harness, model, cache_read_weight)
+        if row is None:
+            vector = None  # type: Optional[Tuple[Tuple[int, float], ...]]
+        else:
+            kinds = CLAUDE_KINDS if harness == "claude" else CODEX_FIT_KINDS
+            slots = CLAUDE_FIT_SLOTS if harness == "claude" else CODEX_FIT_SLOTS
+            vector = tuple(
+                (slots[index], 0.0 if (input_only and kind == "output") else row[index])
+                for index, kind in enumerate(kinds)
+            )
+        vectors[key] = vector
+        return vector
 
     def guessed_models(self, harness: str, used: Iterable[str]) -> List[str]:
         found = []
@@ -379,25 +673,21 @@ class Weights:
     def claude_units(
         self, model: str, tokens: Mapping[str, int], cache_read_weight: Optional[float]
     ) -> float:
-        entry = self.model_entry("claude", model)
-        if entry is None:
+        prices = self.price_row("claude", model, cache_read_weight)
+        if prices is None:
             return 0.0
-        cache_read_price = claude_price(entry, model, "cache_read")
-        if cache_read_weight is not None:
-            cache_read_price = claude_price(entry, model, "input") * cache_read_weight
         total = 0.0
-        for kind in CLAUDE_KINDS:
-            price = cache_read_price if kind == "cache_read" else claude_price(entry, model, kind)
-            total += tokens.get(kind, 0) / 1_000_000.0 * price
+        for index, kind in enumerate(CLAUDE_KINDS):
+            total += tokens.get(kind, 0) / 1_000_000.0 * prices[index]
         return total
 
     def codex_units(self, model: str, tokens: Mapping[str, int]) -> float:
-        entry = self.model_entry("codex", model)
-        if entry is None:
+        prices = self.price_row("codex", model)
+        if prices is None:
             return 0.0
         total = 0.0
-        for kind in CODEX_FIT_KINDS:
-            total += tokens.get(kind, 0) / 1_000_000.0 * float(entry.get(kind, 0.0))
+        for index, kind in enumerate(CODEX_FIT_KINDS):
+            total += tokens.get(kind, 0) / 1_000_000.0 * prices[index]
         return total
 
 
@@ -417,7 +707,7 @@ def load_weights(use_calibrated: bool) -> Weights:
     if use_calibrated:
         fit_file = state_dir() / "codex-weights.json"
         if not fit_file.is_file():
-            warn("--use-calibrated: no fit at %s; run `quota-drain calibrate`" % fit_file)
+            warn("--use-calibrated: no fit at %s; run `nenpi calibrate`" % fit_file)
             return Weights(table, sources)
         try:
             fit = json.loads(fit_file.read_text(encoding="utf-8"))
@@ -703,10 +993,49 @@ class FileIndex:
         self.last_model = UNWEIGHTED
         self.boundaries = []  # type: List[List[Any]]
         self.compactions = []  # type: List[List[Any]]
+        # One row per completed tool call; see the TOOL_* layout below.
+        # Tool rows are a fifth of the cached bytes and only `tools`,
+        # `prompts` and `fanout` ever look at them, so they live in a
+        # sibling shard that `tools_loader` reads on first touch. `sessions`
+        # and `timeline` never decode them.
+        self._tools = []  # type: List[List[Any]]
+        self.tools_loader = None  # type: Optional[Callable[[], List[List[Any]]]]
+        # Row count and serialized size of the sibling, written into the
+        # main shard so a missing, truncated or stale sibling is caught
+        # instead of read back as "this transcript called no tools".
+        self.tool_count = 0
+        self.tool_bytes = 0
+        # tool-call id -> [name, sidechain, spawn] for calls whose result has
+        # not been read yet. Kept across incremental parses because a call and
+        # its result can straddle the resume offset.
+        self.pending_tools = []  # type: List[List[Any]]
+        # A Codex user message arrives just before the task_started /
+        # turn_context pair that opens its prompt, and can straddle the resume
+        # offset, so the label waits here until a boundary claims it.
+        self.pending_label = ""
+        self.pending_label_rank = LABEL_RANK_NONE
         self.thread_id = ""
         self.is_subagent = False
         self.head_hash = ""
         self.tail_hash = ""
+
+    @property
+    def tools(self) -> List[List[Any]]:
+        loader = self.tools_loader
+        if loader is not None:
+            self.tools_loader = None
+            self._tools = loader()
+        return self._tools
+
+    @tools.setter
+    def tools(self, rows: List[List[Any]]) -> None:
+        self.tools_loader = None
+        self._tools = rows
+
+    @property
+    def tools_pending(self) -> bool:
+        """True when tool rows exist on disk but have not been read."""
+        return self.tools_loader is not None
 
     def to_json(self) -> Dict[str, Any]:
         return {
@@ -724,6 +1053,11 @@ class FileIndex:
             "last_model": self.last_model,
             "boundaries": self.boundaries,
             "compactions": self.compactions,
+            "tool_count": self.tool_count,
+            "tool_bytes": self.tool_bytes,
+            "pending_tools": self.pending_tools,
+            "pending_label": self.pending_label,
+            "pending_label_rank": self.pending_label_rank,
             "thread_id": self.thread_id,
             "is_subagent": self.is_subagent,
             "head_hash": self.head_hash,
@@ -747,6 +1081,11 @@ class FileIndex:
         index.last_model = str(payload.get("last_model", UNWEIGHTED))
         index.boundaries = list(payload.get("boundaries") or [])
         index.compactions = list(payload.get("compactions") or [])
+        index.tool_count = int(payload.get("tool_count") or 0)
+        index.tool_bytes = int(payload.get("tool_bytes") or 0)
+        index.pending_tools = list(payload.get("pending_tools") or [])
+        index.pending_label = str(payload.get("pending_label", ""))
+        index.pending_label_rank = int(payload.get("pending_label_rank") or 0)
         index.thread_id = str(payload.get("thread_id", ""))
         index.is_subagent = bool(payload.get("is_subagent"))
         index.head_hash = str(payload.get("head_hash", ""))
@@ -804,9 +1143,139 @@ EVENT_THREAD = 11
 EVENT_ID = 12
 EVENT_PROMPT = 13
 
+# Absolute token-area indices for the kinds each harness actually prices, in
+# the order its `*_units` method sums them. `Weights.event_vector` pairs these
+# with prices so a hot loop can weigh a row without building a token dict.
+CLAUDE_FIT_SLOTS = tuple(EVENT_KINDS + offset for offset in range(len(CLAUDE_KINDS)))
+CODEX_FIT_SLOTS = tuple(EVENT_KINDS + CODEX_KINDS.index(kind) for kind in CODEX_FIT_KINDS)
+
 
 def event_tokens(event: Sequence[Any], kinds: Sequence[str]) -> Dict[str, int]:
     return dict((kind, int(event[EVENT_KINDS + offset])) for offset, kind in enumerate(kinds))
+
+
+def vector_units(vector: Sequence[Tuple[int, float]], event: Sequence[Any]) -> float:
+    """Weighted units for one event row, summed in the harness' kind order.
+
+    Arithmetic is term-for-term what `Weights.claude_units`/`codex_units` do
+    on the equivalent token dict, so results stay bit-identical.
+    """
+    total = 0.0
+    for slot, price in vector:
+        total += int(event[slot]) / 1_000_000.0 * price
+    return total
+
+
+# Tool-call layout, one row per completed call:
+# [session_id, timestamp, tool name, result characters, subagent, spawn, id]
+# Only the name and the size are stored; the result text never leaves the
+# parser, and the id is the harness' own opaque call id, used to count a
+# replayed call once.
+TOOL_SESSION, TOOL_TS, TOOL_NAME = 0, 1, 2
+TOOL_CHARS, TOOL_SUB, TOOL_SPAWN, TOOL_ID = 3, 4, 5, 6
+
+
+def content_chars(value: Any) -> int:
+    """Size of a tool result in characters, without keeping any of it.
+
+    Text parts are measured directly; a structured part is measured by its
+    compact JSON length, which is what the harness sends back to the model.
+    """
+    if value is None:
+        return 0
+    if isinstance(value, str):
+        return len(value)
+    if isinstance(value, (int, float, bool)):
+        return len(str(value))
+    if isinstance(value, list):
+        total = 0
+        for part in value:
+            total += content_chars(part)
+        return total
+    if isinstance(value, Mapping):
+        text = value.get("text")
+        if isinstance(text, str):
+            return len(text)
+        output = value.get("output")
+        if isinstance(output, str):
+            return len(output)
+        # Everything else is measured by walking its strings rather than by
+        # serializing it: a re-serialized megabyte of structured output costs
+        # more than the parse did. The walk under-counts JSON punctuation and
+        # key quoting by a few percent, which the /4 token estimate absorbs.
+        total = 0
+        for key, part in value.items():
+            if isinstance(key, str):
+                total += len(key)
+            total += content_chars(part)
+        return total
+    return len(str(value))
+
+
+def is_spawn_tool(name: str) -> bool:
+    return name.lower() in SPAWN_TOOL_NAMES
+
+
+def remember_tool(index: "FileIndex", call_id: str, name: str, sidechain: bool) -> None:
+    """Note an issued tool call so its result can be named when it arrives."""
+    if not call_id or not name:
+        return
+    for row in index.pending_tools:
+        if row[0] == call_id:
+            return
+    index.pending_tools.append(
+        [call_id, name, 1 if sidechain else 0, 1 if is_spawn_tool(name) else 0]
+    )
+    if len(index.pending_tools) > MAX_PENDING_TOOLS:
+        del index.pending_tools[: len(index.pending_tools) - MAX_PENDING_TOOLS]
+
+
+def expire_pending_tools(index: "FileIndex") -> None:
+    """Forget issued calls whose result can no longer arrive.
+
+    A user prompt starts a new turn, and a tool result for a call issued
+    before it is never written afterwards - the harness has either recorded
+    the result already or abandoned the call (interrupt, crash, rejected
+    permission). Dropping them there keeps the pending map bounded by one
+    turn's calls instead of decaying through the 512-entry FIFO trim, so a
+    later result cannot be named after a long-abandoned call of the same id.
+    """
+    if index.pending_tools:
+        del index.pending_tools[:]
+
+
+def resolve_tool(index: "FileIndex", call_id: str) -> Tuple[str, int, int]:
+    """Name the call a result answers, or report it as unmatched."""
+    for position in range(len(index.pending_tools) - 1, -1, -1):
+        row = index.pending_tools[position]
+        if row[0] == call_id:
+            del index.pending_tools[position]
+            return str(row[1]), int(row[2]), int(row[3])
+    return "unknown", 0, 0
+
+
+def record_tool(
+    index: "FileIndex",
+    session_id: str,
+    epoch: Optional[float],
+    call_id: str,
+    chars: int,
+    sidechain: bool,
+) -> None:
+    if epoch is None or not session_id:
+        return
+    name, was_sub, spawn = resolve_tool(index, call_id)
+    index.tools.append(
+        [
+            session_id,
+            epoch,
+            name,
+            int(chars),
+            1 if (sidechain or was_sub) else 0,
+            spawn,
+            call_id,
+        ]
+    )
 
 
 def event_context(event: Sequence[Any], harness: str) -> int:
@@ -860,7 +1329,10 @@ def parse_claude_file(
             any(marker in raw for marker in CLAUDE_USER_MARKERS)
             and not any(marker in raw for marker in CLAUDE_NOT_A_PROMPT)
         )
-        if not wants_usage and not wants_prompt:
+        # Tool lines are no longer dropped on the raw-bytes screen: they are
+        # parsed for the tool's name and the size of its result only.
+        wants_tool = any(marker in raw for marker in CLAUDE_TOOL_MARKERS)
+        if not wants_usage and not wants_prompt and not wants_tool:
             continue
         try:
             record = json.loads(raw)
@@ -888,14 +1360,49 @@ def parse_claude_file(
             if is_claude_prompt(record, is_subagent_file):
                 epoch = parse_timestamp(record.get("timestamp"))
                 if epoch is not None:
-                    index.boundaries.append([session_id, epoch])
+                    label, rank = prompt_label_parts(
+                        claude_prompt_text(record.get("message") or {})
+                    )
+                    index.boundaries.append([session_id, epoch, label, rank])
                     summary.touch(epoch)
+                expire_pending_tools(index)
+                continue
+            message = record.get("message")
+            if not isinstance(message, dict):
+                continue
+            content = message.get("content")
+            if not isinstance(content, list):
+                continue
+            epoch = parse_timestamp(record.get("timestamp"))
+            sidechain = bool(record.get("isSidechain")) or is_subagent_file
+            for block in content:
+                if not isinstance(block, dict) or block.get("type") != "tool_result":
+                    continue
+                call_id = block.get("tool_use_id")
+                record_tool(
+                    index,
+                    session_id,
+                    epoch,
+                    call_id if isinstance(call_id, str) else "",
+                    content_chars(block.get("content")),
+                    sidechain,
+                )
             continue
         if kind != "assistant":
             continue
         message = record.get("message")
         if not isinstance(message, dict):
             continue
+        content = message.get("content")
+        if isinstance(content, list):
+            issued_sidechain = bool(record.get("isSidechain")) or is_subagent_file
+            for block in content:
+                if not isinstance(block, dict) or block.get("type") != "tool_use":
+                    continue
+                block_id = block.get("id")
+                block_name = block.get("name")
+                if isinstance(block_id, str) and isinstance(block_name, str):
+                    remember_tool(index, block_id, block_name, issued_sidechain)
         usage = message.get("usage")
         if not isinstance(usage, dict):
             continue
@@ -1061,9 +1568,38 @@ def parse_codex_file(
             session_id = path.stem
         summary = index.sessions.setdefault(session_id, SessionSummary("codex", session_id))
 
+        if kind == "response_item":
+            item = payload.get("type")
+            if item in CODEX_TOOL_CALL_ITEMS:
+                call_id = payload.get("call_id") or payload.get("id")
+                name = codex_tool_name(payload, item)
+                if isinstance(call_id, str):
+                    remember_tool(index, call_id, name, index.is_subagent)
+            elif item == "message" and payload.get("role") == "user":
+                # Only the label is taken; the message body is never kept.
+                if not index.is_subagent:
+                    label, rank = prompt_label_parts(codex_prompt_text(payload))
+                    if rank > index.pending_label_rank:
+                        index.pending_label = label
+                        index.pending_label_rank = rank
+            elif item in CODEX_TOOL_OUTPUT_ITEMS:
+                call_id = payload.get("call_id") or payload.get("id")
+                record_tool(
+                    index,
+                    session_id,
+                    epoch if epoch is not None else codex_item_epoch(payload),
+                    call_id if isinstance(call_id, str) else "",
+                    content_chars(payload.get("output")),
+                    index.is_subagent,
+                )
+            continue
+
         if kind == "turn_context":
             if epoch is not None and not index.is_subagent:
-                add_boundary(index.boundaries, session_id, epoch)
+                add_boundary(index.boundaries, session_id, epoch,
+                             index.pending_label, index.pending_label_rank)
+                index.pending_label = ""
+                index.pending_label_rank = LABEL_RANK_NONE
             candidate = payload.get("model")
             collaboration = payload.get("collaboration_mode")
             if isinstance(collaboration, dict):
@@ -1104,9 +1640,21 @@ def parse_codex_file(
             )
             continue
 
+        if kind == "event_msg" and payload.get("type") == "task_complete":
+            # The turn is over. A user message that never opened a boundary of
+            # its own - an interjection queued mid-turn - must not label the
+            # next prompt.
+            index.pending_label = ""
+            index.pending_label_rank = LABEL_RANK_NONE
+            continue
+
         if kind == "event_msg" and payload.get("type") == "task_started":
             if epoch is not None and not index.is_subagent:
-                add_boundary(index.boundaries, session_id, epoch)
+                add_boundary(index.boundaries, session_id, epoch,
+                             index.pending_label, index.pending_label_rank)
+                index.pending_label = ""
+                index.pending_label_rank = LABEL_RANK_NONE
+            expire_pending_tools(index)
             continue
 
         if kind == "event_msg" and payload.get("type") == "token_count":
@@ -1146,6 +1694,39 @@ def parse_codex_file(
     return index
 
 
+CODEX_TOOL_CALL_ITEMS = frozenset(
+    ("function_call", "custom_tool_call", "local_shell_call")
+)
+CODEX_TOOL_OUTPUT_ITEMS = frozenset(
+    ("function_call_output", "custom_tool_call_output", "local_shell_call_output")
+)
+
+
+def codex_tool_name(payload: Mapping[str, Any], item: str) -> str:
+    """Tool name for a Codex call, namespace-qualified when one is given.
+
+    MCP and collaboration tools arrive as a `namespace` plus a bare `name`;
+    both are kept so `mcp.search` and `collaboration.send_message` stay
+    distinct from a local tool of the same name.
+    """
+    name = payload.get("name")
+    if not isinstance(name, str) or not name:
+        name = "shell" if item == "local_shell_call" else item
+    namespace = payload.get("namespace")
+    if isinstance(namespace, str) and namespace:
+        return "%s.%s" % (namespace, name)
+    return name
+
+
+def codex_item_epoch(payload: Mapping[str, Any]) -> Optional[float]:
+    metadata = payload.get("internal_chat_message_metadata_passthrough")
+    if isinstance(metadata, Mapping):
+        created = metadata.get("create_time")
+        if isinstance(created, (int, float)):
+            return float(created)
+    return None
+
+
 def is_codex_subagent(payload: Mapping[str, Any]) -> bool:
     """True when a rollout is a spawned subagent thread rather than the root."""
     if payload.get("parent_thread_id"):
@@ -1160,17 +1741,23 @@ def is_codex_subagent(payload: Mapping[str, Any]) -> bool:
     return False
 
 
-def add_boundary(boundaries: List[List[Any]], session_id: str, epoch: float) -> None:
+def add_boundary(
+    boundaries: List[List[Any]], session_id: str, epoch: float, label: str = "",
+    rank: int = LABEL_RANK_NONE,
+) -> None:
     """Record a prompt start, collapsing the task_started/turn_context pair.
 
     Codex writes both within a second or two of each other for the same user
-    turn, so a naive append would double every prompt.
+    turn, so a naive append would double every prompt. A label seen after the
+    first of the pair still lands on the boundary it belongs to.
     """
     if boundaries:
-        last_session, last_epoch = boundaries[-1][0], boundaries[-1][1]
-        if last_session == session_id and abs(epoch - last_epoch) <= BOUNDARY_DEDUP_SECONDS:
+        last = boundaries[-1]
+        if last[0] == session_id and abs(epoch - last[1]) <= BOUNDARY_DEDUP_SECONDS:
+            if len(last) > 3 and rank > last[3]:
+                last[2], last[3] = label, rank
             return
-    boundaries.append([session_id, epoch])
+    boundaries.append([session_id, epoch, label, rank])
 
 
 def record_event(
@@ -1228,7 +1815,60 @@ def snapshot_rows(limits: Mapping[str, Any], epoch: float) -> List[Dict[str, Any
 
 
 # --------------------------------------------------------------------------
+# phase timing
+
+
+# `--profile` is a stderr-only stopwatch, not a profiler: it names the phases
+# a run spends its time in so a regression shows up without cProfile. Off by
+# default and free when off, so the TUI and the statusline path pay nothing.
+_PROFILE = {"on": False, "phases": []}  # type: Dict[str, Any]
+
+
+def profile_enabled(args: argparse.Namespace) -> bool:
+    return bool(getattr(args, "profile", False)) or os.environ.get("NENPI_PROFILE") == "1"
+
+
+def profile_start(enabled: bool) -> None:
+    """Arm the timer and drop whatever the previous run recorded.
+
+    The TUI calls `prepare` once per refresh in one long-lived process, so
+    the phase list has to be per-run; appending to a process-global list
+    would grow without bound and report every refresh since startup.
+    """
+    _PROFILE["on"] = enabled
+    _PROFILE["phases"] = []
+
+
+@contextlib.contextmanager
+def profile_phase(name: str) -> Iterator[None]:
+    if not _PROFILE["on"]:
+        yield
+        return
+    started = time.perf_counter()
+    try:
+        yield
+    finally:
+        _PROFILE["phases"].append((name, time.perf_counter() - started))
+
+
+def profile_report() -> None:
+    """Print this run's phases and clear them, so nothing accumulates."""
+    phases = _PROFILE["phases"]
+    _PROFILE["phases"] = []
+    if not _PROFILE["on"] or not phases:
+        return
+    width = max(len(name) for name, _ in phases)
+    for name, seconds in phases:
+        sys.stderr.write("nenpi: %-*s %8.3fs\n" % (width, name, seconds))
+    sys.stderr.flush()
+
+
+# --------------------------------------------------------------------------
 # cache
+
+
+class CacheShardError(RuntimeError):
+    """A cache shard disagrees with the sibling file it points at."""
 
 
 class Cache:
@@ -1249,6 +1889,39 @@ class Cache:
         digest = hashlib.sha1(key.encode("utf-8")).hexdigest()
         return self.root / ("v%d" % CACHE_SCHEMA) / digest[:2] / (digest + ".json")
 
+    def tools_path(self, key: str) -> Path:
+        """Sibling shard holding this transcript's tool rows.
+
+        Tool rows are a fifth of the cached bytes and most commands never
+        read one, so they are parked beside the shard instead of inside it:
+        `sessions` then decodes only what it reports on.
+        """
+        return self.shard_path(key).with_suffix(".tools.json")
+
+    @staticmethod
+    def _load_tool_rows(path: Path, expected: int) -> List[List[Any]]:
+        """Decode a tool sibling, or refuse to guess at what it should hold.
+
+        `stored` already checked the sibling's size, so getting here with
+        the wrong content means the cache was corrupted in a way a stat
+        cannot see. Returning `[]` would report a transcript that called
+        hundreds of tools as one that called none, for as long as its
+        size and mtime stay put - so this raises instead.
+        """
+        try:
+            rows = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as error:
+            raise CacheShardError(
+                "cached tool rows in %s are unreadable (%s); "
+                "re-run with --rebuild-cache" % (path, error)
+            ) from None
+        if not isinstance(rows, list) or len(rows) != expected:
+            raise CacheShardError(
+                "cached tool rows in %s do not match the shard that names "
+                "them; re-run with --rebuild-cache" % path
+            )
+        return list(rows)
+
     def stored(self, key: str, harness: str) -> Optional[FileIndex]:
         if self.rebuild:
             return None
@@ -1267,6 +1940,24 @@ class Cache:
             return None
         if entry.harness != harness:
             return None
+        if entry.tool_count:
+            # The sibling holds rows this shard is accountable for, so it is
+            # checked here rather than when something finally reads it: a
+            # deleted, truncated, half-written or stale sibling has to make
+            # the whole entry miss, so the transcript is parsed again from
+            # the start. One stat keeps that check off the hot path - the
+            # rows themselves are still only decoded on demand.
+            tools_file = self.tools_path(key)
+            try:
+                if tools_file.stat().st_size != entry.tool_bytes:
+                    return None
+            except OSError:
+                return None
+            entry.tools_loader = (
+                lambda path=tools_file, count=entry.tool_count: self._load_tool_rows(
+                    path, count
+                )
+            )
         self.entries[key] = entry
         return entry
 
@@ -1318,7 +2009,10 @@ class Cache:
             root = self.root / ("v%d" % CACHE_SCHEMA)
             if not root.is_dir():
                 return
-            expected = set(self.shard_path(key).name for key in live)
+            expected = set()  # type: set
+            for key in live:
+                expected.add(self.shard_path(key).name)
+                expected.add(self.tools_path(key).name)
             for shard in root.rglob("*.json"):
                 check_cancelled(cancellation)
                 if shard.name in expected:
@@ -1339,23 +2033,52 @@ class Cache:
             entry = self.entries.get(key)
             if entry is None:
                 continue
-            payload = entry.to_json()
-            payload["path"] = key
             destination = self.shard_path(key)
             destination.parent.mkdir(parents=True, exist_ok=True)
-            temporary = destination.with_name(
-                "%s.%d.%d.tmp" % (destination.name, os.getpid(), time.time_ns())
-            )
-            try:
-                with open(temporary, "w", encoding="utf-8") as handle:
-                    json.dump(payload, handle, separators=(",", ":"))
-                os.replace(str(temporary), str(destination))
-            finally:
-                try:
-                    temporary.unlink()
-                except OSError:
-                    pass
+            tools_file = self.tools_path(key)
+            # A dirty entry was parsed, and parsing appends to `tools`, so
+            # its rows are always loaded here; the guard only keeps an
+            # untouched entry from being rewritten from an unread loader.
+            if not entry.tools_pending:
+                rows = entry.tools
+                entry.tool_count = len(rows)
+                if rows:
+                    entry.tool_bytes = self._write_atomic(tools_file, rows)
+                else:
+                    # An empty list would cost a file and a decode per
+                    # transcript that never called a tool.
+                    entry.tool_bytes = 0
+                    try:
+                        tools_file.unlink()
+                    except OSError:
+                        pass
+            payload = entry.to_json()
+            payload["path"] = key
+            # The main shard is written last so it is the commit point: it
+            # is the only file that records what the sibling must contain,
+            # so an interrupted flush leaves an orphan sibling (harmless,
+            # pruned or overwritten later) rather than a shard pointing at
+            # rows that were never written.
+            self._write_atomic(destination, payload)
         self.dirty.clear()
+
+    @staticmethod
+    def _write_atomic(destination: Path, payload: Any) -> int:
+        """Replace `destination` with `payload`; return the bytes written."""
+        temporary = destination.with_name(
+            "%s.%d.%d.tmp" % (destination.name, os.getpid(), time.time_ns())
+        )
+        try:
+            blob = json.dumps(payload, separators=(",", ":"))
+            with open(temporary, "w", encoding="utf-8") as handle:
+                handle.write(blob)
+            os.replace(str(temporary), str(destination))
+            return len(blob.encode("utf-8"))
+        finally:
+            try:
+                temporary.unlink()
+            except OSError:
+                pass
 
     def flush(self) -> None:
         with serialized_cache(self.root):
@@ -1379,7 +2102,7 @@ class Progress:
         if now - self.last < PROGRESS_INTERVAL_SECONDS and self.done < self.total:
             return
         self.last = now
-        line = "quota-drain: %s %d/%d" % (self.label, self.done, self.total)
+        line = "nenpi: %s %d/%d" % (self.label, self.done, self.total)
         self.width = max(self.width, len(line))
         sys.stderr.write("\r" + line)
         sys.stderr.flush()
@@ -1399,8 +2122,20 @@ class Scan:
     def __init__(self):
         self.sessions = {}  # type: Dict[Tuple[str, str], SessionSummary]
         self.events = {"claude": [], "codex": []}  # type: Dict[str, List[List[Any]]]
+        # Tool rows stay in their per-file shards until something asks for
+        # them. `absorb` only records where they are; the dedup merge and
+        # the range/account filters below replay on first read, in the same
+        # order they were applied, so the rows come out identical to the
+        # eager build. See `FileIndex.tools`.
+        self._tool_sources = []  # type: List[Tuple[FileIndex, str]]
+        self._tool_filters = []  # type: List[Callable[[str, List[List[Any]]], List[List[Any]]]]
+        self._tools = None  # type: Optional[Dict[str, List[List[Any]]]]
+        self.claimed_tools = {}  # type: Dict[Tuple[str, str], str]
         self.snapshots = []  # type: List[Dict[str, Any]]
         self.boundaries = {}  # type: Dict[Tuple[str, str], List[float]]
+        # (harness, session) -> {boundary epoch: redacted prompt label}. One
+        # short line per prompt; see `prompt_label`.
+        self.prompt_labels = {}  # type: Dict[Tuple[str, str], Dict[float, str]]
         self.compactions = {}  # type: Dict[Tuple[str, str], List[float]]
         self.claimed = {}  # type: Dict[Tuple[str, str], str]
         self.forks = {}  # type: Dict[Tuple[str, str], Dict[str, int]]
@@ -1412,6 +2147,53 @@ class Scan:
         self.files_read = 0
         self.files_seen = 0
         self.bytes_read = 0
+
+    def defer_tools(self, entry: "FileIndex", harness: str) -> None:
+        if self._tools is not None:
+            # The merge has already run, so this file's rows would never
+            # reach it and the report would quietly be short a transcript.
+            raise RuntimeError(
+                "tool rows were absorbed after the merged list was read"
+            )
+        self._tool_sources.append((entry, harness))
+
+    def filter_tools(
+        self, keep: "Callable[[str, List[List[Any]]], List[List[Any]]]"
+    ) -> None:
+        """Record a filter to apply when the tool rows are finally read."""
+        if self._tools is None:
+            self._tool_filters.append(keep)
+            return
+        for harness, rows in self._tools.items():
+            self._tools[harness] = keep(harness, rows)
+
+    @property
+    def tools(self) -> Dict[str, List[List[Any]]]:
+        if self._tools is None:
+            merged = {"claude": [], "codex": []}  # type: Dict[str, List[List[Any]]]
+            claimed = self.claimed_tools
+            for entry, harness in self._tool_sources:
+                kept = merged.setdefault(harness, [])
+                for row in entry.tools:
+                    tool_id = (harness, row[TOOL_ID]) if row[TOOL_ID] else None
+                    if tool_id is not None:
+                        if tool_id in claimed:
+                            # The same call replayed into a resumed or
+                            # forked transcript.
+                            continue
+                        claimed[tool_id] = row[TOOL_SESSION]
+                    kept.append(row)
+            for keep in self._tool_filters:
+                for harness, rows in merged.items():
+                    merged[harness] = keep(harness, rows)
+            self._tool_filters = []
+            self._tools = merged
+        return self._tools
+
+    @tools.setter
+    def tools(self, value: Dict[str, List[List[Any]]]) -> None:
+        self._tools = value
+        self._tool_filters = []
 
 
 def collect(
@@ -1547,32 +2329,44 @@ def absorb(scan: Scan, entry: FileIndex, harness: str, account: str, account_lab
         scan.session_accounts[key] = (account, account_label)
     claimed = scan.claimed
     kept = scan.events[harness]
+    stamp = (account, account_label)
+    session_accounts = scan.session_accounts
+    stamped_sessions = set()  # type: set
     for row in entry.events:
         # Every event's session gets an account stamp here too, not only the
         # ones with a `SessionSummary` above: `attribute()` treats a session
         # missing from `session_accounts` as "any pool" (fail-open), so a
         # session known only through its events - never seen in
         # `entry.sessions` - must never be credited to every account's pool.
-        scan.session_accounts.setdefault((harness, row[EVENT_SESSION]), (account, account_label))
+        row_session = row[EVENT_SESSION]
+        if row_session not in stamped_sessions:
+            stamped_sessions.add(row_session)
+            session_accounts.setdefault((harness, row_session), stamp)
         call_id = (harness, row[EVENT_ID]) if row[EVENT_ID] else None
         if call_id is not None:
             owner = claimed.get(call_id)
             if owner is not None:
                 # Same API call seen again: a resumed or forked transcript
                 # replaying it. Count it once, against whoever recorded it first.
-                if owner != row[EVENT_SESSION]:
-                    forks = scan.forks.setdefault((harness, row[EVENT_SESSION]), {})
+                if owner != row_session:
+                    forks = scan.forks.setdefault((harness, row_session), {})
                     forks[owner] = forks.get(owner, 0) + 1
                 continue
-            claimed[call_id] = row[EVENT_SESSION]
+            claimed[call_id] = row_session
         kept.append(row)
+    scan.defer_tools(entry, harness)
     for row in entry.snapshots:
         stamped_row = dict(row)
         stamped_row["account"] = account
         stamped_row["account_label"] = account_label
         scan.snapshots.append(stamped_row)
     for row in entry.boundaries:
-        scan.boundaries.setdefault((harness, str(row[0])), []).append(float(row[1]))
+        key = (harness, str(row[0]))
+        epoch = float(row[1])
+        scan.boundaries.setdefault(key, []).append(epoch)
+        label = str(row[2]) if len(row) > 2 and row[2] else ""
+        if label:
+            scan.prompt_labels.setdefault(key, {})[epoch] = label
     for row in entry.compactions:
         scan.compactions.setdefault((harness, str(row[0])), []).append(float(row[1]))
 
@@ -1596,6 +2390,14 @@ def window_events(
             if (since is None or row[EVENT_TS] >= since)
             and (until is None or row[EVENT_TS] <= until)
         ]
+    scan.filter_tools(
+        lambda _harness, rows: [
+            row
+            for row in rows
+            if (since is None or row[TOOL_TS] >= since)
+            and (until is None or row[TOOL_TS] <= until)
+        ]
+    )
 
 
 def rebuild_totals(scan: Scan, cancellation: Cancellation = None) -> None:
@@ -1606,24 +2408,34 @@ def rebuild_totals(scan: Scan, cancellation: Cancellation = None) -> None:
         summary.sub_models = {}
         summary.requests = 0
         summary.sub_requests = 0
+    sessions = scan.sessions
+    watch = cancellation is not None
     for harness, events in scan.events.items():
         check_cancelled(cancellation)
         kinds = CLAUDE_KINDS if harness == "claude" else CODEX_KINDS
+        kind_slots = tuple(enumerate(kinds, start=EVENT_KINDS))
         for row in events:
-            check_cancelled(cancellation)
-            summary = scan.sessions.get((harness, row[EVENT_SESSION]))
+            if watch:
+                check_cancelled(cancellation)
+            summary = sessions.get((harness, row[EVENT_SESSION]))
             if summary is None:
                 continue
-            tokens = event_tokens(row, kinds)
+            model = row[EVENT_MODEL]
             bucket = summary.sub_models if row[EVENT_SUB] else summary.models
-            slot = bucket.setdefault(row[EVENT_MODEL], empty_tokens(kinds))
-            for kind in kinds:
-                slot[kind] += tokens[kind]
+            slot = bucket.get(model)
+            if slot is None:
+                slot = empty_tokens(kinds)
+                bucket[model] = slot
+            for index, kind in kind_slots:
+                slot[kind] += int(row[index])
             if row[EVENT_SUB]:
                 summary.sub_requests += 1
-                rollup = summary.models.setdefault(row[EVENT_MODEL], empty_tokens(kinds))
-                for kind in kinds:
-                    rollup[kind] += tokens[kind]
+                rollup = summary.models.get(model)
+                if rollup is None:
+                    rollup = empty_tokens(kinds)
+                    summary.models[model] = rollup
+                for index, kind in kind_slots:
+                    rollup[kind] += int(row[index])
             else:
                 summary.requests += 1
     for (harness, session_id), forks in scan.forks.items():
@@ -1749,13 +2561,20 @@ def snapshot_windows(
     never be read as one timeline rolling over (#9).
     """
     grouped = {}  # type: Dict[Tuple[str, str, str, Any], List[Mapping[str, Any]]]
+    watch = cancellation is not None
     for row in snapshots:
-        check_cancelled(cancellation)
+        if watch:
+            check_cancelled(cancellation)
         key = (row.get("account") or "default", row.get("limit_id") or "codex",
                row.get("plan_type") or "unknown", row.get("window_minutes"))
-        grouped.setdefault(key, []).append(row)
+        rows = grouped.get(key)
+        if rows is None:
+            grouped[key] = [row]
+        else:
+            rows.append(row)
     for rows in grouped.values():
-        check_cancelled(cancellation)
+        if watch:
+            check_cancelled(cancellation)
         rows.sort(key=lambda item: item["ts"])
     return grouped
 
@@ -1815,6 +2634,7 @@ def build_intervals(
     cancellation: Cancellation = None,
 ) -> List[Interval]:
     intervals = []
+    watch = cancellation is not None
     groups = snapshot_windows(snapshots, cancellation)
     for key, rows in groups.items():
         check_cancelled(cancellation)
@@ -1824,7 +2644,8 @@ def build_intervals(
         running = 0.0
         anchor_ts = None  # type: Optional[float]
         for row in rows:
-            check_cancelled(cancellation)
+            if watch:
+                check_cancelled(cancellation)
             bucket = resets_bucket(row.get("resets_at"))
             used = row["used_percent"]
             if (
@@ -1947,6 +2768,14 @@ def attribute(
         return
     stamps = [event[EVENT_TS] for event in ordered]
     computed = {}  # type: Dict[int, Dict[str, Any]]
+    # One price vector and one set of feature keys per model, resolved once
+    # for the whole call: a corpus has a handful of Codex models and millions
+    # of calls. Memoizing per *event* was tried and lost - the table costs
+    # more in allocation than re-pricing a row costs in arithmetic.
+    per_model = {}  # type: Dict[str, Tuple[Any, Tuple[Tuple[str, str], ...]]]
+    cache_read_weight = args.claude_cache_read_weight
+    multiplier = args.long_context_multiplier
+    watch = cancellation is not None
     for interval in intervals:
         check_cancelled(cancellation)
         low = bisect.bisect_right(stamps, interval.start)
@@ -1956,15 +2785,28 @@ def attribute(
         prompt_shares = {}  # type: Dict[Tuple[str, Any], float]
         prompted_units = {}  # type: Dict[str, float]
         fallback_sessions = set()  # type: set
-        for event in ordered[low:high]:
-            check_cancelled(cancellation)
-            account = session_accounts.get(("codex", event[EVENT_SESSION]))
-            if account is not None and account[0] != interval.account:
+        features = interval.features
+        account_label = interval.account
+        for index in range(low, high):
+            if watch:
+                check_cancelled(cancellation)
+            event = ordered[index]
+            session_id = event[EVENT_SESSION]
+            account = session_accounts.get(("codex", session_id))
+            if account is not None and account[0] != account_label:
                 continue
-            tokens = event_tokens(event, CODEX_KINDS)
-            units = weighted_units(
-                "codex", event[EVENT_MODEL], tokens, weights, args, bool(event[EVENT_LONG])
-            )
+            model = event[EVENT_MODEL]
+            resolved = per_model.get(model)
+            if resolved is None:
+                resolved = (
+                    weights.event_vector("codex", model, cache_read_weight),
+                    tuple((model, kind) for kind in CODEX_FIT_KINDS),
+                )
+                per_model[model] = resolved
+            vector, feature_keys = resolved
+            units = 0.0 if vector is None else vector_units(vector, event)
+            if event[EVENT_LONG]:
+                units *= multiplier
             used_fallback = False
             if units <= 0:
                 # A model with no weight, or one whose fitted coefficient is
@@ -1973,11 +2815,12 @@ def attribute(
                 # scale (tokens * 1e-9) is nowhere near the weighted-unit
                 # scale, so it is exempted from the cap below rather than
                 # capped to near-zero.
-                units = float(sum(tokens.get(kind, 0) for kind in CODEX_FIT_KINDS)) * 1e-9
+                units = float(
+                    sum(int(event[slot]) for slot in CODEX_FIT_SLOTS)
+                ) * 1e-9
                 used_fallback = True
             if units <= 0:
                 continue
-            session_id = event[EVENT_SESSION]
             total += units
             shares[session_id] = shares.get(session_id, 0.0) + units
             if used_fallback:
@@ -1986,10 +2829,10 @@ def attribute(
                 prompt_key = (session_id, event[EVENT_PROMPT])
                 prompt_shares[prompt_key] = prompt_shares.get(prompt_key, 0.0) + units
                 prompted_units[session_id] = prompted_units.get(session_id, 0.0) + units
-            for kind in CODEX_FIT_KINDS:
-                feature = (event[EVENT_MODEL], kind)
-                interval.features[feature] = (
-                    interval.features.get(feature, 0.0) + tokens.get(kind, 0) / 1_000_000.0
+            for offset, feature in enumerate(feature_keys):
+                features[feature] = (
+                    features.get(feature, 0.0)
+                    + int(event[CODEX_FIT_SLOTS[offset]]) / 1_000_000.0
                 )
         computed[id(interval)] = {
             "total": total,
@@ -2206,6 +3049,17 @@ class Prompt:
         self.drain_percent = None  # type: Optional[float]
         self.model = UNWEIGHTED
         self.reduction = ""
+        # The redacted one-line label of the user prompt; see `prompt_label`.
+        self.label = ""
+        # The session's working directory, basename only, as `cwd_label` cuts
+        # it. "-" when the transcript never named one.
+        self.cwd = "-"
+        # Tool aggregates, filled by attribute_tools. Sizes only.
+        self.tool_calls = 0
+        self.tool_chars = 0
+        self.tool_measured = 0.0
+        self.top_tool = ""
+        self.top_tool_chars = 0
 
     @property
     def kinds(self) -> Sequence[str]:
@@ -2216,6 +3070,11 @@ class Prompt:
         if self.start is None or self.end is None:
             return 0.0
         return max(0.0, self.end - self.start)
+
+    @property
+    def tool_est_tokens(self) -> float:
+        """Approximate tokens added by this prompt's tool results."""
+        return self.tool_chars / CHARS_PER_TOKEN
 
     def to_json(self) -> Dict[str, Any]:
         return {
@@ -2237,6 +3096,14 @@ class Prompt:
             "drain_percent": self.drain_percent,
             "model": self.model,
             "reduction": self.reduction,
+            "label": self.label,
+            "cwd": self.cwd,
+            "tool_calls": self.tool_calls,
+            "tool_result_chars": self.tool_chars,
+            "tool_est_tokens": self.tool_est_tokens,
+            "tool_measured_tokens": self.tool_measured,
+            "largest_tool": self.top_tool,
+            "largest_tool_chars": self.top_tool_chars,
         }
 
 
@@ -2282,6 +3149,159 @@ def input_side_units(harness: str, model: str, tokens: Mapping[str, int], weight
     return weights.codex_units(model, trimmed)
 
 
+class ToolCall:
+    """One completed tool call: its name, its result size, nothing else.
+
+    `est_tokens` is an ESTIMATE from the result size (characters divided by
+    CHARS_PER_TOKEN). `measured` is this call's share of the context growth
+    actually billed on the next API call of the same thread, split across the
+    results of that turn in proportion to their sizes; it is 0 when no later
+    call was recorded and so nothing was measured.
+    """
+
+    __slots__ = (
+        "harness", "session_id", "prompt", "ts", "name", "chars",
+        "measured", "subagent", "spawn",
+    )
+
+    def __init__(self, harness: str, session_id: str, prompt: int, ts: float,
+                 name: str, chars: int, subagent: bool, spawn: bool):
+        self.harness = harness
+        self.session_id = session_id
+        self.prompt = prompt
+        self.ts = ts
+        self.name = name
+        self.chars = chars
+        self.measured = 0.0
+        self.subagent = subagent
+        self.spawn = spawn
+
+    @property
+    def est_tokens(self) -> float:
+        return self.chars / CHARS_PER_TOKEN
+
+    def to_json(self) -> Dict[str, Any]:
+        return {
+            "harness": self.harness,
+            "session_id": self.session_id,
+            "short_id": short_id(self.session_id),
+            "prompt": self.prompt,
+            "ts": self.ts,
+            "tool": self.name,
+            "result_chars": self.chars,
+            "est_tokens": self.est_tokens,
+            "measured_tokens": self.measured,
+            "subagent": self.subagent,
+            "spawned_subagent": self.spawn,
+        }
+
+
+def attribute_tools(
+    scan: Scan, analysis: "Analysis", cancellation: Cancellation = None
+) -> List[ToolCall]:
+    """Tie each tool result to the prompt and the context growth it caused.
+
+    Estimated context is the result size over CHARS_PER_TOKEN. Measured
+    context is the input-token growth between two consecutive API calls of the
+    same thread, split across the tool results recorded between them in
+    proportion to their sizes - so a turn whose growth came from somewhere
+    else (a pasted message, a re-read file) is not blamed on the tools, and a
+    turn with no following call measures nothing.
+    """
+    calls = []  # type: List[ToolCall]
+    for harness, tools in scan.tools.items():
+        check_cancelled(cancellation)
+        if not tools:
+            continue
+        streams = {}  # type: Dict[Tuple[str, int], List[List[Any]]]
+        for row in tools:
+            streams.setdefault((row[TOOL_SESSION], int(row[TOOL_SUB])), []).append(row)
+        events = {}  # type: Dict[Tuple[str, int], List[List[Any]]]
+        for row in scan.events.get(harness, []):
+            events.setdefault(
+                (row[EVENT_SESSION], 1 if row[EVENT_SUB] else 0), []
+            ).append(row)
+        for key, rows in events.items():
+            check_cancelled(cancellation)
+            rows.sort(key=lambda item: item[EVENT_TS])
+            total = 0
+            for position in range(1, len(rows)):
+                step = (
+                    event_context(rows[position], harness)
+                    - event_context(rows[position - 1], harness)
+                )
+                if step > 0:
+                    total += step
+            growth_key = (harness, key[0])
+            analysis.growth_totals[growth_key] = (
+                analysis.growth_totals.get(growth_key, 0) + total
+            )
+        for key, rows in streams.items():
+            check_cancelled(cancellation)
+            rows.sort(key=lambda item: item[TOOL_TS])
+            calls.extend(
+                attribute_tool_stream(harness, key[0], rows, events.get(key, []))
+            )
+    calls.sort(key=lambda call: call.ts)
+    attach_prompt_tools(analysis, calls)
+    return calls
+
+
+def attribute_tool_stream(
+    harness: str, session_id: str, rows: Sequence[List[Any]],
+    stream_events: Sequence[List[Any]],
+) -> List[ToolCall]:
+    starts = [row[EVENT_TS] for row in stream_events]
+    calls = []  # type: List[ToolCall]
+    buckets = {}  # type: Dict[int, List[ToolCall]]
+    for row in rows:
+        # bisect_left: a result stamped exactly at a call's time belongs to
+        # that call, which is the one that carried it into context.
+        position = bisect.bisect_left(starts, row[TOOL_TS])
+        prompt = 0
+        if stream_events:
+            anchor = stream_events[min(position, len(stream_events) - 1)]
+            index = anchor[EVENT_PROMPT] if len(anchor) > EVENT_PROMPT else None
+            prompt = int(index) if isinstance(index, int) else 0
+        call = ToolCall(
+            harness, session_id, prompt, float(row[TOOL_TS]), str(row[TOOL_NAME]),
+            int(row[TOOL_CHARS]), bool(row[TOOL_SUB]), bool(row[TOOL_SPAWN]),
+        )
+        calls.append(call)
+        if position < len(stream_events):
+            buckets.setdefault(position, []).append(call)
+    for position, bucket in buckets.items():
+        if position == 0:
+            # Nothing before it to measure growth against.
+            continue
+        growth = (
+            event_context(stream_events[position], harness)
+            - event_context(stream_events[position - 1], harness)
+        )
+        if growth <= 0:
+            continue
+        total = sum(call.chars for call in bucket)
+        if total <= 0:
+            continue
+        for call in bucket:
+            call.measured = growth * (call.chars / total)
+    return calls
+
+
+def attach_prompt_tools(analysis: "Analysis", calls: Sequence[ToolCall]) -> None:
+    for call in calls:
+        prompts = analysis.prompts.get((call.harness, call.session_id))
+        if not prompts or call.prompt <= 0 or call.prompt > len(prompts):
+            continue
+        prompt = prompts[call.prompt - 1]
+        prompt.tool_calls += 1
+        prompt.tool_chars += call.chars
+        prompt.tool_measured += call.measured
+        if call.chars > prompt.top_tool_chars:
+            prompt.top_tool_chars = call.chars
+            prompt.top_tool = call.name
+
+
 def assemble_prompts(
     scan: Scan, weights: Weights, args: argparse.Namespace,
     cancellation: Cancellation = None,
@@ -2294,20 +3314,27 @@ def assemble_prompts(
     when they started, in both harnesses.
     """
     assembled = {}  # type: Dict[Tuple[str, str], List[Prompt]]
+    watch = cancellation is not None
     for harness, events in scan.events.items():
         check_cancelled(cancellation)
         kinds = CLAUDE_KINDS if harness == "claude" else CODEX_KINDS
         for session_id, rows in group_events_by_session(events, cancellation).items():
             check_cancelled(cancellation)
             bounds = sorted(scan.boundaries.get((harness, session_id), []))
+            labels = scan.prompt_labels.get((harness, session_id), {})
+            summary = scan.sessions.get((harness, session_id))
+            cwd = cwd_label(summary.cwd) if summary is not None else "-"
             groups = group_rows_by_prompt(rows, bounds, harness)
             prompts = []
             for position, (start_ts, group) in enumerate(groups, start=1):
-                check_cancelled(cancellation)
-                prompts.append(
-                    build_prompt(harness, session_id, position, start_ts, group, kinds,
-                                 weights, args, cancellation)
-                )
+                if watch:
+                    check_cancelled(cancellation)
+                prompt = build_prompt(harness, session_id, position, start_ts, group,
+                                      kinds, weights, args, cancellation)
+                if labels:
+                    prompt.label = labels.get(start_ts, "")
+                prompt.cwd = cwd
+                prompts.append(prompt)
             if prompts:
                 assembled[(harness, session_id)] = prompts
     return assembled
@@ -2345,36 +3372,56 @@ def build_prompt(
     prompt.start = start_ts
     baseline = 0.0
     seen_main = False
+    # One price vector per model, not per call: `group` is usually dozens of
+    # calls against one or two models, and the vector lets each row be weighed
+    # straight off its token slots instead of through a fresh dict.
+    cache_read_weight = args.claude_cache_read_weight
+    multiplier = args.long_context_multiplier
+    watch = cancellation is not None
+    is_claude = harness == "claude"
+    totals = prompt.tokens
+    kind_slots = tuple(enumerate(kinds, start=EVENT_KINDS))
+    vectors = {}  # type: Dict[str, Tuple[Any, Any]]
     for row in group:
-        check_cancelled(cancellation)
+        if watch:
+            check_cancelled(cancellation)
         if len(row) <= EVENT_PROMPT:
             row.extend([None] * (EVENT_PROMPT + 1 - len(row)))
         row[EVENT_PROMPT] = position
-        tokens = event_tokens(row, kinds)
-        context = event_context(row, harness)
+        model = row[EVENT_MODEL]
+        pair = vectors.get(model)
+        if pair is None:
+            pair = (
+                weights.event_vector(harness, model, cache_read_weight, False),
+                weights.event_vector(harness, model, cache_read_weight, True),
+            )
+            vectors[model] = pair
+        unit_vector, input_vector = pair
+        if is_claude:
+            context = int(row[3]) + int(row[4]) + int(row[5]) + int(row[6])
+        else:
+            context = int(row[3]) + int(row[4])
+        resent = 0.0 if input_vector is None else vector_units(input_vector, row)
         prompt.end = row[EVENT_TS]
         prompt.turns += 1
         if row[EVENT_SUB]:
             prompt.sub_turns += 1
         else:
-            prompt.context_peak = max(prompt.context_peak, context)
+            if context > prompt.context_peak:
+                prompt.context_peak = context
             if not seen_main:
                 prompt.context_start = context
-                prompt.model = row[EVENT_MODEL]
-                baseline = input_side_units(
-                    harness, row[EVENT_MODEL], tokens, weights,
-                    args.claude_cache_read_weight
-                )
+                prompt.model = model
+                baseline = resent
                 seen_main = True
-        for kind in kinds:
-            prompt.tokens[kind] += tokens[kind]
+        for slot, kind in kind_slots:
+            totals[kind] += int(row[slot])
         prompt.input_tokens += context
-        prompt.units += weighted_units(
-            harness, row[EVENT_MODEL], tokens, weights, args, bool(row[EVENT_LONG])
-        )
-        prompt.resent_units += input_side_units(
-            harness, row[EVENT_MODEL], tokens, weights, args.claude_cache_read_weight
-        )
+        units = 0.0 if unit_vector is None else vector_units(unit_vector, row)
+        if row[EVENT_LONG]:
+            units *= multiplier
+        prompt.units += units
+        prompt.resent_units += resent
     prompt.resent_units = max(0.0, prompt.resent_units - baseline)
     if prompt.start is None:
         prompt.start = group[0][EVENT_TS] if group else None
@@ -2435,6 +3482,7 @@ class Reduction:
     def to_json(self) -> Dict[str, Any]:
         return {
             "harness": self.harness,
+            "session_id": self.session_id,
             "short_id": short_id(self.session_id),
             "time": self.epoch,
             "kind": self.kind,
@@ -2544,11 +3592,19 @@ def group_events_by_session(
     events: Sequence[Sequence[Any]], cancellation: Cancellation = None
 ) -> Dict[str, List[Sequence[Any]]]:
     grouped = {}  # type: Dict[str, List[Sequence[Any]]]
+    watch = cancellation is not None
     for row in events:
-        check_cancelled(cancellation)
-        grouped.setdefault(row[EVENT_SESSION], []).append(row)
+        if watch:
+            check_cancelled(cancellation)
+        session = row[EVENT_SESSION]
+        rows = grouped.get(session)
+        if rows is None:
+            grouped[session] = [row]
+        else:
+            rows.append(row)
     for rows in grouped.values():
-        check_cancelled(cancellation)
+        if watch:
+            check_cancelled(cancellation)
         rows.sort(key=lambda row: row[EVENT_TS])
     return grouped
 
@@ -2880,14 +3936,17 @@ def session_rows(
     long_context = {}  # type: Dict[Tuple[str, str, str], Dict[str, int]]
     for harness, events in scan.events.items():
         kinds = CLAUDE_KINDS if harness == "claude" else CODEX_KINDS
+        kind_slots = tuple(enumerate(kinds, start=EVENT_KINDS))
         for event in events:
             if not event[EVENT_LONG]:
                 continue
-            slot = long_context.setdefault(
-                (harness, event[EVENT_SESSION], event[EVENT_MODEL]), empty_tokens(kinds)
-            )
-            for kind, value in event_tokens(event, kinds).items():
-                slot[kind] += value
+            key = (harness, event[EVENT_SESSION], event[EVENT_MODEL])
+            slot = long_context.get(key)
+            if slot is None:
+                slot = empty_tokens(kinds)
+                long_context[key] = slot
+            for index, kind in kind_slots:
+                slot[kind] += int(event[index])
     rows = []
     for (harness, session_id), summary in scan.sessions.items():
         if summary.end is None:
@@ -3391,6 +4450,371 @@ def row_json(row: Row) -> Dict[str, Any]:
 
 
 # --------------------------------------------------------------------------
+# "what to run next" footer (issue #27)
+#
+# Every command ends by naming the next command worth running, built from
+# the rows it just printed. The footer goes to STDERR so `nenpi sessions |
+# tee` and every `--json` pipeline stay byte-clean; under `--json` the same
+# suggestions ride along as the payload's additive `next` key instead.
+
+
+def hint(cmd: str, why: str) -> Dict[str, str]:
+    """One footer entry. An empty `cmd` prints `why` as a plain note."""
+    return {"cmd": cmd, "why": why}
+
+
+def quiet_output(args: argparse.Namespace) -> bool:
+    return bool(getattr(args, "quiet", False)) or os.environ.get("NENPI_QUIET") == "1"
+
+
+def scope_flags(args: argparse.Namespace) -> List[str]:
+    """The range/harness/account flags the user passed, to repeat verbatim.
+
+    A suggestion that dropped them would report on a different corpus than
+    the rows it was derived from.
+    """
+    flags = []  # type: List[str]
+    for name, flag in (("since", "--since"), ("until", "--until")):
+        value = getattr(args, name, None)
+        if value:
+            flags += [flag, str(value)]
+    harness = getattr(args, "harness", "all")
+    if harness and harness != "all":
+        flags += ["--harness", str(harness)]
+    account = getattr(args, "account", None)
+    if account:
+        flags += ["--account", str(account)]
+    return flags
+
+
+def suggest(args: argparse.Namespace, command: str, *flags: Any) -> str:
+    """`nenpi <command> <flags>` with the user's scope flags carried through.
+
+    A flag the caller set itself (a narrowed `--since`, say) wins over the
+    same flag from the invocation, so a suggestion is never self-contradictory.
+    """
+    given = [str(flag) for flag in flags]
+    carried = scope_flags(args)
+    extra = []  # type: List[str]
+    for index in range(0, len(carried), 2):
+        if carried[index] not in given:
+            extra += [carried[index], carried[index + 1]]
+    # Quoted because --since/--until/--account carry free text: a printed
+    # suggestion has to be safe to paste into a shell as it stands.
+    return " ".join(["nenpi", command] + [shlex.quote(part) for part in given + extra])
+
+
+def analysis_session_ids(analysis: "Analysis") -> List[str]:
+    """Every session id the run could resolve a `--session` prefix against."""
+    return sorted({session_id for _harness, session_id in analysis.scan.sessions})
+
+
+def pick_id(session_id: str, known: Sequence[str]) -> str:
+    """The shortest prefix of `session_id` no other session in scope shares.
+
+    `short_id`'s eight characters are fine to read but not to run: on a real
+    corpus several sessions share them and the suggested `--session` would
+    exit 1 as ambiguous (#27). Grows from eight characters, and falls back to
+    the full id when even that is only a prefix of another id.
+    """
+    flat = session_id.replace("-", "")
+    rivals = [
+        other.replace("-", "") for other in known
+        if other != session_id and other.replace("-", "") != flat
+    ]
+    for length in range(min(8, len(flat)), len(flat) + 1):
+        prefix = flat[:length]
+        if not any(rival.startswith(prefix) for rival in rivals):
+            return prefix
+    return session_id
+
+
+def footer_painter(args: argparse.Namespace) -> Painter:
+    """Color the footer only when stderr is a tty of its own."""
+    if os.environ.get("NO_COLOR"):
+        return Painter(False)
+    return Painter(sys.stderr.isatty() and not getattr(args, "no_color", False))
+
+
+def footer(args: argparse.Namespace, hints: Sequence[Mapping[str, str]]) -> None:
+    """Write up to three "what to run next" lines to stderr."""
+    if getattr(args, "json", False) or quiet_output(args):
+        return
+    rows = [entry for entry in hints if entry and (entry.get("cmd") or entry.get("why"))][:3]
+    if not rows:
+        return
+    paint = footer_painter(args)
+    for entry in rows:
+        if not entry.get("cmd"):
+            sys.stderr.write(paint("next: " + entry["why"], "dim") + "\n")
+            continue
+        sys.stderr.write(
+            "%s %s  %s\n"
+            % (paint("next:", "dim"), paint(entry["cmd"], "bold"),
+               paint("# " + entry["why"], "dim"))
+        )
+    sys.stderr.flush()
+
+
+def widen_hints(args: argparse.Namespace, what: str) -> List[Dict[str, str]]:
+    """The empty-result footer: widen the range, then check the roots."""
+    return [
+        hint(suggest(args, "sessions", "--since", "30d"),
+             "no %s in range; widen the window" % what),
+        hint("nenpi config", "check which harness roots are being scanned"),
+    ]
+
+
+def session_weight(row: "Row") -> float:
+    return row.relative
+
+
+def sessions_hints(
+    args: argparse.Namespace, shown: Sequence["Row"], scoped: Sequence["Row"],
+    known: Sequence[str]
+) -> List[Dict[str, str]]:
+    if not shown:
+        return widen_hints(args, "sessions")
+    top = shown[:3]
+    lead = pick_id(top[0].summary.session_id, known)
+    # The note has to name the order actually on screen: --sort start ranks
+    # by recency, and calling that "by drain" would be a lie (#27).
+    note = "top %d by %s: %s" % (
+        len(top), getattr(args, "sort", "drain"),
+        ", ".join(pick_id(row.summary.session_id, known) for row in top))
+    # The median is over every session in scope, not the --top slice, and
+    # the multiple is always the drain leader's, whatever the sort is.
+    weights = sorted(session_weight(row) for row in scoped)
+    median = weights[len(weights) // 2] if weights else 0.0
+    leader = max(scoped, key=session_weight) if scoped else None
+    if leader is not None and median > 0 and session_weight(leader) >= 3.0 * median:
+        note += " (%s drains %.1fx the median session here)" % (
+            pick_id(leader.summary.session_id, known), session_weight(leader) / median)
+    return [
+        hint("", note),
+        hint(suggest(args, "prompts", "--session", lead), "which prompts drove %s" % lead),
+        hint(suggest(args, "tools", "--session", lead), "which tools filled its context"),
+    ]
+
+
+def timeline_hints(
+    args: argparse.Namespace, buckets: Mapping[int, Mapping[str, float]], bucket_seconds: int
+) -> List[Dict[str, str]]:
+    if not buckets:
+        return widen_hints(args, "activity")
+    slot = max(buckets, key=lambda key: buckets[key]["claude"] + buckets[key]["codex"])
+    entry = buckets[slot]
+    return [
+        hint("", "busiest bucket %s: %.1f claude + %.1f codex units"
+             % (local_label(slot), entry["claude"], entry["codex"])),
+        hint(suggest(args, "sessions", "--since", iso_arg(slot),
+                     "--until", iso_arg(slot + bucket_seconds)),
+             "the sessions running in that bucket"),
+    ]
+
+
+def iso_arg(epoch: float) -> str:
+    """A local ISO stamp `--since`/`--until` parse and a shell needs no quotes."""
+    return local_label(epoch, "%Y-%m-%dT%H:%M")
+
+
+def windows_hints(
+    args: argparse.Namespace, ordered: Sequence[Mapping[str, Any]], known: Sequence[str]
+) -> List[Dict[str, str]]:
+    if not ordered:
+        return widen_hints(args, "Codex quota windows")
+    busiest = max(ordered, key=lambda entry: entry["peak_used_percent"])
+    start = busiest["start"]
+    resets = busiest["resets_at"]
+    end = float(resets) if isinstance(resets, (int, float)) else (
+        start + 60.0 * float(busiest["window_minutes"] or 0))
+    hints = [
+        hint("", "busiest window started %s, peak %.1f%%"
+             % (local_label(start), busiest["peak_used_percent"])),
+        hint(suggest(args, "sessions", "--since", iso_arg(start), "--until", iso_arg(end)),
+             "the sessions that drained it"),
+    ]
+    top = top_session_list(busiest["sessions"], 1)
+    if top:
+        hints.append(
+            hint(suggest(args, "prompts", "--session", pick_id(top[0]["session_id"], known)),
+                 "its biggest session, prompt by prompt")
+        )
+    return hints
+
+
+def prompts_ranked_hints(
+    args: argparse.Namespace, shown: Sequence["Prompt"], known: Sequence[str]
+) -> List[Dict[str, str]]:
+    if not shown:
+        return widen_hints(args, "prompts")
+    lead = shown[0]
+    session = pick_id(lead.session_id, known)
+    return [
+        hint("", "#1 is prompt %d of session %s (%d turns, %s peak context)"
+             % (lead.index, session, lead.turns, format_tokens(lead.context_peak))),
+        hint(suggest(args, "prompts", "--session", session),
+             "that session's per-prompt breakdown"),
+        hint(suggest(args, "tools", "--session", session),
+             "the tools those prompts ran"),
+    ]
+
+
+def prompts_session_hints(
+    args: argparse.Namespace, session_id: str, prompts: Sequence["Prompt"],
+    known: Sequence[str]
+) -> List[Dict[str, str]]:
+    if not prompts:
+        return widen_hints(args, "prompts")
+    session = pick_id(session_id, known)
+    busiest = max(prompts, key=lambda prompt: (prompt.turns, prompt.index))
+    largest = max(prompts, key=lambda prompt: (prompt.context_peak, prompt.index))
+    hints = [
+        hint("", "prompt %d ran the most turns (%d); prompt %d held the most context (%s)"
+             % (busiest.index, busiest.turns, largest.index,
+                format_tokens(largest.context_peak))),
+        hint(suggest(args, "tools", "--session", session, "--prompt", busiest.index),
+             "what prompt %d's turns were reading" % busiest.index),
+    ]
+    marked = [prompt for prompt in prompts if prompt.reduction]
+    if marked:
+        hints.append(hint(suggest(args, "reductions"),
+                          "a context reduction landed in this session"))
+    else:
+        hints.append(hint(suggest(args, "prompts", "--sort", "context"),
+                          "compare these prompts against every other session's"))
+    return hints
+
+
+def tools_hints(
+    args: argparse.Namespace, session_id: str, calls: Sequence["ToolCall"],
+    shown: Sequence[Mapping[str, Any]], known: Sequence[str]
+) -> List[Dict[str, str]]:
+    if not calls or not shown:
+        return widen_hints(args, "tool calls")
+    top = shown[0]
+    note = hint("", "top tool by measured context: %s (%s over %d calls)"
+                % (top["tool"], format_tokens(top["measured_tokens"]), top["calls"]))
+    if session_id:
+        session = pick_id(session_id, known)
+        busiest = max(calls, key=lambda call: (call.measured, call.prompt)).prompt
+        return [
+            note,
+            hint(suggest(args, "tools", "--session", session, "--prompt", busiest),
+                 "the same tools inside prompt %d alone" % busiest),
+            hint(suggest(args, "prompts", "--session", session, "--tools"),
+                 "which prompts those calls belong to"),
+        ]
+    session = pick_id(heaviest_session(calls), known)
+    return [
+        note,
+        hint(suggest(args, "tools", "--session", session),
+             "the same ranking inside %s, the heaviest session" % session),
+        hint(suggest(args, "prompts", "--session", session, "--tools"),
+             "per-prompt tool counts for that session"),
+    ]
+
+
+def heaviest_session(calls: Sequence["ToolCall"]) -> str:
+    totals = {}  # type: Dict[str, float]
+    for call in calls:
+        totals[call.session_id] = totals.get(call.session_id, 0.0) + call.measured + call.chars
+    return max(sorted(totals), key=lambda key: totals[key]) if totals else ""
+
+
+def fanout_hints(
+    args: argparse.Namespace, prompts: Sequence["Prompt"], known: Sequence[str]
+) -> List[Dict[str, str]]:
+    if not prompts:
+        return widen_hints(args, "prompts")
+    totals = {}  # type: Dict[str, float]
+    for prompt in prompts:
+        totals[prompt.session_id] = totals.get(prompt.session_id, 0.0) + prompt.sub_turns
+    busiest = max(sorted(totals), key=lambda key: totals[key])
+    if totals[busiest] <= 0:
+        busiest = max(prompts, key=lambda prompt: (prompt.turns, prompt.index)).session_id
+        why = "the session with the widest single prompt"
+    else:
+        why = "the session with the most sub-agent turns (%d)" % int(totals[busiest])
+    session = pick_id(busiest, known)
+    return [
+        hint(suggest(args, "prompts", "--session", session), why),
+        hint(suggest(args, "tools", "--session", session),
+             "what its sub-agents were reading"),
+    ]
+
+
+def reductions_hints(
+    args: argparse.Namespace, found: Sequence["Reduction"], known: Sequence[str]
+) -> List[Dict[str, str]]:
+    if not found:
+        return [
+            hint(suggest(args, "prompts", "--sort", "context"),
+                 "no reductions in range; see which prompts carry the most context"),
+        ]
+    biggest = max(found, key=lambda reduction: reduction.removed)
+    session = pick_id(biggest.session_id, known)
+    return [
+        hint("", "largest drop: %s removed from %s at %s"
+             % (format_tokens(biggest.removed), session, local_label(biggest.epoch))),
+        hint(suggest(args, "prompts", "--session", session),
+             "where that session's context went"),
+    ]
+
+
+def verify_hints(
+    args: argparse.Namespace, report: Sequence[Mapping[str, Any]], known: Sequence[str]
+) -> List[Dict[str, str]]:
+    if not report:
+        return widen_hints(args, "sessions to verify")
+
+    def gap(entry: Mapping[str, Any]) -> float:
+        reference = entry.get("cost_state") or entry.get("thread_token_usage") or {}
+        summed = sum(entry["deduped"].get(kind, 0) for kind in ("input", "output"))
+        reported = sum(int(reference.get(kind, 0) or 0) for kind in ("input", "output"))
+        return abs(summed - reported)
+
+    worst = max(report, key=gap)
+    session = pick_id(worst["session_id"], known)
+    return [
+        hint("", "largest gap between parsed and reported totals: %s" % session),
+        hint(suggest(args, "prompts", "--session", session),
+             "read that session prompt by prompt"),
+    ]
+
+
+def calibrate_hints(args: argparse.Namespace, usable: bool) -> List[Dict[str, str]]:
+    hints = [
+        hint(suggest(args, "sessions", "--use-calibrated"),
+             "price sessions with the fit just saved"),
+    ]
+    if not usable:
+        hints.insert(0, hint("", "the fit is not usable yet; a longer --since or a "
+                                 "larger --calibrate-bucket-hours may identify it"))
+    return hints
+
+
+def snapshot_hints(args: argparse.Namespace) -> List[Dict[str, str]]:
+    return [
+        hint("nenpi sessions --since 7d",
+             "rank sessions against the drain these snapshots measure"),
+        hint("nenpi calibrate --harness claude --since 30d",
+             "fit Claude weights once the log spans a few windows"),
+    ]
+
+
+def config_hints(
+    args: argparse.Namespace, present: bool, unconfigured: Sequence[Mapping[str, Any]]
+) -> List[Dict[str, str]]:
+    if unconfigured or not present:
+        return [
+            hint("nenpi config --init",
+                 "write a config.toml seeded with the roots found on this host"),
+        ]
+    return [hint("nenpi sessions --since 7d", "rank the sessions these roots hold")]
+
+
+# --------------------------------------------------------------------------
 # subcommands
 
 
@@ -3404,8 +4828,29 @@ class Analysis:
         self.until = until
         self.window = None  # type: Optional[str]
         self.intervals = []  # type: List[Interval]
-        self.prompts = {}  # type: Dict[Tuple[str, str], List[Prompt]]
+        # (harness, session) -> total positive input growth across its calls,
+        # the denominator for a tool's share of context growth.
+        self.growth_totals = {}  # type: Dict[Tuple[str, str], int]
         self.reductions = None  # type: Optional[List[Reduction]]
+        self.prompts = {}  # type: Dict[Tuple[str, str], List[Prompt]]
+        # Tool attribution walks every recorded tool result and every API
+        # call to split context growth between them. Only `tools`, `prompts`
+        # and `fanout` ever read the answer, so it is computed on first use
+        # rather than by `prepare`: `sessions` and `timeline` were paying for
+        # a whole second pass over the corpus they never looked at.
+        #
+        # Prompt assembly stays eager because `attribute()` reads the prompt
+        # index that `assemble_prompts` writes onto each codex event, so
+        # every command that reports drain already depends on it.
+        self.cancellation = None  # type: Cancellation
+        self._tool_calls = None  # type: Optional[List[ToolCall]]
+
+    @property
+    def tool_calls(self) -> List[ToolCall]:
+        if self._tool_calls is None:
+            with profile_phase("tools"):
+                self._tool_calls = attribute_tools(self.scan, self, self.cancellation)
+        return self._tool_calls
 
     def prompts_for(self, harness: str, session_id: str) -> List[Prompt]:
         return self.prompts.get((harness, session_id), [])
@@ -3458,9 +4903,17 @@ def filter_by_account(scan: Scan, label: str) -> None:
         scan.events[harness] = [
             row for row in events if (harness, row[EVENT_SESSION]) in keep
         ]
+    scan.filter_tools(
+        lambda harness, rows: [
+            row for row in rows if (harness, row[TOOL_SESSION]) in keep
+        ]
+    )
     scan.snapshots = [row for row in scan.snapshots if row.get("account") in account_keys]
     scan.boundaries = dict(
         (key, value) for key, value in scan.boundaries.items() if key in keep
+    )
+    scan.prompt_labels = dict(
+        (key, value) for key, value in scan.prompt_labels.items() if key in keep
     )
     scan.compactions = dict(
         (key, value) for key, value in scan.compactions.items() if key in keep
@@ -3483,35 +4936,41 @@ def prepare(
         since = parse_since(args.since, now)
         until = parse_since(args.until, now) if getattr(args, "until", None) else None
         weights = load_weights(getattr(args, "use_calibrated", False))
-        scan = collect(args, since, run)
+        with profile_phase("scan"):
+            scan = collect(args, since, run)
         if getattr(args, "account", None):
             filter_by_account(scan, args.account)
         run.emit("analysis", message="building analysis")
         run.check()
-        if not getattr(args, "whole_session", False):
-            window_events(scan, since, until, cancellation)
-        rebuild_totals(scan, cancellation)
+        with profile_phase("totals"):
+            if not getattr(args, "whole_session", False):
+                window_events(scan, since, until, cancellation)
+            rebuild_totals(scan, cancellation)
         analysis = Analysis(scan, weights, since, until, args)
+        analysis.cancellation = cancellation
         # Prompt keys must exist before attribution so measured drain can be split
         # down to the prompt as well as the session.
-        analysis.prompts = assemble_prompts(scan, weights, args, cancellation)
+        with profile_phase("prompts"):
+            analysis.prompts = assemble_prompts(scan, weights, args, cancellation)
         run.check()
-        analysis.window = choose_window(scan.snapshots, args.window)
-        analysis.intervals = [
-            interval
-            for interval in build_intervals(scan.snapshots, analysis.window, cancellation)
-            if (since is None or interval.end >= since)
-            and (until is None or interval.start <= until)
-        ]
-        for interval in analysis.intervals:
-            run.check()
-            if since is not None and interval.start < since:
-                interval.start = since
+        with profile_phase("intervals"):
+            analysis.window = choose_window(scan.snapshots, args.window)
+            analysis.intervals = [
+                interval
+                for interval in build_intervals(scan.snapshots, analysis.window, cancellation)
+                if (since is None or interval.end >= since)
+                and (until is None or interval.start <= until)
+            ]
+            for interval in analysis.intervals:
+                run.check()
+                if since is not None and interval.start < since:
+                    interval.start = since
         # attribute()'s signature stays compatible with its account-aware
         # implementation; cancellation is an optional final argument.
         args._session_accounts = scan.session_accounts
-        attribute(analysis.intervals, scan.events["codex"], weights, args, cancellation)
-        apply_prompt_drain(analysis, cancellation)
+        with profile_phase("attribute"):
+            attribute(analysis.intervals, scan.events["codex"], weights, args, cancellation)
+            apply_prompt_drain(analysis, cancellation)
         run.emit("done", message="analysis ready")
         return analysis
     except (ScanCancelled, KeyboardInterrupt):
@@ -3521,6 +4980,7 @@ def prepare(
 
 def apply_prompt_drain(analysis: Analysis, cancellation: Cancellation = None) -> None:
     shares = {}  # type: Dict[Tuple[str, Any], float]
+    watch = cancellation is not None
     for interval in analysis.intervals:
         check_cancelled(cancellation)
         for key, value in interval.prompts.items():
@@ -3530,7 +4990,8 @@ def apply_prompt_drain(analysis: Analysis, cancellation: Cancellation = None) ->
         if harness != "codex":
             continue
         for prompt in prompts:
-            check_cancelled(cancellation)
+            if watch:
+                check_cancelled(cancellation)
             value = shares.get((session_id, prompt.index))
             if value is not None:
                 prompt.drain_percent = value
@@ -3547,11 +5008,14 @@ def command_sessions(args: argparse.Namespace) -> int:
     dollars_per_percent = claude_dollars_per_percent(since, until)
     apply_claude_estimate(rows, dollars_per_percent)
     score_rows(rows)
-    rows = sort_rows(rows, args.sort)[: args.top]
+    scoped = sort_rows(rows, args.sort)
+    rows = scoped[: args.top]
+    hints = sessions_hints(args, rows, scoped, analysis_session_ids(analysis))
     if args.json:
         payload = {
             "schema": JSON_SCHEMA,
             "command": "sessions",
+            "next": hints,
             "generated_at": time.time(),
             "weight_source": weights.source_label,
             "claude_dollars_per_percent": dollars_per_percent,
@@ -3570,10 +5034,12 @@ def command_sessions(args: argparse.Namespace) -> int:
             print(paint(wrapped, "dim"))
     if not rows:
         print("no sessions in range")
+        footer(args, hints)
         return 0
     print("")
     for line in render_sessions(rows, args, paint, width):
         print(line)
+    footer(args, hints)
     return 0
 
 
@@ -3607,10 +5073,12 @@ def command_timeline(args: argparse.Namespace) -> int:
         slot = int(epoch // bucket_seconds) * bucket_seconds
         entry = buckets.setdefault(slot, {"claude": 0.0, "codex": 0.0, "used_percent": 0.0})
         entry["used_percent"] = max(entry["used_percent"], row["used_percent"])
+    hints = timeline_hints(args, buckets, bucket_seconds)
     if args.json:
         payload = {
             "schema": JSON_SCHEMA,
             "command": "timeline",
+            "next": hints,
             "bucket_seconds": bucket_seconds,
             "buckets": [
                 dict(start=slot, **buckets[slot]) for slot in sorted(buckets)
@@ -3621,6 +5089,7 @@ def command_timeline(args: argparse.Namespace) -> int:
     paint = make_painter(args)
     if not buckets:
         print("no activity in range")
+        footer(args, hints)
         return 0
     width = terminal_width(args)
     bar_width = max(10, width - 44)
@@ -3642,6 +5111,7 @@ def command_timeline(args: argparse.Namespace) -> int:
                 glyphs,
             )
         )
+    footer(args, hints)
     return 0
 
 
@@ -3738,10 +5208,12 @@ def command_windows(args: argparse.Namespace) -> int:
     # so `intervals`/`scan.snapshots` here hold only the selected account's
     # pool; no re-check against `args.account` is needed.
     ordered = codex_window_entries(scan, intervals, since, window)
+    hints = windows_hints(args, ordered, analysis_session_ids(analysis))
     if args.json:
         payload = {
             "schema": JSON_SCHEMA,
             "command": "windows",
+            "next": hints,
             "windows": [
                 {
                     "account": entry["account"],
@@ -3761,6 +5233,7 @@ def command_windows(args: argparse.Namespace) -> int:
     paint = make_painter(args)
     if not ordered:
         print("no Codex quota windows observed in range")
+        footer(args, hints)
         return 0
     label_width = max(len(entry["account_label"]) for entry in ordered)
     for entry in ordered:
@@ -3784,12 +5257,16 @@ def command_windows(args: argparse.Namespace) -> int:
             print("    %-10s %6.3f%%" % (item["short_id"], item["drain_percent"]))
         if entry["unattributed_percent"] > 0:
             print("    unattributed %.1f%%" % entry["unattributed_percent"])
+    footer(args, hints)
     return 0
 
 
 def top_session_list(sessions: Mapping[str, float], top: int) -> List[Dict[str, Any]]:
     ordered = sorted(sessions.items(), key=lambda item: item[1], reverse=True)[:top]
-    return [{"short_id": short_id(key), "drain_percent": value} for key, value in ordered]
+    return [
+        {"session_id": key, "short_id": short_id(key), "drain_percent": value}
+        for key, value in ordered
+    ]
 
 
 def command_calibrate(args: argparse.Namespace) -> int:
@@ -3825,8 +5302,12 @@ def command_calibrate(args: argparse.Namespace) -> int:
     total_drain = sum(interval.drain for interval in usable)
     total_unattributed = sum(interval.unattributed for interval in usable)
     unattributed_share = (total_unattributed / total_drain) if total_drain > 0 else 0.0
+    hints = calibrate_hints(args, bool(fit["usable"]))
     payload = {
         "schema": JSON_SCHEMA,
+        "command": "calibrate",
+        "next": hints,
+        "harness": "codex",
         "version": 1,
         "fitted_at": time.time(),
         "samples": fit["samples"],
@@ -3890,6 +5371,7 @@ def command_calibrate(args: argparse.Namespace) -> int:
                 )
             )
     print("saved to %s" % destination)
+    footer(args, hints)
     return 0
 
 
@@ -4025,12 +5507,16 @@ def calibrate_claude(args: argparse.Namespace, analysis: "Analysis") -> int:
     if not results:
         warn(
             "no usable Claude snapshot intervals; sample utilisation with "
-            "`quota-drain snapshot --oauth` (see docs/drain.md) and retry"
+            "`nenpi snapshot --oauth` (see docs/drain.md) and retry"
         )
         return 1
+    hints = calibrate_hints(
+        args, any(result["usable"] for result in results.values())
+    )
     payload = {
         "schema": JSON_SCHEMA,
         "command": "calibrate",
+        "next": hints,
         "harness": "claude",
         "unit": "percent_per_mtok",
         "windows": results,
@@ -4076,38 +5562,188 @@ def calibrate_claude(args: argparse.Namespace, analysis: "Analysis") -> int:
             "  list price puts cache reads at 0.1x input (0.025x on Fable 5.1); "
             "the implied column is the measured ratio"
         )
+    footer(args, hints)
     return 0
 
 
-def command_prompts(args: argparse.Namespace) -> int:
-    analysis = prepare(args)
-    matches = [
-        (key, prompts)
-        for key, prompts in analysis.prompts.items()
-        if key[1].replace("-", "").startswith(args.session.replace("-", ""))
-        or key[1].startswith(args.session)
-    ]
+def session_prefix_match(session_id: str, prefix: str) -> bool:
+    """The prefix rule `prompts` has always used, shared with `tools`."""
+    return session_id.replace("-", "").startswith(
+        prefix.replace("-", "")
+    ) or session_id.startswith(prefix)
+
+
+def resolve_session_prefix(
+    candidates: Mapping[Tuple[str, str], float], prefix: str, first: bool
+) -> Tuple[Optional[Tuple[str, str]], int]:
+    """Resolve one `--session` prefix against `{(harness, id): weight}`.
+
+    Shared by `prompts` and `tools` so a scripted drill-down never reads a
+    different session in one command than in the other. A full id (with or
+    without dashes) wins outright; an ambiguous prefix is an error listing
+    the candidates, unless `--first` asks for the busiest of them.
+    Returns the chosen key, or `None` and the exit code to return.
+    """
+    matches = [key for key in candidates if session_prefix_match(key[1], prefix)]
     if not matches:
-        warn("no session matching %r; run `quota-drain sessions` for ids" % args.session)
-        return 1
-    if len(matches) > 1:
+        warn("no session matching %r; run `nenpi sessions` for ids" % prefix)
+        return None, 1
+    wanted = prefix.replace("-", "")
+    exact = [key for key in matches if key[1].replace("-", "") == wanted]
+    if len(exact) == 1:
+        return exact[0], 0
+    if len(matches) > 1 and not first:
         warn(
-            "%r matches %d sessions (%s); using the busiest"
-            % (args.session, len(matches), ", ".join(short_id(key[1]) for key, _ in matches[:5]))
+            "%r matches %d sessions (%s); pass a longer prefix, a full id, "
+            "or --first for the busiest"
+            % (prefix, len(matches),
+               ", ".join(short_id(key[1]) for key in sorted(matches)[:5]))
         )
-    (harness, session_id), prompts = max(
-        matches, key=lambda item: sum(prompt.units for prompt in item[1])
-    )
-    mark_reductions(prompts, analysis)
-    growth = fit_growth(prompts)
-    shown = prompts[-args.top:] if args.top and len(prompts) > args.top else prompts
+        return None, 1
+    return max(matches, key=lambda key: (candidates[key], key)), 0
+
+
+def session_unit_totals(analysis: "Analysis") -> Dict[Tuple[str, str], float]:
+    """Weighted units per session, the `--first` tie-break over ALL sessions."""
+    totals = {}  # type: Dict[Tuple[str, str], float]
+    for key, summary in analysis.scan.sessions.items():
+        totals[key] = sum(
+            weighted_units(summary.harness, model, tokens, analysis.weights, analysis.args)
+            for model, tokens in summary.models.items()
+        )
+    return totals
+
+
+PROMPTS_SESSION_TOP = 25
+PROMPTS_RANK_TOP = 10
+PROMPT_RANK_KEYS = {
+    "turns": lambda prompt: (prompt.turns, prompt.sub_turns, prompt.units),
+    "context": lambda prompt: (prompt.context_peak, prompt.turns),
+    "drain": lambda prompt: (prompt.drain_percent or 0.0, prompt.units),
+    "tokens": lambda prompt: (prompt.input_tokens, prompt.turns),
+    "units": lambda prompt: (prompt.units, prompt.turns),
+}
+
+
+def rank_prompts(
+    analysis: "Analysis", sort: str, top: int
+) -> List[Prompt]:
+    """The prompts in range, busiest first by `sort`, cut to `top`."""
+    prompts = [
+        prompt
+        for session_prompts in analysis.prompts.values()
+        for prompt in session_prompts
+        if analysis.in_range(prompt.start) or analysis.in_range(prompt.end)
+    ]
+    # Sorted by identity first so the metric sort, which is stable, breaks
+    # its own ties the same way on every run.
+    prompts.sort(key=lambda prompt: (prompt.harness, prompt.session_id, prompt.index))
+    prompts.sort(key=PROMPT_RANK_KEYS[sort], reverse=True)
+    return prompts[:top] if top else prompts
+
+
+def format_prompt_drain(prompt: Prompt) -> str:
+    if prompt.drain_percent is None:
+        return "-"
+    return "%.2f%%" % prompt.drain_percent
+
+
+def command_prompts_ranked(args: argparse.Namespace, analysis: "Analysis") -> int:
+    """`prompts` with no --session: one row per prompt, across sessions."""
+    top = args.top if args.top is not None else PROMPTS_RANK_TOP
+    shown = rank_prompts(analysis, args.sort, top)
+    hints = prompts_ranked_hints(args, shown, analysis_session_ids(analysis))
     if args.json:
         print(
             json.dumps(
                 {
                     "schema": JSON_SCHEMA,
                     "command": "prompts",
+                    "next": hints,
+                    "sort": args.sort,
+                    "top": top,
+                    "prompts": [
+                        dict(prompt.to_json(), prompt_index=prompt.index)
+                        for prompt in shown
+                    ],
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        return 0
+    paint = make_painter(args)
+    print(
+        paint(
+            "top %d prompts by %s across %d sessions"
+            % (top or len(shown), args.sort, len(analysis.prompts)),
+            "bold",
+        )
+    )
+    if not shown:
+        print("no prompts in range")
+        footer(args, hints)
+        return 0
+    print("")
+    columns = "%4s %-7s %-10s %-14s %5s %6s %6s %10s %8s" % (
+        "rank", "harness", "session", "cwd", "#", "turns", "sub", "ctx peak",
+        "drain")
+    with_label = args.label is not False
+    label_width = max(20, terminal_width(args) - len(columns) - 1)
+    if with_label:
+        columns += " %-*s" % (label_width, "prompt")
+    print(paint(columns.rstrip(), "bold"))
+    for rank, prompt in enumerate(shown, start=1):
+        line = "%4d %-7s %-10s %-14s %5d %6d %6d %10s %8s" % (
+            rank,
+            prompt.harness,
+            short_id(prompt.session_id),
+            prompt.cwd[:14],
+            prompt.index,
+            prompt.turns,
+            prompt.sub_turns,
+            format_tokens(prompt.context_peak),
+            format_prompt_drain(prompt),
+        )
+        if with_label:
+            line += " " + prompt.label[:label_width]
+        print(line.rstrip())
+    footer(args, hints)
+    return 0
+
+
+def command_prompts(args: argparse.Namespace) -> int:
+    analysis = prepare(args)
+    # Every prompt row this command prints or serializes carries its tool
+    # counts, which `attribute_tools` writes onto the prompts as a side
+    # effect, so the lazy attribution is forced before any prompt is read.
+    _ = analysis.tool_calls
+    if not getattr(args, "session", None):
+        return command_prompts_ranked(args, analysis)
+    candidates = dict(
+        (key, sum(prompt.units for prompt in prompts))
+        for key, prompts in analysis.prompts.items()
+    )
+    key, code = resolve_session_prefix(candidates, args.session, args.first)
+    if key is None:
+        return code
+    harness, session_id = key
+    prompts = analysis.prompts[key]
+    mark_reductions(prompts, analysis)
+    growth = fit_growth(prompts)
+    top = args.top if args.top is not None else PROMPTS_SESSION_TOP
+    shown = prompts[-top:] if top and len(prompts) > top else prompts
+    hints = prompts_session_hints(
+        args, session_id, shown, analysis_session_ids(analysis))
+    if args.json:
+        print(
+            json.dumps(
+                {
+                    "schema": JSON_SCHEMA,
+                    "command": "prompts",
+                    "next": hints,
                     "harness": harness,
+                    "session_id": session_id,
                     "short_id": short_id(session_id),
                     "growth": growth,
                     "prompts": [prompt.to_json() for prompt in shown],
@@ -4132,11 +5768,18 @@ def command_prompts(args: argparse.Namespace) -> int:
         )
     )
     print("")
-    print(paint("%-4s %-16s %6s %6s %10s %10s %10s %9s %-8s" % (
-        "#", "start", "wall", "turns", "ctx start", "ctx peak", "input sent", "units", "note"),
-        "bold"))
+    with_tools = getattr(args, "tools", False)
+    with_label = getattr(args, "label", None) is True
+    label_width = max(20, width - 110)
+    header = "%-4s %-16s %6s %6s %10s %10s %10s %9s %-8s" % (
+        "#", "start", "wall", "turns", "ctx start", "ctx peak", "input sent", "units", "note")
+    if with_tools:
+        header += " %6s %10s %-16s" % ("tools", "tool est", "largest tool")
+    if with_label:
+        header += " %-*s" % (label_width, "prompt")
+    print(paint(header, "bold"))
     for prompt in shown:
-        print(
+        line = (
             "%-4d %-16s %6s %6d %10s %10s %10s %9.2f %-8s"
             % (
                 prompt.index,
@@ -4150,6 +5793,16 @@ def command_prompts(args: argparse.Namespace) -> int:
                 prompt.reduction or "",
             )
         )
+        if with_tools:
+            line += " %6d %10s %-16s" % (
+                prompt.tool_calls,
+                format_tokens(prompt.tool_est_tokens),
+                prompt.top_tool[:16],
+            )
+        if with_label:
+            line += " " + prompt.label[:label_width]
+            line = line.rstrip()
+        print(line)
     print("")
     bar_width = max(10, width - 30)
     harness_style = "claude" if harness == "claude" else "codex"
@@ -4178,6 +5831,7 @@ def command_prompts(args: argparse.Namespace) -> int:
         )
     print("")
     print(paint(describe_growth(growth), "bold"))
+    footer(args, hints)
     return 0
 
 
@@ -4219,20 +5873,199 @@ def detect_reductions_cached(analysis: "Analysis") -> List[Reduction]:
     return analysis.reductions
 
 
+def tool_totals(calls: Sequence[ToolCall]) -> Dict[str, Dict[str, Any]]:
+    """Aggregate calls by tool name. Names and sizes only."""
+    totals = {}  # type: Dict[str, Dict[str, Any]]
+    for call in calls:
+        row = totals.get(call.name)
+        if row is None:
+            row = {
+                "tool": call.name,
+                "calls": 0,
+                "result_chars": 0,
+                "est_tokens": 0.0,
+                "measured_tokens": 0.0,
+                "max_result_chars": 0,
+                "spawns": 0,
+                "harness": call.harness,
+            }
+            totals[call.name] = row
+        row["calls"] += 1
+        row["result_chars"] += call.chars
+        row["est_tokens"] += call.est_tokens
+        row["measured_tokens"] += call.measured
+        row["spawns"] += 1 if call.spawn else 0
+        if call.chars > row["max_result_chars"]:
+            row["max_result_chars"] = call.chars
+    for row in totals.values():
+        row["mean_result_chars"] = row["result_chars"] / row["calls"] if row["calls"] else 0.0
+    return totals
+
+
+def sort_tool_rows(rows: Sequence[Mapping[str, Any]], key: str) -> List[Dict[str, Any]]:
+    def order(row: Mapping[str, Any]) -> Tuple[float, float]:
+        if key == "calls":
+            return (row["calls"], row["est_tokens"])
+        if key == "mean":
+            return (row["mean_result_chars"], row["calls"])
+        return (row["est_tokens"], row["calls"])
+
+    return sorted(rows, key=order, reverse=True)
+
+
+def command_tools(args: argparse.Namespace) -> int:
+    analysis = prepare(args)
+    calls = analysis.tool_calls
+    session_id = ""
+    if getattr(args, "session", None):
+        key, code = resolve_session_prefix(
+            session_unit_totals(analysis), args.session, args.first
+        )
+        if key is None:
+            return code
+        session_id = key[1]
+        calls = [call for call in calls if call.session_id == session_id]
+    if getattr(args, "prompt", None):
+        calls = [call for call in calls if call.prompt == args.prompt]
+    sessions_seen = {(call.harness, call.session_id) for call in calls}
+    growth_total = sum(
+        analysis.growth_totals.get(key, 0) for key in sessions_seen
+    )
+    rows = sort_tool_rows(list(tool_totals(calls).values()), args.sort)
+    shown = rows[: args.top] if args.top else rows
+    largest = sorted(calls, key=lambda call: call.chars, reverse=True)[:5]
+    measured_total = sum(call.measured for call in calls)
+    hints = tools_hints(
+        args, session_id, calls, shown, analysis_session_ids(analysis))
+    if args.json:
+        print(
+            json.dumps(
+                {
+                    "schema": JSON_SCHEMA,
+                    "command": "tools",
+                    "next": hints,
+                    "generated_at": time.time(),
+                    "session": short_id(session_id) if session_id else "",
+                    "session_id": session_id,
+                    "tool_calls": len(calls),
+                    "result_chars": sum(call.chars for call in calls),
+                    "est_tokens": sum(call.est_tokens for call in calls),
+                    "measured_tokens": measured_total,
+                    "measured_is_upper_bound": True,
+                    "measured_note": (
+                        "a turn's whole input growth is split across its tool "
+                        "results, so output and prompt text are charged here too"
+                    ),
+                    "context_growth_tokens": growth_total,
+                    "tools": [
+                        dict(row, share_of_growth=(
+                            row["measured_tokens"] / growth_total if growth_total else None
+                        ))
+                        for row in shown
+                    ],
+                    "largest_results": [call.to_json() for call in largest],
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        return 0
+    paint = make_painter(args)
+    width = terminal_width(args)
+    scope = "session %s" % short_id(session_id) if session_id else "all sessions"
+    print(paint(
+        "tool calls - %s, %d calls, %s est tokens added (estimate: result chars / %d)"
+        % (scope, len(calls), format_tokens(sum(call.est_tokens for call in calls)),
+           int(CHARS_PER_TOKEN)),
+        "bold",
+    ))
+    if not calls:
+        print("no tool calls in range")
+        footer(args, hints)
+        return 0
+    print("")
+    print(paint("%-28s %6s %10s %10s %9s %9s %6s" % (
+        "tool", "calls", "est tokens", "measured", "mean", "max", "share"), "bold"))
+    print(paint(
+        "measured is an UPPER BOUND: a turn's whole input growth is split across "
+        "its tool results, so output and prompt text land here too",
+        "dim",
+    ))
+    peak = max(row["est_tokens"] for row in shown)
+    bar_width = max(8, min(30, width - 90))
+    for row in shown:
+        share = row["measured_tokens"] / growth_total if growth_total else None
+        style = "claude" if row["harness"] == "claude" else "codex"
+        print(
+            "%-28s %6d %10s %10s %9s %9s %6s %s"
+            % (
+                row["tool"][:28],
+                row["calls"],
+                format_tokens(row["est_tokens"]),
+                format_tokens(row["measured_tokens"]),
+                format_tokens(row["mean_result_chars"] / CHARS_PER_TOKEN),
+                format_tokens(row["max_result_chars"] / CHARS_PER_TOKEN),
+                "-" if share is None else "%5.1f%%" % (100.0 * share),
+                paint(bar(row["est_tokens"], peak, bar_width), style),
+            )
+        )
+    print("")
+    print(paint("largest single results", "bold"))
+    for call in largest:
+        print(
+            "%-28s %10s  %-10s prompt %d"
+            % (
+                call.name[:28],
+                format_tokens(call.est_tokens),
+                short_id(call.session_id),
+                call.prompt,
+            )
+        )
+    print("")
+    print(paint(
+        "measured = this turn's input-token growth split across its tool results; "
+        "est = result size / %d" % int(CHARS_PER_TOKEN),
+        "dim",
+    ))
+    footer(args, hints)
+    return 0
+
+
 def command_fanout(args: argparse.Namespace) -> int:
     analysis = prepare(args)
+    # Every prompt row this command prints or serializes carries its tool
+    # counts, which `attribute_tools` writes onto the prompts as a side
+    # effect, so the lazy attribution is forced before any prompt is read.
+    _ = analysis.tool_calls
     prompts = [
         prompt
         for prompts in analysis.prompts.values()
         for prompt in prompts
         if analysis.in_range(prompt.start) or analysis.in_range(prompt.end)
     ]
+    sort = getattr(args, "sort", "tokens")
     if not prompts:
+        hints = widen_hints(args, "prompts")
+        if args.json:
+            print(json.dumps(
+                {
+                    "schema": JSON_SCHEMA,
+                    "command": "fanout",
+                    "next": hints,
+                    "prompts": 0,
+                    "sort": sort,
+                    "turns_histogram": [],
+                    "context_histogram": [],
+                    "top_prompts": [],
+                },
+                indent=2, sort_keys=True))
+            return 0
         print("no prompts in range")
+        footer(args, hints)
         return 0
     turns = [float(prompt.turns) for prompt in prompts]
     contexts = [float(prompt.context_peak) for prompt in prompts]
-    top = sorted(prompts, key=lambda prompt: prompt.input_tokens, reverse=True)[:15]
+    top = sorted(prompts, key=PROMPT_RANK_KEYS[sort], reverse=True)[:15]
     cwds = {}  # type: Dict[Tuple[str, str], str]
     for (harness, session_id), summary in analysis.scan.sessions.items():
         cwds[(harness, session_id)] = cwd_label(summary.cwd)
@@ -4250,6 +6083,7 @@ def command_fanout(args: argparse.Namespace) -> int:
             "p90": percentile(contexts, 0.9),
             "max": max(contexts),
         },
+        "sort": sort,
         "turns_histogram": histogram(turns, (1, 2, 3, 5, 10, 20, 50, 100)),
         "context_histogram": histogram(
             contexts, (10_000, 50_000, 100_000, 200_000, 400_000, 800_000)
@@ -4258,6 +6092,7 @@ def command_fanout(args: argparse.Namespace) -> int:
             dict(prompt.to_json(), cwd=cwds.get((prompt.harness, prompt.session_id), "-"))
             for prompt in top
         ],
+        "next": fanout_hints(args, prompts, analysis_session_ids(analysis)),
     }
     if args.json:
         print(json.dumps(summary_json, indent=2, sort_keys=True))
@@ -4283,7 +6118,9 @@ def command_fanout(args: argparse.Namespace) -> int:
     render_histogram(paint, "peak context per prompt", summary_json["context_histogram"],
                      terminal_width(args), tokens=True)
     print("")
-    print(paint("top 15 single prompts by input tokens sent", "bold"))
+    print(paint(
+        "top 15 single prompts by %s"
+        % ("input tokens sent" if sort == "tokens" else sort), "bold"))
     print(paint("%-7s %-10s %-18s %5s %6s %10s %10s" % (
         "harness", "session", "cwd", "#", "turns", "ctx peak", "input"), "bold"))
     for prompt in top:
@@ -4299,6 +6136,7 @@ def command_fanout(args: argparse.Namespace) -> int:
                 format_tokens(prompt.input_tokens),
             )
         )
+    footer(args, summary_json["next"])
     return 0
 
 
@@ -4344,12 +6182,14 @@ def command_reductions(args: argparse.Namespace) -> int:
         for reduction in detect_reductions_cached(analysis)
         if analysis.in_range(reduction.epoch)
     ][: args.top]
+    hints = reductions_hints(args, found, analysis_session_ids(analysis))
     if args.json:
         print(
             json.dumps(
                 {
                     "schema": JSON_SCHEMA,
                     "command": "reductions",
+                    "next": hints,
                     "reductions": [reduction.to_json() for reduction in found],
                 },
                 indent=2,
@@ -4360,6 +6200,7 @@ def command_reductions(args: argparse.Namespace) -> int:
     paint = make_painter(args)
     if not found:
         print("no context reductions detected in range")
+        footer(args, hints)
         return 0
     print(
         paint(
@@ -4392,6 +6233,7 @@ def command_reductions(args: argparse.Namespace) -> int:
                 reduction.saved_units_upper,
             )
         )
+    footer(args, hints)
     return 0
 
 
@@ -4399,9 +6241,12 @@ def command_verify(args: argparse.Namespace) -> int:
     analysis = prepare(args)
     scan = analysis.scan
     since = analysis.since
+    until = analysis.until
     report = []
     for (harness, session_id), summary in sorted(scan.sessions.items()):
         if since is not None and (summary.end or 0) < since:
+            continue
+        if until is not None and (summary.start or 0) > until:
             continue
         if harness == "claude":
             cost_state = summary.cost_state
@@ -4413,6 +6258,7 @@ def command_verify(args: argparse.Namespace) -> int:
                 report.append(
                     {
                         "harness": "claude",
+                        "session_id": session_id,
                         "short_id": short_id(session_id),
                         "model": normalized,
                         "deduped": {
@@ -4449,19 +6295,23 @@ def command_verify(args: argparse.Namespace) -> int:
             report.append(
                 {
                     "harness": "codex",
+                    "session_id": session_id,
                     "short_id": short_id(session_id),
                     "model": "-",
                     "deduped": observed,
                     "thread_token_usage": reported,
                 }
             )
+    hints = verify_hints(args, report, analysis_session_ids(analysis))
     if args.json:
-        print(json.dumps({"schema": JSON_SCHEMA, "command": "verify", "rows": report},
-                         indent=2, sort_keys=True))
+        print(json.dumps(
+            {"schema": JSON_SCHEMA, "command": "verify", "next": hints, "rows": report},
+            indent=2, sort_keys=True))
         return 0
     paint = make_painter(args)
     if not report:
         print("nothing to verify in range")
+        footer(args, hints)
         return 0
     print(paint("%-7s %-10s %-20s %14s %14s %10s" %
                 ("harness", "session", "model", "summed", "reported", "delta"), "bold"))
@@ -4481,6 +6331,7 @@ def command_verify(args: argparse.Namespace) -> int:
                 (100.0 * delta / reported) if reported else 0.0,
             )
         )
+    footer(args, hints)
     return 0
 
 
@@ -4728,12 +6579,18 @@ def snapshot_from_oauth(destination: Path, args: argparse.Namespace) -> int:
 def command_snapshot(args: argparse.Namespace) -> int:
     destination = state_dir() / "snapshots.jsonl"
     if args.stdin:
+        # The statusline passthrough writes nothing of its own on either
+        # stream; no footer here, ever (#27).
         return snapshot_from_stdin(destination)
     if args.compact:
-        return compact_snapshots(destination)
-    if args.oauth:
-        return snapshot_from_oauth(destination, args)
-    return snapshot_from_configs(destination)
+        code = compact_snapshots(destination)
+    elif args.oauth:
+        code = snapshot_from_oauth(destination, args)
+    else:
+        code = snapshot_from_configs(destination)
+    if code == 0:
+        footer(args, snapshot_hints(args))
+    return code
 
 
 def snapshot_from_stdin(destination: Path) -> int:
@@ -4987,6 +6844,15 @@ def add_common(parser: argparse.ArgumentParser) -> None:
         help="write the command result as indented JSON",
     )
     parser.add_argument(
+        "-q", "--quiet", action="store_true",
+        help="drop the stderr \"what to run next\" footer; NENPI_QUIET=1 does the same",
+    )
+    parser.add_argument(
+        "--profile", action="store_true",
+        help="print phase timings (scan, totals, prompts, intervals, attribute, "
+             "render) to stderr; NENPI_PROFILE=1 does the same",
+    )
+    parser.add_argument(
         "--no-color", action="store_true",
         help="disable ANSI colors, including the scan progress display",
     )
@@ -5055,7 +6921,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     sessions = sub.add_parser(
         "sessions", help="rank sessions by quota drain",
-        description="Show one row per session, with fan-out and quota-drain details.",
+        description="Show one row per session, with fan-out and drain details.",
         epilog="Example:\n  nenpi sessions --since 7d --sort tokens --top 20",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -5103,17 +6969,80 @@ def build_parser() -> argparse.ArgumentParser:
     calibrate.set_defaults(handler=command_calibrate, harness="codex")
 
     prompts = sub.add_parser(
-        "prompts", help="inspect fan-out and context growth for one session",
-        description="Show per-prompt input, context, turns, weighted units, and growth fits.",
-        epilog="Example:\n  nenpi prompts --session 0123abcd --top 40 --since 7d",
+        "prompts", help="rank prompts across sessions, or break down one session",
+        description=(
+            "Without --session, rank every prompt in range by turns (or context, "
+            "drain, tokens) with a short redacted label. With --session, show that "
+            "session's per-prompt input, context, turns, weighted units, and "
+            "growth fits."
+        ),
+        epilog="Examples:\n"
+               "  nenpi prompts --since 7d --sort turns --top 20\n"
+               "  nenpi prompts --session 0123abcd --top 40 --since 7d",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     add_common(prompts)
     prompts.add_argument(
-        "--session", required=True, metavar="ID_PREFIX",
-        help="required session ID prefix; if several match, use the busiest",
+        "--session", default=None, metavar="ID_PREFIX",
+        help="break down one session by ID prefix; an ambiguous prefix is an error. "
+             "Without it, prompts from every session in range are ranked together",
     )
-    prompts.set_defaults(handler=command_prompts)
+    prompts.add_argument(
+        "--first", action="store_true",
+        help="with an ambiguous --session prefix, use the busiest match instead of failing",
+    )
+    prompts.add_argument(
+        "--sort", choices=tuple(sorted(PROMPT_RANK_KEYS)), default="turns",
+        help="ranking key without --session: API turns (default), peak context, "
+             "measured drain, input tokens sent, or weighted units",
+    )
+    prompts.add_argument(
+        "--tools", action="store_true",
+        help="add per-prompt tool columns: call count, estimated tokens added, "
+             "and the largest single result's tool",
+    )
+    label_flag = prompts.add_mutually_exclusive_group()
+    label_flag.add_argument(
+        "--label", dest="label", action="store_true", default=None,
+        help="show the redacted prompt label column (the default for the "
+             "cross-session ranking; opt-in with --session)",
+    )
+    label_flag.add_argument(
+        "--no-label", dest="label", action="store_false",
+        help="hide the redacted prompt label column",
+    )
+    # `--top` means "last N of this session" with --session and "top N of the
+    # ranking" without, so its default is resolved in the handler.
+    prompts.set_defaults(handler=command_prompts, top=None)
+
+    tools = sub.add_parser(
+        "tools", help="rank tool calls by the context they add",
+        description=(
+            "Rank tool names by estimated context added. Only tool names and "
+            "result sizes are read; no tool input or output text is stored or shown."
+        ),
+        epilog="Example:\n  nenpi tools --since 7d --sort context --top 15",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    add_common(tools)
+    tools.add_argument(
+        "--session", default=None, metavar="ID_PREFIX",
+        help="limit to one session by ID prefix; an ambiguous prefix is an error",
+    )
+    tools.add_argument(
+        "--first", action="store_true",
+        help="with an ambiguous --session prefix, use the busiest match instead of failing",
+    )
+    tools.add_argument(
+        "--prompt", type=int, default=None, metavar="N",
+        help="limit to one prompt index within the selected session",
+    )
+    tools.add_argument(
+        "--sort", choices=("context", "calls", "mean"), default="context",
+        help="sort by estimated context added, call count, or mean result size "
+             "(default: context)",
+    )
+    tools.set_defaults(handler=command_tools)
 
     fanout = sub.add_parser(
         "fanout", help="summarize turns and context per prompt",
@@ -5122,6 +7051,11 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     add_common(fanout)
+    fanout.add_argument(
+        "--sort", choices=tuple(sorted(PROMPT_RANK_KEYS)), default="tokens",
+        help="rank the top-prompts table by input tokens sent (default), API "
+             "turns, peak context, measured drain, or weighted units",
+    )
     fanout.set_defaults(handler=command_fanout)
 
     reductions = sub.add_parser(
@@ -5169,6 +7103,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="drop repeated, malformed, and older-than-60-day snapshot records",
     )
     snapshot.add_argument(
+        "-q", "--quiet", action="store_true",
+        help="drop the stderr \"what to run next\" footer",
+    )
+    snapshot.add_argument("--no-color", action="store_true",
+                          help="disable ANSI colors")
+    snapshot.add_argument(
         "--config-dir", action="append", default=[], metavar="PATH",
         help="Claude config directory for --oauth; repeatable (default: discovered configs)",
     )
@@ -5185,6 +7125,12 @@ def build_parser() -> argparse.ArgumentParser:
     config_cmd.add_argument("--force", action="store_true",
                             help="with --init, overwrite an existing config.toml")
     config_cmd.add_argument("--json", action="store_true")
+    config_cmd.add_argument(
+        "-q", "--quiet", action="store_true",
+        help="drop the stderr \"what to run next\" footer",
+    )
+    config_cmd.add_argument("--no-color", action="store_true",
+                            help="disable ANSI colors")
     config_cmd.set_defaults(handler=command_config)
 
     return parser
@@ -5209,14 +7155,23 @@ def command_config(args: argparse.Namespace) -> int:
                     "account_key": key,
                 }
             )
+    unconfigured = unconfigured_roots(config)
+    unconfigured_rows = [
+        {"harness": harness, "path": str(root)}
+        for harness in ("claude", "codex")
+        for root in unconfigured.get(harness, [])
+    ]
+    hints = config_hints(args, path.is_file(), unconfigured_rows)
     if args.json:
         print(
             json.dumps(
                 {
                     "schema": JSON_SCHEMA,
+                    "next": hints,
                     "config_path": str(path),
                     "config_present": path.is_file(),
                     "roots": rows,
+                    "unconfigured_roots": unconfigured_rows,
                 },
                 indent=2,
                 sort_keys=True,
@@ -5238,11 +7193,14 @@ def command_config(args: argparse.Namespace) -> int:
                 row["account_key"],
             )
         )
+    if unconfigured_rows:
+        print(
+            "unconfigured: %s (run `nenpi config --init`, add them to "
+            "[claude]/[codex] roots, or set [general] ignore_unconfigured = true)"
+            % ", ".join(display_path(Path(row["path"])) for row in unconfigured_rows)
+        )
+    footer(args, hints)
     return 0
-
-
-def _toml_escape(value: str) -> str:
-    return value.replace("\\", "\\\\").replace('"', '\\"')
 
 
 def command_config_init(args: argparse.Namespace) -> int:
@@ -5253,27 +7211,48 @@ def command_config_init(args: argparse.Namespace) -> int:
     if path.exists() and not args.force:
         warn("%s already exists; pass --force to overwrite" % path)
         return 1
-    lines = [
-        "# nenpi config, written by `nenpi config --init`.",
-        "# Precedence: --claude-root/--codex-root flags > this file > defaults.",
-        "",
-    ]
+    existing = load_config(path) if path.is_file() else Config(path=path)
+    # --init reseeds `roots` only: the user's other settings, the UI's
+    # disabled/ignored bookkeeping, and any table this version does not know
+    # about all survive an --init --force.
+    fresh = Config(
+        path=path,
+        plan_claude=existing.plan_claude,
+        plan_codex=existing.plan_codex,
+        ignore_unconfigured=existing.ignore_unconfigured,
+        claude_disabled=existing.claude_disabled,
+        codex_disabled=existing.codex_disabled,
+        claude_ignored=existing.claude_ignored,
+        codex_ignored=existing.codex_ignored,
+        tables_present=existing.tables_present,
+        extras=existing.extras,
+    )
+    comments = {}  # type: Dict[str, str]
     for harness in ("claude", "codex"):
-        candidates = discover_candidate_roots(harness)
-        lines.append("[%s]" % harness)
-        lines.append("roots = [")
-        for root in candidates:
+        roots = fresh.roots(harness)
+        excluded = {
+            str(Path(item).expanduser())
+            for item in list(fresh.disabled(harness)) + list(fresh.ignored(harness))
+        }
+        for root in discover_candidate_roots(harness):
+            if str(root) in excluded:
+                continue
             label, _key = account_for_root(root, harness)
-            lines.append('    "%s",  # %s' % (_toml_escape(str(root)), label))
-        lines.append("]")
-        lines.append("")
-    lines.append("# [plan]  # optional, display only")
-    lines.append('# claude = "max_20x"')
-    lines.append('# codex = "pro"')
-    lines.append("")
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text("\n".join(lines), encoding="utf-8")
+            roots.append(str(root))
+            comments[str(root)] = label
+    save_config(
+        fresh,
+        path,
+        comments=comments,
+        header=[
+            "# nenpi config, written by `nenpi config --init`.",
+            "# Precedence: --claude-root/--codex-root flags > this file > defaults.",
+            "# The Sources screen reads and writes this same file.",
+        ],
+    )
     print("wrote %s" % path)
+    footer(args, [hint("nenpi config", "check the roots it resolved"),
+                  hint("nenpi sessions --since 7d", "rank the sessions they hold")])
     return 0
 
 
@@ -5284,17 +7263,31 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # bytes moving before building the full parser.
     if arguments == ["snapshot", "--stdin"]:
         return snapshot_from_stdin(state_dir() / "snapshots.jsonl")
+    # The Sources screen's old store is imported here too, so a CLI-only
+    # user gets it as well (issue #23); it is a no-op once config.toml
+    # exists, and stays out of the statusline path above.
+    try:
+        from .settings import migrate_json_store
+    except ImportError:  # bench can load drain.py as a standalone module
+        from nenpi.settings import migrate_json_store  # type: ignore
+    migrate_json_store()
     parser = build_parser()
     args = parser.parse_args(arguments)
+    # Advisory notes belong on a human's stderr, not in a --json run.
+    set_notices_enabled(not getattr(args, "json", False))
     if not getattr(args, "handler", None):
         parser.print_help()
         return 2
     if getattr(args, "harness", None) == "claude" and args.command == "windows":
         warn("windows are a Codex-only measurement")
+    profile_start(profile_enabled(args))
     try:
-        return args.handler(args)
+        with profile_phase("total"):
+            return args.handler(args)
     except ScanCancelled:
         return 130
+    finally:
+        profile_report()
 
 
 if __name__ == "__main__":

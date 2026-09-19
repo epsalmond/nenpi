@@ -33,8 +33,11 @@ so cost grows faster than session length. See
 nenpi sessions    [--harness claude|codex|all] [--since 7d|2026-09-10] [--until ...]
                   [--window auto|five_hour|weekly] [--top 25]
                   [--sort drain|tokens|start] [--json] [--no-color] [--width N]
-nenpi prompts     --session <id-prefix> [--top N]
-nenpi fanout      [--since ...] [--harness ...]
+nenpi prompts     [--sort turns|context|drain|tokens|units] [--top N]
+                  [--label | --no-label] [--session <id-prefix> [--first] [--tools]]
+nenpi tools       [--session <id-prefix>] [--first] [--prompt N] [--top N]
+                  [--sort context|calls|mean] [--harness ...] [--json]
+nenpi fanout      [--since ...] [--harness ...] [--sort tokens|turns|...]
 nenpi reductions  [--since ...]
 nenpi timeline    [--bucket 1h|5h|1d]
 nenpi windows     [--harness codex]
@@ -43,6 +46,8 @@ nenpi verify      [--since ...]
 nenpi snapshot    [--stdin | --oauth [--config-dir PATH] | --compact]
 nenpi config      [--claude-root PATH] [--codex-root PATH] [--json]
 nenpi config      --init [--force]
+
+Every reporting subcommand also takes --quiet/-q (drop the stderr footer).
 ```
 
 Common flags on every reporting subcommand: `--claude-root PATH` and
@@ -58,6 +63,33 @@ its default of 1.0), `--use-calibrated` prefers a stored fit,
 `--whole-session` reports each selected session's whole life rather than the
 part inside the range, `--ascii` draws bars without block glyphs, and
 `--rebuild-cache` discards the parse cache.
+
+Every subcommand ends with a **"what to run next"** footer of at most three
+lines on **stderr**, derived from the rows it just printed: the top sessions
+and the `prompts --session` line for the biggest, the busiest prompt and the
+`tools --session ID --prompt N` line for it, the busiest timeline bucket and
+the `sessions --since ... --until ...` line that opens it. Suggestions repeat
+the `--since`, `--until`, `--harness`, and `--account` flags of the run that
+produced them, so each is runnable as printed and stays in the same scope; a
+flag the suggestion sets itself (the bucket's own `--since`) wins.
+
+A suggested `--session` carries the shortest prefix no other session in
+scope shares (eight characters unless that collides), so it resolves instead
+of failing as ambiguous, and every value is shell-quoted, so a `--since` or
+`--account` holding spaces pastes safely. Color is skipped when `NO_COLOR`
+is set.
+
+stdout is untouched, so `nenpi sessions | tee` stays clean. `--quiet`/`-q`
+and `NENPI_QUIET=1` suppress the footer. Under `--json` nothing goes to
+stderr and the same suggestions are the payload's additive `next` key, a list
+of `{"cmd", "why"}` objects for scripts and the TUI. `nenpi snapshot --stdin`
+is a byte-exact statusline passthrough and never writes a footer. Color is
+used only when stderr is a tty.
+
+`--profile` (or `NENPI_PROFILE=1`) prints one line per phase — scan, totals,
+prompts, intervals, attribute, total — to stderr, so a run that got slower
+says which phase did it without reaching for cProfile. stdout is untouched,
+so `--json --profile` still pipes cleanly.
 
 `--since` and `--until` window the **events**, not just the session list. A
 session that started weeks ago and ran again this morning reports only this
@@ -86,7 +118,26 @@ largest drainer. The header says so.
 
 ### prompts
 
-Per-prompt breakdown for one session, plus two charts (input tokens sent per
+Without `--session`, every prompt in range is ranked together, one row per
+prompt: rank, harness, short session id, cwd, prompt index, API turns,
+subagent turns, peak context, measured drain, and the prompt's label.
+`--sort` picks `turns` (default), `context`, `drain`, `tokens` (input tokens
+sent) or `units`, `--top N` cuts the list (default 10), and `--no-label`
+drops the label column. `--json` returns the same rows with the full
+`session_id`, `prompt_index`, `cwd` and `label`.
+
+```
+top 10 prompts by turns across 63 sessions
+
+rank harness session    cwd              #  turns    sub   ctx peak    drain prompt
+   1 codex   01a0ab96   nenpi            7    929    713     116.8K    2.26% rerun the tests
+```
+
+The **label** is the one line the person typed that opened the prompt, cut to
+120 characters — see [What is stored](#performance-and-state) for what is
+scrubbed out of it first.
+
+With `--session`, the per-prompt breakdown for that session, plus two charts (input tokens sent per
 prompt, split cached and uncached; peak context per prompt) and a fitted
 growth summary:
 
@@ -99,11 +150,47 @@ The fit is ordinary least squares of per-prompt weighted units against prompt
 index, once linear and once quadratic; `better` names the higher R², requiring
 at least a 0.01 margin so near-ties report as linear.
 
+### tools
+
+Ranks tool names by the context their results add. `--session` takes the same
+ID prefix as `prompts` (busiest wins when several match) and `--prompt N`
+narrows to one prompt of that session; without either, the report is
+corpus-wide. Columns:
+
+- **calls** — completed calls of that tool in range.
+- **est tokens** — *estimate*: total result characters / 4. Labelled an
+  estimate everywhere; no tokenizer is run.
+- **measured** — the input-token growth actually billed on the next API call
+  of the same thread, split across that turn's tool results in proportion to
+  their sizes. A turn with no following call measures nothing, so measured is
+  0 there; where other things also grew the context (reasoning, assistant
+  output, pasted text) the split charges them to the tools of that turn, so
+  measured is an UPPER BOUND - the table says so under its header, and
+  `--json` carries `measured_is_upper_bound`. On a real corpus it runs
+  several times the estimate for that reason.
+- **mean** / **max** — mean and largest single result, in estimated tokens.
+- **share** — measured tokens over the total positive input growth of the
+  sessions in scope.
+
+A closing section lists the five largest single results by tool, session and
+prompt index. `--sort` picks `context` (default, estimated tokens), `calls`,
+or `mean`.
+
+`prompts --session --tools` adds the same numbers per prompt: call count,
+estimated tokens, and the tool behind the largest single result of that
+prompt. `--label` adds the prompt label there too - it is on by default in
+the ranking and off with `--session`, and `--label`/`--no-label` work in
+both. Without either flag the per-session `prompts` table is unchanged.
+
+Only tool **names** and result **sizes** are read. Tool inputs and outputs are
+never stored in the cache, printed, or hashed.
+
 ### fanout
 
 Across every session in range: the turns-per-prompt distribution (histogram
 plus p50/p90/max), the peak-context-per-prompt distribution, and the top 15
-single prompts by input tokens sent.
+single prompts by input tokens sent; `--sort` reranks that table by `turns`,
+`context`, `drain` or `units` instead.
 
 ### reductions
 
@@ -393,8 +480,9 @@ next prompt belongs to it, including subagent work started under it.
 Per prompt the tool records wall time, API turns (distinct Claude
 `message.id` / Codex `response_id`), context size at the start and at the
 peak, input tokens summed across the fan-out split into uncached, cache read
-and cache write, output tokens, weighted units, and measured or estimated
-drain.
+and cache write, output tokens, weighted units, measured or estimated drain,
+and the tool-call count, total result size, estimated and measured tool
+context, and largest single result (see [tools](#tools)).
 
 **Resent share** is the fraction of a session's weighted cost that went on
 context it had already sent: for each prompt, the input-side weighted cost of
@@ -464,6 +552,8 @@ overrides the path):
 ```toml
 [claude]
 roots = ["~/.claude", "~/.claude-arcade"]
+disabled = ["~/.claude-old"]   # written by the UI; not scanned
+ignored = ["~/.claude-tmp"]    # written by the UI; not offered again
 
 [codex]
 roots = ["~/.codex", "~/.codex-arcade"]
@@ -471,7 +561,38 @@ roots = ["~/.codex", "~/.codex-arcade"]
 [plan]            # optional, display only
 claude = "max_20x"
 codex = "pro"
+
+[general]
+ignore_unconfigured = true     # silence the unconfigured-sibling note
 ```
+
+This one file is the whole store. The Textual Sources screen reads and
+writes it too: adding a source appends to `roots`, switching one off moves
+it to `disabled`, and removing a discovered one records it under `ignored`.
+An older `~/.config/nenpi/config.json` (the UI's previous store) is imported
+on first use — enabled state preserved, each source's harness re-derived
+from its layout, since the Sources form used to save `~/.codex-*` roots as
+Claude — and the old file is renamed to `config.json.migrated`. Nothing
+reads it afterwards. `$NENPI_CONFIG`, the UI's own override, still works and
+is now an alias of `$NENPI_CONFIG_FILE`; it names the TOML file, and a
+`.json` value is read as the `.toml` beside it, with a warning. The import
+also runs for a CLI-only user, on the first command after the upgrade. A
+`config.json` that listed sources for one harness only imports as an empty
+`roots = []` table for the other, which now means "scan nothing" rather than
+the defaults — run `nenpi config --init` afterwards, or add that harness's
+roots to the file (or delete its table) to get the defaults back.
+
+An empty `roots` in a `[claude]`/`[codex]` table the file actually has means
+"scan nothing for this harness": disabling every root in the UI keeps the
+CLI away from `~/.claude` too. The defaults below apply only when the
+harness has no table at all.
+
+Writing the file (the Sources screen, or `nenpi config --init --force`)
+preserves every table and key, including ones this version does not
+recognise, but not comments: `--init` re-seeds `roots` and rewrites the rest
+from what it parsed, so hand-written comments are lost. `--init --force`
+keeps `disabled`, `ignored`, `[plan]`, `[general]` and unknown tables, and
+never re-seeds a root that is listed as disabled or ignored.
 
 A missing file falls back to the defaults above. A malformed file is a hard
 error naming the file and the parse problem; an unknown key is a warning, not
@@ -487,6 +608,20 @@ account it authenticates as: a label (the root's basename) and a key (Codex:
 label). Tokens are never read or printed. `nenpi config --init` writes a
 starter `config.toml`, seeded with every root the old glob would have found
 on this host (refuses to overwrite an existing file without `--force`).
+
+When a `~/.claude-*` or `~/.codex-*` directory that looks like a harness
+home (it has `projects/` or `sessions/`) is present but in nothing's
+resolved set, one line goes to stderr per run:
+
+```
+nenpi: found unconfigured harness dirs: ~/.claude-arcade, ~/.codex-arcade; run `nenpi config --init` to include them (or set [general] ignore_unconfigured = true)
+```
+
+It costs one glob per harness, is suppressed for `--json` output and for
+`snapshot --stdin`, never fires for roots given with `--claude-root` /
+`--codex-root`, and skips the default locations and anything listed under
+`disabled` or `ignored`. `nenpi config` prints the same set as an
+`unconfigured:` line (`unconfigured_roots` in `--json`).
 
 **Breaking change:** with defaults narrowed to one location per harness, a
 host that relied on the old glob picking up e.g. `~/.codex-arcade` or
@@ -671,10 +806,61 @@ A cold full sweep is the price of corpus-wide dedup: every transcript has to
 be read once before a replayed API call can be told from a new one.
 
 Only the structural fields are read: `type`, `message.usage`, `message.id`,
-`message.model`, timestamps, ids, `cwd`, and the Codex `rate_limits` and
-`turn_id`. Prompt text, tool results and message content are never parsed or
-printed. Claude user lines carrying tool results are screened out on the raw
-bytes before `json.loads` ever sees them.
+`message.model`, timestamps, ids, `cwd`, the Codex `rate_limits` and
+`turn_id`, and — for tool accounting — `tool_use.name` / `function_call.name`
+(MCP names kept whole, Codex namespaces qualified as `namespace.name`) with
+the character SIZE of each `tool_result` / `function_call_output`. Tool result
+text and message content are never parsed into anything stored or printed: a
+result is measured and dropped.
+
+One deliberate exception: each prompt's **label** is stored in its shard and
+printed by `prompts`. The label is the first line the person typed, and
+nothing else — the rest of the prompt is discarded before anything is kept:
+
+- Injected blocks are stripped, whether they close on the same line or span
+  several. The list is fixed: `system-reminder`, `user_instructions`,
+  `environment_context`, `recommended_plugins`, `pasted_content`,
+  `command-name`, `command-message`, `command-args`,
+  `local-command-stdout`, `local-command-stderr`, `local-command-caveat`,
+  `ide_selection`, `ide_opened_file`, `task-notification`,
+  `cross-session-message`. Anything else in angle brackets is something the
+  person typed and is kept, and a self-closing `<tag …/>` is dropped while
+  the typed text beside it stays.
+- A **pasted-content placeholder** (`[Pasted text …]`, `[Image #1]`) ends the
+  scan. The lines after it are the paste, and the paste is never a label.
+- A turn that is *only* an injected block — a task notification, a bare
+  slash-command expansion — is labelled with the block's name in
+  parentheses, e.g. `(task-notification)`. The name comes from the list
+  above, so such a label is a fixed vocabulary and carries nothing from
+  inside the block. Only a closing tag at the start of a line ends a block,
+  so a body that quotes its own closing tag cannot hand back a line; a block
+  that never closes yields its name and nothing else.
+- Whitespace is collapsed and the line is cut to 120 characters.
+- These become `[redacted]` first: email addresses, `sk-…`,
+  `ghp_`/`gho_`/`github_pat_…`, `xox…` and `AKIA…` keys, JWTs, `Bearer …`
+  values, hex runs of 32 characters or more, and base64-looking runs of 40 or
+  more. The runs are matched with lookarounds rather than word boundaries, so
+  `api_key_<hex>` is caught too.
+
+`--no-label` hides the column, and nothing longer than the label ever reaches
+the cache; delete `~/.cache/nenpi/` to drop the labels already stored.
+
+Claude user lines carrying tool results still bypass the prompt path on the
+raw-bytes screen; they now go through the size-only tool parser instead of
+being skipped.
+
+Reading those lines costs something: on a 14-day sweep of a real corpus the
+cold parse went from ~24 s to ~32 s and the cache from 34 MB to 43 MB (a
+later pass trimmed that back to ~24 s: only `"tool_result"` admits a line,
+and a structured result is sized by walking its strings rather than by
+re-serializing it, which under-counts JSON punctuation by a fraction of a
+percent). Warm runs are unchanged. An issued call is forgotten once the next
+user turn starts in that file, so a result can only be named by a call of
+its own turn.
+
+Labels add two more Codex line kinds to the screen (`"role":"user"` and
+`"task_complete"`, the latter bounding how long a user message can wait for
+the prompt it opens), worth about 12% on a cold Codex-only scan.
 
 State lives in `~/.local/state/nenpi/` (`snapshots.jsonl`,
 `codex-weights.json`, `oauth-poll.json`), config in
