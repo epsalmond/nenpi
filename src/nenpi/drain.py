@@ -78,7 +78,7 @@ except ImportError:  # bench can load drain.py as a standalone quota module.
         serialized_cache,
     )
 
-CACHE_SCHEMA = 6
+CACHE_SCHEMA = 7
 JSON_SCHEMA = 1
 LONG_CONTEXT_THRESHOLD = 200_000
 CONTEXT_REDUCTION_FRACTION = 0.30
@@ -980,6 +980,11 @@ class FileIndex:
         # and `timeline` never decode them.
         self._tools = []  # type: List[List[Any]]
         self.tools_loader = None  # type: Optional[Callable[[], List[List[Any]]]]
+        # Row count and serialized size of the sibling, written into the
+        # main shard so a missing, truncated or stale sibling is caught
+        # instead of read back as "this transcript called no tools".
+        self.tool_count = 0
+        self.tool_bytes = 0
         # tool-call id -> [name, sidechain, spawn] for calls whose result has
         # not been read yet. Kept across incremental parses because a call and
         # its result can straddle the resume offset.
@@ -1028,6 +1033,8 @@ class FileIndex:
             "last_model": self.last_model,
             "boundaries": self.boundaries,
             "compactions": self.compactions,
+            "tool_count": self.tool_count,
+            "tool_bytes": self.tool_bytes,
             "pending_tools": self.pending_tools,
             "pending_label": self.pending_label,
             "pending_label_rank": self.pending_label_rank,
@@ -1054,6 +1061,8 @@ class FileIndex:
         index.last_model = str(payload.get("last_model", UNWEIGHTED))
         index.boundaries = list(payload.get("boundaries") or [])
         index.compactions = list(payload.get("compactions") or [])
+        index.tool_count = int(payload.get("tool_count") or 0)
+        index.tool_bytes = int(payload.get("tool_bytes") or 0)
         index.pending_tools = list(payload.get("pending_tools") or [])
         index.pending_label = str(payload.get("pending_label", ""))
         index.pending_label_rank = int(payload.get("pending_label_rank") or 0)
@@ -1836,6 +1845,10 @@ def profile_report() -> None:
 # cache
 
 
+class CacheShardError(RuntimeError):
+    """A cache shard disagrees with the sibling file it points at."""
+
+
 class Cache:
     """One JSON shard per transcript, loaded only for files a run actually reads.
 
@@ -1864,12 +1877,28 @@ class Cache:
         return self.shard_path(key).with_suffix(".tools.json")
 
     @staticmethod
-    def _load_tool_rows(path: Path) -> List[List[Any]]:
+    def _load_tool_rows(path: Path, expected: int) -> List[List[Any]]:
+        """Decode a tool sibling, or refuse to guess at what it should hold.
+
+        `stored` already checked the sibling's size, so getting here with
+        the wrong content means the cache was corrupted in a way a stat
+        cannot see. Returning `[]` would report a transcript that called
+        hundreds of tools as one that called none, for as long as its
+        size and mtime stay put - so this raises instead.
+        """
         try:
             rows = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            return []
-        return list(rows) if isinstance(rows, list) else []
+        except (OSError, ValueError) as error:
+            raise CacheShardError(
+                "cached tool rows in %s are unreadable (%s); "
+                "re-run with --rebuild-cache" % (path, error)
+            ) from None
+        if not isinstance(rows, list) or len(rows) != expected:
+            raise CacheShardError(
+                "cached tool rows in %s do not match the shard that names "
+                "them; re-run with --rebuild-cache" % path
+            )
+        return list(rows)
 
     def stored(self, key: str, harness: str) -> Optional[FileIndex]:
         if self.rebuild:
@@ -1889,9 +1918,24 @@ class Cache:
             return None
         if entry.harness != harness:
             return None
-        tools_file = self.tools_path(key)
-        if tools_file.is_file():
-            entry.tools_loader = lambda path=tools_file: self._load_tool_rows(path)
+        if entry.tool_count:
+            # The sibling holds rows this shard is accountable for, so it is
+            # checked here rather than when something finally reads it: a
+            # deleted, truncated, half-written or stale sibling has to make
+            # the whole entry miss, so the transcript is parsed again from
+            # the start. One stat keeps that check off the hot path - the
+            # rows themselves are still only decoded on demand.
+            tools_file = self.tools_path(key)
+            try:
+                if tools_file.stat().st_size != entry.tool_bytes:
+                    return None
+            except OSError:
+                return None
+            entry.tools_loader = (
+                lambda path=tools_file, count=entry.tool_count: self._load_tool_rows(
+                    path, count
+                )
+            )
         self.entries[key] = entry
         return entry
 
@@ -1967,36 +2011,47 @@ class Cache:
             entry = self.entries.get(key)
             if entry is None:
                 continue
-            payload = entry.to_json()
-            payload["path"] = key
             destination = self.shard_path(key)
             destination.parent.mkdir(parents=True, exist_ok=True)
-            self._write_atomic(destination, payload)
+            tools_file = self.tools_path(key)
             # A dirty entry was parsed, and parsing appends to `tools`, so
             # its rows are always loaded here; the guard only keeps an
             # untouched entry from being rewritten from an unread loader.
             if not entry.tools_pending:
-                tools_file = self.tools_path(key)
-                if entry.tools:
-                    self._write_atomic(tools_file, entry.tools)
+                rows = entry.tools
+                entry.tool_count = len(rows)
+                if rows:
+                    entry.tool_bytes = self._write_atomic(tools_file, rows)
                 else:
                     # An empty list would cost a file and a decode per
                     # transcript that never called a tool.
+                    entry.tool_bytes = 0
                     try:
                         tools_file.unlink()
                     except OSError:
                         pass
+            payload = entry.to_json()
+            payload["path"] = key
+            # The main shard is written last so it is the commit point: it
+            # is the only file that records what the sibling must contain,
+            # so an interrupted flush leaves an orphan sibling (harmless,
+            # pruned or overwritten later) rather than a shard pointing at
+            # rows that were never written.
+            self._write_atomic(destination, payload)
         self.dirty.clear()
 
     @staticmethod
-    def _write_atomic(destination: Path, payload: Any) -> None:
+    def _write_atomic(destination: Path, payload: Any) -> int:
+        """Replace `destination` with `payload`; return the bytes written."""
         temporary = destination.with_name(
             "%s.%d.%d.tmp" % (destination.name, os.getpid(), time.time_ns())
         )
         try:
+            blob = json.dumps(payload, separators=(",", ":"))
             with open(temporary, "w", encoding="utf-8") as handle:
-                json.dump(payload, handle, separators=(",", ":"))
+                handle.write(blob)
             os.replace(str(temporary), str(destination))
+            return len(blob.encode("utf-8"))
         finally:
             try:
                 temporary.unlink()
@@ -2072,6 +2127,12 @@ class Scan:
         self.bytes_read = 0
 
     def defer_tools(self, entry: "FileIndex", harness: str) -> None:
+        if self._tools is not None:
+            # The merge has already run, so this file's rows would never
+            # reach it and the report would quietly be short a transcript.
+            raise RuntimeError(
+                "tool rows were absorbed after the merged list was read"
+            )
         self._tool_sources.append((entry, harness))
 
     def filter_tools(

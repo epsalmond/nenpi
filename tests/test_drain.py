@@ -4584,15 +4584,27 @@ class ToolAttribution(Harness):
         QD.attribute_tools = explode
         QD.Cache._load_tool_rows = staticmethod(explode_rows)
         try:
-            for command in ("sessions", "timeline", "windows"):
+            reports = (
+                ["sessions"],
+                ["sessions", "--json"],
+                ["timeline"],
+                ["windows"],
+                ["reductions"],
+                ["verify"],
+            )
+            for report in reports:
                 captured = io.StringIO()
                 stdout, sys.stdout = sys.stdout, captured
                 try:
                     with self.env_applied():
-                        code = QD.main([command, "--harness", "claude", "--no-color", "-q"])
+                        code = QD.main(
+                            report + ["--harness", "claude", "--no-color", "-q"]
+                        )
                 finally:
                     sys.stdout = stdout
-                self.assertEqual(code, 0, "%s failed: %s" % (command, captured.getvalue()))
+                self.assertEqual(
+                    code, 0, "%s failed: %s" % (" ".join(report), captured.getvalue())
+                )
             # And the guard is real: the command that does show tools trips
             # one of them (the shard decode comes first).
             QD.Cache._load_tool_rows = original_rows
@@ -4624,6 +4636,108 @@ class ToolAttribution(Harness):
         # Second run is served from the shard and must agree.
         second = self.run_json("tools", "--harness", "claude", "--json")
         self.assertEqual(first["tools"], second["tools"])
+
+    def tool_sibling(self) -> Path:
+        siblings = list((self.root / "cache").rglob("*.tools.json"))
+        self.assertEqual(len(siblings), 1, siblings)
+        return siblings[0]
+
+    def assert_tools_survive(self, damage) -> None:
+        """Damage the tool sibling; the next run must reparse and recover.
+
+        A sibling that is gone, short, or left over from an interrupted
+        flush must make the whole entry miss, because the alternative is a
+        transcript that called tools being reported as one that called none
+        for as long as its size and mtime stay put.
+        """
+        session = "64000000-1111-2222-3333-444444444444"
+        self.claude_session("sibling.jsonl", session)
+        first = self.run_json("tools", "--harness", "claude", "--json")
+        self.assertEqual(first["tool_calls"], 2)
+        damage(self.tool_sibling())
+        after = self.run_json("tools", "--harness", "claude", "--json")
+        self.assertEqual(after["tool_calls"], 2)
+        self.assertEqual(after["tools"], first["tools"])
+        # And the recovered sibling is usable on the run after that.
+        self.assertEqual(
+            self.run_json("tools", "--harness", "claude", "--json")["tools"],
+            first["tools"],
+        )
+
+    def test_deleted_tool_sibling_is_reparsed(self) -> None:
+        self.assert_tools_survive(lambda path: path.unlink())
+
+    def test_truncated_tool_sibling_is_reparsed(self) -> None:
+        self.assert_tools_survive(
+            lambda path: path.write_text("[[", encoding="utf-8")
+        )
+
+    def test_tool_sibling_with_the_wrong_rows_is_reparsed(self) -> None:
+        # Same shape, fewer rows than the shard says it wrote.
+        def drop_a_row(path: Path) -> None:
+            rows = json.loads(path.read_text(encoding="utf-8"))
+            path.write_text(json.dumps(rows[:1]), encoding="utf-8")
+
+        self.assert_tools_survive(drop_a_row)
+
+    def test_interrupted_flush_leaves_no_silent_gap(self) -> None:
+        """A shard that outlived its sibling must not be trusted.
+
+        The sibling is written first so the main shard is the commit point.
+        A crash in between leaves the previous run's sibling under a shard
+        that names the rows of a longer transcript - the case that used to
+        read back as "the tools before the resume offset never happened".
+        """
+        session = "66000000-1111-2222-3333-444444444444"
+        now = self.claude_session("interrupted.jsonl", session)
+        first = self.run_json("tools", "--harness", "claude", "--json")
+        self.assertEqual(first["tool_calls"], 2)
+        stale_rows = self.tool_sibling().read_text(encoding="utf-8")
+
+        # The transcript grows, so the next flush writes a longer sibling.
+        self.write_claude(
+            "interrupted.jsonl",
+            [
+                claude_tool_use_line(
+                    now + 10, session, "msg_3", [("toolu_c", "Read")],
+                    input_tokens=100, cache_read=2200, output_tokens=20,
+                ),
+                claude_tool_output_line(now + 11, session, "toolu_c", "z" * 600),
+                claude_assistant_line(
+                    now + 12, session, "msg_4",
+                    input_tokens=100, cache_read=3000, output_tokens=30,
+                ),
+            ],
+        )
+        grown = self.run_json("tools", "--harness", "claude", "--json")
+        self.assertEqual(grown["tool_calls"], 3)
+
+        # Roll the sibling back to the pre-append copy, leaving the newer
+        # shard in place: exactly what a crash between the two writes does.
+        self.tool_sibling().write_text(stale_rows, encoding="utf-8")
+        recovered = self.run_json("tools", "--harness", "claude", "--json")
+        self.assertEqual(recovered["tool_calls"], 3)
+        self.assertEqual(recovered["tools"], grown["tools"])
+
+    def test_tool_sibling_is_written_before_the_shard(self) -> None:
+        """The main shard is the commit point, so it must land last."""
+        session = "65000000-1111-2222-3333-444444444444"
+        self.claude_session("order.jsonl", session)
+        self.run_json("tools", "--harness", "claude", "--json")
+        sibling = self.tool_sibling()
+        shard = sibling.with_name(sibling.name.replace(".tools.json", ".json"))
+        self.assertTrue(shard.is_file())
+        self.assertLessEqual(sibling.stat().st_mtime, shard.stat().st_mtime)
+        recorded = json.loads(shard.read_text(encoding="utf-8"))
+        self.assertEqual(recorded["tool_count"], 2)
+        self.assertEqual(recorded["tool_bytes"], sibling.stat().st_size)
+
+    def test_absorbing_tools_after_the_merge_is_refused(self) -> None:
+        scan = QD.Scan()
+        entry = QD.FileIndex("claude")
+        self.assertEqual(scan.tools, {"claude": [], "codex": []})
+        with self.assertRaises(RuntimeError):
+            scan.defer_tools(entry, "claude")
 
     def test_old_schema_shards_are_rebuilt(self) -> None:
         session = "61000000-1111-2222-3333-444444444444"
@@ -5065,10 +5179,11 @@ class PromptRanking(Harness):
         )
         self.assertEqual(second["prompts"][0]["label"], "rank me first please")
 
-    def test_cache_schema_is_six(self) -> None:
-        # Bumped by the tool-row shard split; a v5 shard still carries its
-        # tool rows inline and would read back as a file with none.
-        self.assertEqual(QD.CACHE_SCHEMA, 6)
+    def test_cache_schema_is_seven(self) -> None:
+        # 6 split the tool rows into a sibling shard; 7 added the row count
+        # and size that make the sibling checkable. Either older shard
+        # would read back as a transcript that called no tools.
+        self.assertEqual(QD.CACHE_SCHEMA, 7)
 
     def test_codex_label_comes_from_the_user_message(self) -> None:
         now = time.time() - 3600
