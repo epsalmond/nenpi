@@ -11,6 +11,7 @@ import contextlib
 import io
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -22,6 +23,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import nenpi.config as QC
+from nenpi.settings import SourceSettings, migrate_json_store
 import nenpi.drain as QD
 
 DRAIN_COMMAND = [sys.executable, "-m", "nenpi.drain"]
@@ -269,6 +271,121 @@ def rate_limits(used_percent: float, resets_at: int, window_minutes: int = 300) 
         "rate_limit_reached_type": None,
         "spend_control_reached": None,
     }
+
+
+# Distinctive strings planted in tool inputs and results. Nothing the parser
+# writes - shard, JSON, or text table - may ever contain them.
+TOOL_INPUT_SENTINEL = "ZZINPUTSENTINELZZ-rm-rf-secret-path"
+TOOL_RESULT_SENTINEL = "ZZRESULTSENTINELZZ-api-key-abcdef"
+
+
+def claude_tool_use_line(
+    epoch: float,
+    session_id: str,
+    message_id: str,
+    calls: Sequence[Tuple[str, str]],
+    *,
+    input_tokens: int = 0,
+    cache_read: int = 0,
+    output_tokens: int = 0,
+    sidechain: bool = False,
+) -> str:
+    """An assistant line that issues tool calls: (tool_use_id, tool name)."""
+    return json.dumps(
+        {
+            "type": "assistant",
+            "sessionId": session_id,
+            "cwd": "/home/agent/project",
+            "timestamp": iso(epoch),
+            "requestId": "req_" + message_id,
+            "isSidechain": sidechain,
+            "message": {
+                "id": message_id,
+                "role": "assistant",
+                "model": "claude-opus-5",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": call_id,
+                        "name": name,
+                        "input": {
+                            "command": TOOL_INPUT_SENTINEL,
+                            "nested": {"path": TOOL_INPUT_SENTINEL},
+                        },
+                    }
+                    for call_id, name in calls
+                ],
+                "usage": {
+                    "input_tokens": input_tokens,
+                    "cache_read_input_tokens": cache_read,
+                    "cache_creation_input_tokens": 0,
+                    "output_tokens": output_tokens,
+                },
+            },
+        }
+    )
+
+
+def claude_tool_output_line(
+    epoch: float,
+    session_id: str,
+    call_id: str,
+    payload: Any,
+    *,
+    sidechain: bool = False,
+) -> str:
+    return json.dumps(
+        {
+            "type": "user",
+            "sessionId": session_id,
+            "timestamp": iso(epoch),
+            "isSidechain": sidechain,
+            "toolUseResult": {"stdout": "synthetic"},
+            "message": {
+                "role": "user",
+                "content": [
+                    {"type": "tool_result", "tool_use_id": call_id, "content": payload}
+                ],
+            },
+        }
+    )
+
+
+def codex_tool_call_line(
+    epoch: float,
+    call_id: str,
+    name: str,
+    *,
+    item: str = "function_call",
+    namespace: Optional[str] = None,
+) -> str:
+    payload = {"type": item, "id": "item-" + call_id, "call_id": call_id, "name": name}
+    if namespace is not None:
+        payload["namespace"] = namespace
+    if item == "custom_tool_call":
+        payload["input"] = TOOL_INPUT_SENTINEL
+    else:
+        payload["arguments"] = json.dumps({"command": TOOL_INPUT_SENTINEL})
+    return json.dumps(
+        {"type": "response_item", "timestamp": iso(epoch), "payload": payload}
+    )
+
+
+def codex_tool_output_line(
+    epoch: float, call_id: str, output: Any, *, item: str = "function_call_output"
+) -> str:
+    return json.dumps(
+        {
+            "type": "response_item",
+            "timestamp": iso(epoch),
+            "payload": {
+                "type": item,
+                "id": "out-" + call_id,
+                "call_id": call_id,
+                "output": output,
+            },
+        }
+    )
 
 
 class Harness(unittest.TestCase):
@@ -689,6 +806,16 @@ class MeasuredAttribution(Harness):
             window["top_sessions"][1]["drain_percent"],
         )
 
+    def test_windows_json_carries_full_session_ids(self) -> None:
+        resets_at = int(time.time()) + 7200
+        self.write_two_concurrent_sessions(resets_at, resets_at)
+        payload = self.run_json("windows", "--harness", "codex", "--json")
+        top = payload["windows"][0]["top_sessions"]
+        self.assertEqual(sorted(row["session_id"] for row in top),
+                         ["codex-conc-aaaa", "codex-conc-bbbb"])
+        self.assertEqual([QD.short_id(row["session_id"]) for row in top],
+                         [row["short_id"] for row in top])
+
 
 class DrainIntervalRules(Harness):
     """Unit-level coverage of build_intervals rules (a)/(b)/(c), #16/#17."""
@@ -1108,7 +1235,12 @@ class AttributionCap(Harness):
         self.assertEqual(len(with_prompt_event), QD.EVENT_PROMPT + 1)
         weights = QD.Weights({"codex": {"models": {"m": {"input": 1.0}}}}, ["test"])
         args = argparse.Namespace(long_context_multiplier=1.0, claude_cache_read_weight=None)
-        QD.attribute([interval], [no_prompt_event, with_prompt_event], weights, args)
+        # attribute() falls back to reading state_dir()/"codex-weights.json"
+        # (real ~/.local/state/nenpi without this) when weights aren't
+        # already "calibrated" - apply the fixture's env so that read stays
+        # inside the temp root instead of whatever the host has fitted.
+        with self.env_applied():
+            QD.attribute([interval], [no_prompt_event, with_prompt_event], weights, args)
         session_share = interval.sessions[session_id]
         self.assertAlmostEqual(session_share, 10.0, places=6)
         prompt_total = sum(
@@ -1213,6 +1345,15 @@ class Calibration(Harness):
                 0.05,
                 "%s/%s fitted %.4f, expected %.4f" % (model, kind, actual, expected),
             )
+
+    def test_codex_calibrate_json_names_its_command(self) -> None:
+        """Every other --json payload carries `command`; codex calibrate must too."""
+        self.build_rollouts()
+        payload = self.run_json(
+            "calibrate", "--harness", "codex", "--json", "--calibrate-bucket-hours", "0.01"
+        )
+        self.assertEqual(payload["command"], "calibrate")
+        self.assertEqual(payload["harness"], "codex")
 
     def test_calibrate_persists_and_use_calibrated_reads_it(self) -> None:
         self.build_rollouts()
@@ -2051,6 +2192,17 @@ class ContextReductions(Harness):
         self.assertGreater(rows[0]["saved_units"], 0.0)
         self.assertGreater(rows[0]["saved_units_upper_bound"], rows[0]["saved_units"])
 
+    def test_reductions_json_carries_the_full_session_id(self) -> None:
+        self.codex_run(
+            "codex-red-0003",
+            [100_000, 200_000, 300_000, 40_000, 45_000, 50_000, 55_000],
+            compact_after=3,
+        )
+        payload = self.run_json("reductions", "--harness", "codex", "--json")
+        row = payload["reductions"][0]
+        self.assertEqual(row["session_id"], "codex-red-0003")
+        self.assertEqual(row["short_id"], QD.short_id("codex-red-0003"))
+
     def test_unmarked_drop_is_reported(self) -> None:
         self.codex_run(
             "codex-red-0002", [100_000, 200_000, 300_000, 40_000, 45_000, 50_000, 55_000]
@@ -2609,6 +2761,132 @@ class RangeWindowing(Harness):
             bucket["claude"] + bucket["codex"] for bucket in timeline["buckets"]
         )
         self.assertAlmostEqual(session_units, timeline_units, places=6)
+
+
+class SessionSelection(Harness):
+    PREFIX = "dddd000"
+
+    def build_two_matching_sessions(self) -> Tuple[str, str]:
+        # `second` starts with the whole of `first`, so the full id of `first`
+        # is both an exact match and a prefix of another session.
+        now = time.time() - 1800
+        first = "dddd0001-1111-2222"
+        second = "dddd0001-1111-2222-3333-444444444444"
+        for name, session, output in (
+            ("busy.jsonl", first, 100_000), ("quiet.jsonl", second, 10),
+        ):
+            self.write_claude(
+                name,
+                [
+                    claude_user_prompt_line(now, session),
+                    claude_assistant_line(now + 1, session, "msg_" + name,
+                                          output_tokens=output),
+                ],
+            )
+        return first, second
+
+    def test_ambiguous_session_prefix_fails_with_the_candidates(self) -> None:
+        first, second = self.build_two_matching_sessions()
+        result = self.run_tool("prompts", "--session", self.PREFIX, "--json")
+        self.assertEqual(result.returncode, 1)
+        stderr = result.stderr.decode("utf-8")
+        self.assertIn("matches 2 sessions", stderr)
+        self.assertIn(QD.short_id(first), stderr)
+        self.assertIn(QD.short_id(second), stderr)
+        self.assertEqual(result.stdout.decode("utf-8"), "")
+
+    def test_first_opts_back_into_the_busiest_match(self) -> None:
+        first, _second = self.build_two_matching_sessions()
+        payload = self.run_json("prompts", "--session", self.PREFIX, "--first", "--json")
+        self.assertEqual(payload["session_id"], first)
+
+    def test_full_id_beats_a_shared_prefix(self) -> None:
+        first, _second = self.build_two_matching_sessions()
+        payload = self.run_json("prompts", "--session", first, "--json")
+        self.assertEqual(payload["session_id"], first)
+
+    def test_de_dashed_full_id_still_takes_the_exact_path(self) -> None:
+        first, _second = self.build_two_matching_sessions()
+        payload = self.run_json("prompts", "--session", first.replace("-", ""), "--json")
+        self.assertEqual(payload["session_id"], first)
+
+    def test_one_id_under_two_harnesses_is_still_ambiguous(self) -> None:
+        now = time.time() - 1800
+        session = "ffff0001-1111-2222-3333-444444444444"
+        self.write_claude(
+            "shared.jsonl",
+            [
+                claude_user_prompt_line(now, session),
+                claude_assistant_line(now + 1, session, "msg_shared", output_tokens=100),
+            ],
+        )
+        self.write_codex(
+            "rollout-shared.jsonl",
+            [
+                codex_session_meta_line(now, session, "/shared"),
+                codex_turn_context_line(now, "gpt-5.6-sol"),
+                codex_usage_record_line(now + 2, session, input_tokens=100,
+                                        cached_input_tokens=0, output_tokens=10,
+                                        turn_id="turn-0"),
+            ],
+            day=now,
+        )
+        result = self.run_tool("prompts", "--session", session, "--json")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("matches 2 sessions", result.stderr.decode("utf-8"))
+
+    def test_prompts_json_carries_the_full_session_id(self) -> None:
+        _first, second = self.build_two_matching_sessions()
+        payload = self.run_json("prompts", "--session", second, "--json")
+        self.assertEqual(payload["session_id"], second)
+        self.assertEqual(payload["short_id"], QD.short_id(second))
+
+    def test_no_match_warning_names_the_current_command(self) -> None:
+        self.build_two_matching_sessions()
+        result = self.run_tool("prompts", "--session", "eeee9999", "--json")
+        self.assertEqual(result.returncode, 1)
+        stderr = result.stderr.decode("utf-8")
+        self.assertIn("run `nenpi sessions` for ids", stderr)
+        self.assertNotIn("quota-drain", stderr)
+
+
+class VerifyRange(Harness):
+    def build_two_sessions(self) -> Tuple[str, str]:
+        old_session = "eeee0001-1111-2222-3333-444444444444"
+        new_session = "eeee0002-1111-2222-3333-444444444444"
+        for session, epoch in ((old_session, time.time() - 30 * 86400),
+                               (new_session, time.time() - 600)):
+            self.write_claude(
+                "verify-%s.jsonl" % session[:8],
+                [
+                    claude_assistant_line(epoch, session, "msg_" + session[:8],
+                                          input_tokens=100, output_tokens=200),
+                    claude_cost_state_line(
+                        session,
+                        "claude-opus-5",
+                        {
+                            "inputTokens": 100,
+                            "outputTokens": 200,
+                            "cacheReadInputTokens": 0,
+                            "cacheCreationInputTokens": 0,
+                            "costUSD": 1.0,
+                        },
+                    ),
+                ],
+            )
+        return old_session, new_session
+
+    def test_verify_applies_until(self) -> None:
+        old_session, new_session = self.build_two_sessions()
+        everything = self.run_json("verify", "--harness", "claude", "--json")
+        self.assertEqual(
+            sorted(row["short_id"] for row in everything["rows"]),
+            sorted([QD.short_id(old_session), QD.short_id(new_session)]),
+        )
+        windowed = self.run_json("verify", "--harness", "claude", "--json", "--until", "3d")
+        self.assertEqual([row["short_id"] for row in windowed["rows"]],
+                         [QD.short_id(old_session)])
+        self.assertEqual(windowed["rows"][0]["session_id"], old_session)
 
 
 class CacheIntegrity(Harness):
@@ -3524,6 +3802,1881 @@ class ClaudeAccountPools(Harness):
         self.assertNotIn("org-personal", raw)
         self.assertNotIn("org-arcade", raw)
 
+
+class _StdinWithBuffer:
+    def __init__(self, payload: bytes) -> None:
+        self.buffer = io.BytesIO(payload)
+
+
+class _StdoutWithBuffer:
+    def __init__(self) -> None:
+        self.buffer = io.BytesIO()
+
+    def flush(self) -> None:
+        pass
+
+
+class UnifiedConfigStore(RootsAndConfig):
+    """One store for the CLI and the Sources screen (issue #23)."""
+
+    def test_toml_writer_round_trips_awkward_strings(self) -> None:
+        import tomllib
+
+        config = QC.Config(
+            claude_roots=['/tmp/we"ird', "/tmp/back\\slash", "/tmp/plain"],
+            codex_roots=[],
+            claude_disabled=["/tmp/off"],
+            codex_ignored=["/tmp/gone"],
+            plan_claude="max_20x",
+            ignore_unconfigured=True,
+        )
+        data = tomllib.loads(QC.dump_config(config))
+        self.assertEqual(data["claude"]["roots"], config.claude_roots)
+        self.assertEqual(data["claude"]["disabled"], ["/tmp/off"])
+        self.assertEqual(data["codex"]["roots"], [])
+        self.assertEqual(data["codex"]["ignored"], ["/tmp/gone"])
+        self.assertEqual(data["plan"]["claude"], "max_20x")
+        self.assertTrue(data["general"]["ignore_unconfigured"])
+
+    def test_save_config_then_load_config_is_identity(self) -> None:
+        with self.env_applied():
+            written = QC.Config(
+                claude_roots=[str(self.home / ".claude")],
+                codex_roots=[str(self.home / ".codex")],
+                codex_disabled=[str(self.home / ".codex-off")],
+                plan_codex="pro",
+            )
+            QC.save_config(written, self.config_path())
+            loaded = QC.load_config(self.config_path())
+        self.assertEqual(loaded.claude_roots, written.claude_roots)
+        self.assertEqual(loaded.codex_roots, written.codex_roots)
+        self.assertEqual(loaded.codex_disabled, written.codex_disabled)
+        self.assertEqual(loaded.plan_codex, "pro")
+
+    def test_source_added_in_the_ui_is_visible_to_the_cli(self) -> None:
+        extra = self.make_extra_codex_root(".codex-extra")
+        with self.env_applied():
+            settings = SourceSettings.load(self.config_path(), self.home)
+            settings.add(extra, "codex")
+            settings.save()
+        payload = self.run_json("config", "--json")
+        codex_roots = [row["path"] for row in payload["roots"]
+                       if row["harness"] == "codex"]
+        self.assertIn(str(extra), codex_roots)
+        self.assertTrue(payload["config_present"])
+
+    def test_config_json_is_migrated_with_the_harness_corrected(self) -> None:
+        import tomllib
+
+        claude_extra = self.make_extra_claude_root(".claude-extra")
+        codex_extra = self.make_extra_codex_root(".codex-extra")
+        legacy = self.root / "config" / "config.json"
+        legacy.parent.mkdir(parents=True, exist_ok=True)
+        legacy.write_text(json.dumps({
+            "version": 1,
+            "sources": [
+                {"id": "a", "name": ".claude-extra", "harness": "claude",
+                 "path": str(claude_extra), "enabled": True},
+                # The Sources form saved this one with the wrong harness.
+                {"id": "b", "name": ".codex-extra", "harness": "claude",
+                 "path": str(codex_extra), "enabled": True},
+                {"id": "c", "name": ".claude", "harness": "claude",
+                 "path": str(self.home / ".claude"), "enabled": False},
+            ],
+            "ignored_discovered": [
+                {"harness": "codex", "path": str(self.home / ".codex")}
+            ],
+        }), encoding="utf-8")
+        with self.env_applied():
+            SourceSettings.load(self.config_path(), self.home)
+        data = tomllib.loads(self.config_path().read_text(encoding="utf-8"))
+        self.assertEqual(data["claude"]["roots"], [str(claude_extra)])
+        self.assertEqual(data["claude"]["disabled"], [str(self.home / ".claude")])
+        self.assertEqual(data["codex"]["roots"], [str(codex_extra)])
+        self.assertEqual(data["codex"]["ignored"], [str(self.home / ".codex")])
+        self.assertFalse(legacy.exists())
+        self.assertTrue(legacy.with_name("config.json.migrated").is_file())
+        payload = self.run_json("config", "--json")
+        paths = [row["path"] for row in payload["roots"]]
+        self.assertIn(str(codex_extra), paths)
+        self.assertNotIn(str(self.home / ".claude"), paths)
+
+    def test_disabled_roots_do_not_fall_back_to_the_defaults(self) -> None:
+        """An empty table the user wrote means "scan nothing" (review #1)."""
+
+        self.write_config(
+            '[claude]\nroots = []\ndisabled = ["%s"]\n' % (self.home / ".claude")
+        )
+        payload = self.run_json("config", "--json")
+        self.assertEqual(
+            [row["path"] for row in payload["roots"] if row["harness"] == "claude"], []
+        )
+        # The absent [codex] table still means "no opinion" -> defaults.
+        self.assertEqual(
+            [row["path"] for row in payload["roots"] if row["harness"] == "codex"],
+            [str(self.home / ".codex")],
+        )
+        with self.env_applied():
+            config = QC.load_config(self.config_path())
+            self.assertEqual(QC.resolve_roots("claude", [], config, quiet=True), [])
+
+    def test_source_disabled_in_the_ui_disappears_from_the_cli(self) -> None:
+        now = time.time() - 600
+        self.write_claude(
+            "default.jsonl",
+            [claude_assistant_line(now, "aaaa0001-1111-2222-3333-444444444444",
+                                   "msg_d", output_tokens=10)],
+        )
+        with self.env_applied():
+            settings = SourceSettings.load(self.config_path(), self.home)
+            for source in settings.sources:
+                settings.set_enabled(source.id, False)
+            settings.save()
+        payload = self.run_json("sessions", "--harness", "claude", "--json")
+        self.assertEqual(payload["sessions"], [])
+
+    def test_unknown_tables_and_keys_survive_a_save(self) -> None:
+        import tomllib
+
+        extra_root = self.make_extra_codex_root(".codex-extra")
+        self.write_config(
+            '[ui]\ntheme = "dark"\nrefresh = 30\n\n'
+            '[ui.colors]\naccent = "teal"\n\n'
+            '[claude]\nroots = ["%s"]\nfuture_key = true\n'
+            % (self.home / ".claude")
+        )
+        with self.env_applied():
+            settings = SourceSettings.load(self.config_path(), self.home)
+            settings.add(extra_root, "codex")
+            settings.save()
+        data = tomllib.loads(self.config_path().read_text(encoding="utf-8"))
+        self.assertEqual(data["ui"]["theme"], "dark")
+        self.assertEqual(data["ui"]["refresh"], 30)
+        self.assertEqual(data["ui"]["colors"]["accent"], "teal")
+        self.assertTrue(data["claude"]["future_key"])
+        self.assertIn(str(extra_root), data["codex"]["roots"])
+
+    def test_config_init_force_keeps_unknown_tables_and_ui_state(self) -> None:
+        import tomllib
+
+        disabled = self.make_extra_claude_root(".claude-off")
+        self.write_config(
+            '[ui]\ntheme = "dark"\n\n'
+            '[claude]\nroots = ["%s"]\ndisabled = ["%s"]\n'
+            % (self.home / ".claude", disabled)
+        )
+        result = self.run_tool("config", "--init", "--force")
+        self.assertEqual(result.returncode, 0, result.stderr.decode("utf-8", "replace"))
+        data = tomllib.loads(self.config_path().read_text(encoding="utf-8"))
+        self.assertEqual(data["ui"]["theme"], "dark")
+        self.assertEqual(data["claude"]["disabled"], [str(disabled)])
+        # A disabled root is not reseeded as an enabled one.
+        self.assertNotIn(str(disabled), data["claude"]["roots"])
+        self.assertIn(str(self.home / ".claude"), data["claude"]["roots"])
+
+    def test_cli_alone_migrates_config_json(self) -> None:
+        extra = self.make_extra_codex_root(".codex-extra")
+        legacy = self.root / "config" / "config.json"
+        legacy.parent.mkdir(parents=True, exist_ok=True)
+        legacy.write_text(json.dumps({"version": 1, "sources": [
+            {"id": "a", "name": ".codex-extra", "harness": "codex",
+             "path": str(extra), "enabled": True}]}), encoding="utf-8")
+        result = self.run_tool("config")
+        self.assertEqual(result.returncode, 0, result.stderr.decode("utf-8", "replace"))
+        self.assertIn("imported", result.stderr.decode("utf-8", "replace"))
+        self.assertIn(str(extra), result.stdout.decode("utf-8", "replace"))
+        self.assertTrue(self.config_path().is_file())
+        self.assertTrue(legacy.with_name("config.json.migrated").is_file())
+
+    def test_migration_is_skipped_when_config_toml_exists(self) -> None:
+        self.write_config('[claude]\nroots = ["%s"]\n' % (self.home / ".claude"))
+        legacy = self.root / "config" / "config.json"
+        legacy.write_text('{"version": 1, "sources": []}', encoding="utf-8")
+        with self.env_applied():
+            self.assertIsNone(migrate_json_store(self.config_path()))
+        self.assertTrue(legacy.is_file())
+
+
+class UnconfiguredSiblingNotice(RootsAndConfig):
+    """One stderr note about harness dirs nothing will scan (issue #24)."""
+
+    NOTE = "unconfigured harness dirs"
+
+    def stderr_of(self, *arguments: str) -> str:
+        result = self.run_tool(*arguments)
+        self.assertEqual(result.returncode, 0,
+                         result.stderr.decode("utf-8", "replace"))
+        return result.stderr.decode("utf-8", "replace")
+
+    def test_sibling_dirs_are_reported_once_on_stderr(self) -> None:
+        self.make_extra_claude_root(".claude-extra")
+        self.make_extra_codex_root(".codex-extra")
+        stderr = self.stderr_of("sessions", "--harness", "all")
+        self.assertIn(self.NOTE, stderr)
+        self.assertIn("~/.claude-extra", stderr)
+        self.assertIn("~/.codex-extra", stderr)
+        self.assertEqual(stderr.count(self.NOTE), 1)
+
+    def test_no_note_when_every_sibling_is_configured(self) -> None:
+        extra = self.make_extra_claude_root(".claude-extra")
+        self.write_config(
+            '[claude]\nroots = ["%s", "%s"]\n' % (self.home / ".claude", extra)
+        )
+        self.assertNotIn(self.NOTE, self.stderr_of("sessions", "--harness", "claude"))
+
+    def test_json_output_carries_no_note(self) -> None:
+        self.make_extra_claude_root(".claude-extra")
+        result = self.run_tool("sessions", "--harness", "claude", "--json")
+        self.assertEqual(result.returncode, 0)
+        self.assertNotIn(self.NOTE, result.stderr.decode("utf-8", "replace"))
+
+    def test_ignore_unconfigured_silences_the_note(self) -> None:
+        self.make_extra_claude_root(".claude-extra")
+        self.write_config("[general]\nignore_unconfigured = true\n")
+        self.assertNotIn(self.NOTE, self.stderr_of("sessions", "--harness", "claude"))
+
+    def test_disabled_and_ignored_roots_are_not_unconfigured(self) -> None:
+        extra = self.make_extra_claude_root(".claude-extra")
+        other = self.make_extra_codex_root(".codex-extra")
+        self.write_config(
+            '[claude]\nroots = ["%s"]\ndisabled = ["%s"]\n\n'
+            '[codex]\nroots = ["%s"]\nignored = ["%s"]\n'
+            % (self.home / ".claude", extra, self.home / ".codex", other)
+        )
+        self.assertNotIn(self.NOTE, self.stderr_of("sessions", "--harness", "all"))
+
+    def test_snapshot_stdin_never_globs_or_warns(self) -> None:
+        """The statusline path resolves its own root quietly and globs never.
+
+        It does read the default Claude root to label the snapshot, but that
+        lookup is quiet; the sibling glob must not run on a path the
+        statusline takes on every prompt.
+        """
+
+        self.make_extra_claude_root(".claude-extra")
+        payload = json.dumps({"rate_limits": {"five_hour": {
+            "used_percentage": 10.0, "resets_at": "2026-01-01T00:00:00Z"}}})
+
+        def forbidden(*arguments: Any, **keywords: Any) -> None:
+            raise AssertionError("snapshot --stdin globbed for sibling roots")
+
+        errors = io.StringIO()
+        saved_in, saved_out, saved_err = sys.stdin, sys.stdout, sys.stderr
+        saved_discover = QC.discover_candidate_roots
+        sys.stdin = _StdinWithBuffer(payload.encode("utf-8"))
+        sys.stdout = _StdoutWithBuffer()
+        sys.stderr = errors
+        QC.discover_candidate_roots = forbidden
+        try:
+            with self.env_applied():
+                self.assertEqual(QD.main(["snapshot", "--stdin"]), 0)
+        finally:
+            sys.stdin, sys.stdout, sys.stderr = saved_in, saved_out, saved_err
+            QC.discover_candidate_roots = saved_discover
+        self.assertEqual(errors.getvalue(), "")
+        self.assertTrue((self.root / "state" / "snapshots.jsonl").is_file())
+
+    def test_config_lists_unconfigured_roots(self) -> None:
+        extra = self.make_extra_claude_root(".claude-extra")
+        payload = self.run_json("config", "--json")
+        self.assertEqual(
+            [row["path"] for row in payload["unconfigured_roots"]], [str(extra)]
+        )
+        result = self.run_tool("config")
+        self.assertIn("unconfigured: ~/.claude-extra",
+                      result.stdout.decode("utf-8", "replace"))
+
+
+def synthetic_event(
+    session_id: str,
+    model: str,
+    epoch: float,
+    tokens: Sequence[int],
+    long_context: bool = False,
+    subagent: bool = False,
+    call_id: str = "",
+) -> List[Any]:
+    """One synthetic event row in the layout `absorb`/`build_prompt` expect.
+
+    Never built from a transcript: the numbers are made up so the arithmetic
+    under test is the only thing the assertions depend on.
+    """
+    row = [session_id, model, epoch] + [0] * QD.EVENT_KIND_SLOTS
+    for offset, value in enumerate(tokens):
+        row[QD.EVENT_KINDS + offset] = value
+    row.extend([long_context, subagent, None, None, call_id])
+    return row
+
+
+class CountingMap(dict):
+    """A dict that records how many key lookups went through it.
+
+    Every `Weights` memo test that only compares return values passes with
+    the memo removed, so the tests below count the lookups the memo is
+    supposed to prevent instead.
+    """
+
+    def __init__(self, *arguments: Any, **keywords: Any) -> None:
+        super().__init__(*arguments, **keywords)
+        self.lookups = 0
+
+    def get(self, key: Any, default: Any = None) -> Any:
+        self.lookups += 1
+        return super().get(key, default)
+
+    def __getitem__(self, key: Any) -> Any:
+        self.lookups += 1
+        return super().__getitem__(key)
+
+
+class WeightMemoization(unittest.TestCase):
+    """`Weights` memoizes pure lookups; the memo must not change an answer."""
+
+    def setUp(self) -> None:
+        self.weights = QD.load_weights(False)
+        # A second Weights over instrumented maps, so a lookup that reaches
+        # the table can be counted rather than inferred.
+        self.claude_entry = CountingMap(
+            input=2.0, cache_read=0.2, cache_write_5m=2.5,
+            cache_write_1h=4.0, output=10.0,
+        )
+        self.claude_models = CountingMap({"model-a": self.claude_entry})
+        self.codex_models = CountingMap(
+            {"model-b": CountingMap(input=100.0, cached_input=10.0, output=500.0)}
+        )
+        self.counted = QD.Weights(
+            {
+                "claude": {"unit": "usd_per_mtok", "models": self.claude_models},
+                "codex": {"unit": "credit_units_per_mtok", "models": self.codex_models},
+            },
+            ["test"],
+        )
+
+    def test_repeat_model_entry_does_no_table_lookup(self) -> None:
+        self.assertIsNotNone(self.counted.model_entry("claude", "model-a"))
+        after_first = self.claude_models.lookups
+        self.assertEqual(after_first, 1)
+        for _ in range(5):
+            self.assertIsNotNone(self.counted.model_entry("claude", "model-a"))
+        self.assertEqual(self.claude_models.lookups, after_first)
+
+    def test_a_repeated_miss_is_remembered_as_a_miss(self) -> None:
+        self.assertIsNone(self.counted.model_entry("claude", "no-such-model"))
+        after_first = self.claude_models.lookups
+        self.assertEqual(after_first, 1)
+        for _ in range(5):
+            self.assertIsNone(self.counted.model_entry("claude", "no-such-model"))
+        self.assertEqual(self.claude_models.lookups, after_first)
+
+    def test_repeat_pricing_does_not_reread_the_entry(self) -> None:
+        tokens = {"input": 1_000_000, "output": 1_000_000}
+        self.assertEqual(self.counted.claude_units("model-a", tokens, None), 12.0)
+        after_first = self.claude_entry.lookups
+        self.assertGreater(after_first, 0)
+        for _ in range(5):
+            self.assertEqual(self.counted.claude_units("model-a", tokens, None), 12.0)
+            self.counted.event_vector("claude", "model-a", None)
+            self.counted.event_vector("claude", "model-a", None, True)
+        self.assertEqual(self.claude_entry.lookups, after_first)
+
+    def test_memo_survives_a_miss_without_poisoning_a_hit(self) -> None:
+        self.assertIsNone(self.counted.model_entry("claude", "model-b"))
+        self.assertIsNotNone(self.counted.model_entry("codex", "model-b"))
+        self.assertIsNone(self.counted.model_entry("claude", "model-b"))
+
+    def test_model_entry_returns_the_table_entry(self) -> None:
+        entry = self.weights.model_entry("claude", "claude-sonnet-5")
+        self.assertIsNotNone(entry)
+        self.assertEqual(
+            self.weights.table["claude"]["models"]["claude-sonnet-5"], entry
+        )
+
+    def test_memo_does_not_leak_between_harnesses(self) -> None:
+        # "gpt-5.5" is a Codex model and has no Claude entry; a memo keyed on
+        # the model alone would hand the Codex entry back for Claude.
+        self.assertIsNotNone(self.weights.model_entry("codex", "gpt-5.5"))
+        self.assertIsNone(self.weights.model_entry("claude", "gpt-5.5"))
+        self.assertIsNotNone(self.weights.model_entry("codex", "gpt-5.5"))
+
+    def test_invalidate_picks_up_a_table_edit(self) -> None:
+        self.assertIsNone(self.weights.model_entry("codex", "made-up-model"))
+        self.weights.table["codex"]["models"]["made-up-model"] = {
+            "input": 1.0, "cached_input": 0.5, "output": 2.0
+        }
+        self.assertIsNone(self.weights.model_entry("codex", "made-up-model"))
+        self.weights.invalidate()
+        self.assertIsNotNone(self.weights.model_entry("codex", "made-up-model"))
+        self.assertEqual(
+            self.weights.codex_units("made-up-model", {"input": 1_000_000}), 1.0
+        )
+
+    def test_cache_read_weight_is_part_of_the_key(self) -> None:
+        tokens = {"cache_read": 1_000_000}
+        plain = self.weights.claude_units("claude-sonnet-5", tokens, None)
+        weighted = self.weights.claude_units("claude-sonnet-5", tokens, 1.0)
+        self.assertNotEqual(plain, weighted)
+        # Re-asking in the other order must not serve the other row's memo.
+        self.assertEqual(self.weights.claude_units("claude-sonnet-5", tokens, 1.0), weighted)
+        self.assertEqual(self.weights.claude_units("claude-sonnet-5", tokens, None), plain)
+
+
+class EventVectorEquivalence(unittest.TestCase):
+    """`event_vector` + `vector_units` must be bit-identical to the dict path."""
+
+    def setUp(self) -> None:
+        self.weights = QD.load_weights(False)
+        self.args = argparse.Namespace(
+            claude_cache_read_weight=None, long_context_multiplier=1.0
+        )
+
+    def check(self, harness: str, model: str, tokens: Sequence[int]) -> None:
+        kinds = QD.CLAUDE_KINDS if harness == "claude" else QD.CODEX_KINDS
+        row = synthetic_event("s1", model, 1_700_000_000.0, tokens)
+        as_dict = QD.event_tokens(row, kinds)
+        for cache_read_weight in (None, 0.0, 0.1, 0.5):
+            vector = self.weights.event_vector(harness, model, cache_read_weight)
+            expected = QD.weighted_units(
+                harness, model, as_dict, self.weights,
+                argparse.Namespace(
+                    claude_cache_read_weight=cache_read_weight,
+                    long_context_multiplier=1.0,
+                ),
+            )
+            actual = 0.0 if vector is None else QD.vector_units(vector, row)
+            self.assertEqual(actual, expected, (harness, model, cache_read_weight))
+            input_vector = self.weights.event_vector(
+                harness, model, cache_read_weight, True
+            )
+            expected_input = QD.input_side_units(
+                harness, model, as_dict, self.weights, cache_read_weight
+            )
+            actual_input = 0.0 if input_vector is None else QD.vector_units(input_vector, row)
+            self.assertEqual(actual_input, expected_input, (harness, model, cache_read_weight))
+
+    def test_claude_models(self) -> None:
+        for model in ("claude-sonnet-5", "claude-opus-5", "unweighted-nonsense"):
+            self.check("claude", model, (11_111, 222_222, 3_333, 444, 55_555))
+
+    def test_codex_models(self) -> None:
+        for model in ("gpt-5.5", "gpt-5.4", "unweighted-nonsense"):
+            self.check("codex", model, (98_765, 4_321_000, 777, 12_345))
+
+    def test_output_is_priced_out_of_the_input_side_vector(self) -> None:
+        row = synthetic_event("s1", "claude-sonnet-5", 1.0, (0, 0, 0, 0, 1_000_000))
+        vector = self.weights.event_vector("claude", "claude-sonnet-5", None, True)
+        self.assertEqual(QD.vector_units(vector, row), 0.0)
+        full = self.weights.event_vector("claude", "claude-sonnet-5", None, False)
+        self.assertGreater(QD.vector_units(full, row), 0.0)
+
+    def test_unweighted_model_has_no_vector(self) -> None:
+        self.assertIsNone(self.weights.event_vector("codex", "not-a-real-model"))
+        self.assertIsNone(self.weights.event_vector("claude", "not-a-real-model"))
+
+
+class ProfileFlag(Harness):
+    def test_profile_prints_phase_timings_to_stderr(self) -> None:
+        now = time.time() - 600
+        session = "77777777-aaaa-2222-3333-444444444444"
+        self.write_claude(
+            "profiled.jsonl",
+            [claude_assistant_line(now, session, "msg_1", output_tokens=100)],
+        )
+        result = self.run_tool("sessions", "--harness", "claude", "--profile")
+        self.assertEqual(result.returncode, 0, result.stderr.decode("utf-8", "replace"))
+        report = result.stderr.decode("utf-8")
+        for phase in ("scan", "totals", "prompts", "intervals", "attribute", "total"):
+            self.assertRegex(report, r"nenpi: %s +\d+\.\d+s" % phase)
+        # The report is stderr-only, so piping stdout to jq or a table stays clean.
+        self.assertNotIn("nenpi: total", result.stdout.decode("utf-8"))
+
+    def test_profile_is_silent_by_default(self) -> None:
+        now = time.time() - 600
+        session = "88888888-aaaa-2222-3333-444444444444"
+        self.write_claude(
+            "quiet.jsonl",
+            [claude_assistant_line(now, session, "msg_1", output_tokens=100)],
+        )
+        result = self.run_tool("sessions", "--harness", "claude")
+        self.assertEqual(result.returncode, 0, result.stderr.decode("utf-8", "replace"))
+        self.assertNotIn("nenpi: total", result.stderr.decode("utf-8"))
+
+    def test_nenpi_profile_env_var_turns_it_on(self) -> None:
+        now = time.time() - 600
+        session = "99999999-aaaa-2222-3333-444444444444"
+        self.write_claude(
+            "env.jsonl",
+            [claude_assistant_line(now, session, "msg_1", output_tokens=100)],
+        )
+        result = self.run_tool(
+            "sessions", "--harness", "claude", extra_env={"NENPI_PROFILE": "1"}
+        )
+        self.assertEqual(result.returncode, 0, result.stderr.decode("utf-8", "replace"))
+        self.assertIn("nenpi: total", result.stderr.decode("utf-8"))
+
+
+class ToolAttribution(Harness):
+    """Tool names and result SIZES only; never a byte of tool content."""
+
+    def claude_session(self, name: str, session: str) -> float:
+        now = time.time() - 3600
+        self.write_claude(
+            name,
+            [
+                claude_user_prompt_line(now, session),
+                claude_tool_use_line(
+                    now + 1, session, "msg_1",
+                    [("toolu_a", "Bash"), ("toolu_b", "mcp__github__list_issues")],
+                    input_tokens=100, cache_read=1000, output_tokens=20,
+                ),
+                claude_tool_output_line(now + 2, session, "toolu_a", "x" * 400),
+                claude_tool_output_line(
+                    now + 3, session, "toolu_b",
+                    [{"type": "text", "text": "y" * 800}],
+                ),
+                claude_assistant_line(
+                    now + 4, session, "msg_2",
+                    input_tokens=100, cache_read=2200, output_tokens=30,
+                ),
+            ],
+        )
+        return now
+
+    def two_matching_tool_sessions(self) -> Tuple[str, str]:
+        """Two sessions with tool calls, one id a strict prefix of the other."""
+        busy = "20000000-1111-2222"
+        quiet = "20000000-1111-2222-3333-444444444444"
+        now = time.time() - 3600
+        for tag, session, output in (("busy", busy, 100_000), ("quiet", quiet, 10)):
+            self.write_claude(
+                "tools-%s.jsonl" % tag,
+                [
+                    claude_user_prompt_line(now, session),
+                    claude_tool_use_line(
+                        now + 1, session, "msg_%s_1" % tag, [("toolu_%s" % tag, "Bash")],
+                        input_tokens=100, cache_read=1000, output_tokens=output,
+                    ),
+                    claude_tool_output_line(now + 2, session, "toolu_%s" % tag, "x" * 400),
+                    claude_assistant_line(
+                        now + 3, session, "msg_%s_2" % tag,
+                        input_tokens=100, cache_read=2200, output_tokens=30,
+                    ),
+                ],
+            )
+        return busy, quiet
+
+    def test_tools_ambiguous_session_prefix_fails(self) -> None:
+        busy, _quiet = self.two_matching_tool_sessions()
+        result = self.run_tool("tools", "--harness", "claude", "--session", "2000000", "--json")
+        self.assertEqual(result.returncode, 1)
+        stderr = result.stderr.decode("utf-8")
+        self.assertIn("matches 2 sessions", stderr)
+        self.assertEqual(result.stdout.decode("utf-8"), "")
+        # The full id still resolves, even though it prefixes the other one.
+        payload = self.run_json("tools", "--harness", "claude", "--session", busy, "--json")
+        self.assertEqual(payload["session_id"], busy)
+        self.assertEqual(payload["session"], QD.short_id(busy))
+
+    def test_tools_first_picks_the_busiest_match(self) -> None:
+        busy, _quiet = self.two_matching_tool_sessions()
+        payload = self.run_json(
+            "tools", "--harness", "claude", "--session", "2000000", "--first", "--json"
+        )
+        self.assertEqual(payload["session_id"], busy)
+
+    def test_claude_tool_names_and_sizes_are_parsed(self) -> None:
+        session = "10000000-1111-2222-3333-444444444444"
+        self.claude_session("tools.jsonl", session)
+        payload = self.run_json("tools", "--harness", "claude", "--json")
+        names = dict((row["tool"], row) for row in payload["tools"])
+        self.assertEqual(sorted(names), ["Bash", "mcp__github__list_issues"])
+        self.assertEqual(names["Bash"]["result_chars"], 400)
+        self.assertEqual(names["Bash"]["est_tokens"], 100.0)
+        # MCP names survive whole, server and tool.
+        self.assertEqual(names["mcp__github__list_issues"]["result_chars"], 800)
+        self.assertEqual(payload["tool_calls"], 2)
+
+    def test_measured_growth_splits_over_the_turn(self) -> None:
+        session = "11000000-1111-2222-3333-444444444444"
+        self.claude_session("measured.jsonl", session)
+        payload = self.run_json("tools", "--harness", "claude", "--json")
+        names = dict((row["tool"], row) for row in payload["tools"])
+        # Context grew 1100 -> 2300 tokens across the two calls; the split is
+        # proportional to the 400/800 result sizes.
+        self.assertAlmostEqual(names["Bash"]["measured_tokens"], 400.0, places=6)
+        self.assertAlmostEqual(
+            names["mcp__github__list_issues"]["measured_tokens"], 800.0, places=6
+        )
+        self.assertEqual(payload["context_growth_tokens"], 1200)
+
+    def test_unmatched_tool_result_is_kept_as_unknown(self) -> None:
+        session = "12000000-1111-2222-3333-444444444444"
+        now = time.time() - 3600
+        self.write_claude(
+            "orphan.jsonl",
+            [
+                claude_user_prompt_line(now, session),
+                claude_assistant_line(now + 1, session, "msg_1", output_tokens=5),
+                claude_tool_output_line(now + 2, session, "toolu_missing", "z" * 40),
+            ],
+        )
+        payload = self.run_json("tools", "--harness", "claude", "--json")
+        self.assertEqual([row["tool"] for row in payload["tools"]], ["unknown"])
+        self.assertEqual(payload["tools"][0]["result_chars"], 40)
+
+    def test_claude_subagent_spawn_is_flagged(self) -> None:
+        session = "13000000-1111-2222-3333-444444444444"
+        now = time.time() - 3600
+        self.write_claude(
+            "spawn.jsonl",
+            [
+                claude_user_prompt_line(now, session),
+                claude_tool_use_line(
+                    now + 1, session, "msg_1", [("toolu_t", "Task")], output_tokens=5
+                ),
+                claude_tool_output_line(now + 2, session, "toolu_t", "s" * 20),
+            ],
+        )
+        payload = self.run_json("tools", "--harness", "claude", "--json")
+        self.assertEqual(payload["tools"][0]["spawns"], 1)
+        self.assertTrue(payload["largest_results"][0]["spawned_subagent"])
+
+    def codex_session(self, name: str, session: str) -> float:
+        now = time.time() - 3600
+        self.write_codex(
+            name,
+            [
+                codex_session_meta_line(now, session, "/home/agent/project"),
+                codex_turn_context_line(now + 1, "gpt-5-codex"),
+                codex_task_started_line(now + 1),
+                codex_tool_call_line(now + 2, "call_1", "exec", item="custom_tool_call"),
+                codex_tool_output_line(
+                    now + 3, "call_1",
+                    [{"type": "text", "text": "a" * 600}],
+                    item="custom_tool_call_output",
+                ),
+                codex_tool_call_line(
+                    now + 4, "call_2", "search", namespace="mcp__docs"
+                ),
+                codex_tool_output_line(now + 5, "call_2", "b" * 200),
+                codex_usage_record_line(
+                    now + 6, session, input_tokens=5000,
+                    cached_input_tokens=1000, output_tokens=50, turn_id="turn-1",
+                ),
+            ],
+            day=now,
+        )
+        return now
+
+    def test_codex_function_and_custom_tool_calls_are_parsed(self) -> None:
+        session = "20000000-1111-2222-3333-444444444444"
+        self.codex_session("rollout-tools.jsonl", session)
+        payload = self.run_json("tools", "--harness", "codex", "--json")
+        names = dict((row["tool"], row) for row in payload["tools"])
+        self.assertEqual(sorted(names), ["exec", "mcp__docs.search"])
+        self.assertEqual(names["exec"]["result_chars"], 600)
+        self.assertEqual(names["mcp__docs.search"]["result_chars"], 200)
+
+    def test_session_prefix_scopes_the_report(self) -> None:
+        first = "30000000-1111-2222-3333-444444444444"
+        second = "40000000-1111-2222-3333-444444444444"
+        self.claude_session("one.jsonl", first)
+        now = time.time() - 3600
+        self.write_claude(
+            "two.jsonl",
+            [
+                claude_user_prompt_line(now, second),
+                claude_tool_use_line(
+                    now + 1, second, "msg_9", [("toolu_z", "Read")], output_tokens=5
+                ),
+                claude_tool_output_line(now + 2, second, "toolu_z", "q" * 120),
+            ],
+        )
+        payload = self.run_json(
+            "tools", "--harness", "claude", "--session", "40000000", "--json"
+        )
+        self.assertEqual([row["tool"] for row in payload["tools"]], ["Read"])
+        self.assertEqual(payload["session"], "40000000")
+
+    def test_text_output_lists_tools_without_content(self) -> None:
+        session = "50000000-1111-2222-3333-444444444444"
+        self.claude_session("text.jsonl", session)
+        result = self.run_tool("tools", "--harness", "claude", "--no-color")
+        self.assertEqual(result.returncode, 0, result.stderr.decode("utf-8", "replace"))
+        text = result.stdout.decode("utf-8")
+        self.assertIn("Bash", text)
+        self.assertIn("mcp__github__list_issues", text)
+        self.assertIn("largest single results", text)
+        self.assertNotIn("x" * 20, text)
+        self.assertNotIn("y" * 20, text)
+
+    def test_sort_by_calls(self) -> None:
+        session = "51000000-1111-2222-3333-444444444444"
+        now = time.time() - 3600
+        lines = [claude_user_prompt_line(now, session)]
+        for step in range(3):
+            lines.append(
+                claude_tool_use_line(
+                    now + 1 + step, session, "msg_%d" % step,
+                    [("toolu_s%d" % step, "Read")], output_tokens=5,
+                )
+            )
+            lines.append(
+                claude_tool_output_line(now + 1.5 + step, session, "toolu_s%d" % step, "r" * 10)
+            )
+        lines.append(
+            claude_tool_use_line(now + 8, session, "msg_big", [("toolu_big", "Bash")],
+                                 output_tokens=5)
+        )
+        lines.append(claude_tool_output_line(now + 9, session, "toolu_big", "B" * 5000))
+        self.write_claude("sorted.jsonl", lines)
+        by_context = self.run_json("tools", "--harness", "claude", "--json")
+        self.assertEqual(by_context["tools"][0]["tool"], "Bash")
+        by_calls = self.run_json(
+            "tools", "--harness", "claude", "--sort", "calls", "--json"
+        )
+        self.assertEqual(by_calls["tools"][0]["tool"], "Read")
+
+    def test_prompts_tools_columns_are_opt_in(self) -> None:
+        session = "52000000-1111-2222-3333-444444444444"
+        self.claude_session("prompt-tools.jsonl", session)
+        plain = self.run_tool(
+            "prompts", "--session", "52000000", "--harness", "claude", "--no-color"
+        )
+        self.assertEqual(plain.returncode, 0, plain.stderr.decode("utf-8", "replace"))
+        self.assertNotIn("largest tool", plain.stdout.decode("utf-8"))
+        with_tools = self.run_tool(
+            "prompts", "--session", "52000000", "--harness", "claude",
+            "--no-color", "--tools",
+        )
+        self.assertEqual(with_tools.returncode, 0,
+                         with_tools.stderr.decode("utf-8", "replace"))
+        text = with_tools.stdout.decode("utf-8")
+        self.assertIn("largest tool", text)
+        self.assertIn("mcp__github__li", text)
+        payload = self.run_json(
+            "prompts", "--session", "52000000", "--harness", "claude", "--json"
+        )
+        prompt = payload["prompts"][0]
+        self.assertEqual(prompt["tool_calls"], 2)
+        self.assertEqual(prompt["tool_result_chars"], 1200)
+        self.assertEqual(prompt["largest_tool"], "mcp__github__list_issues")
+
+    def test_reports_that_show_no_tools_never_attribute_them(self) -> None:
+        """`sessions`/`timeline` must not pay for anything tool-shaped.
+
+        Attribution is a second pass over every recorded tool result and
+        every API call, and decoding the tool shards is a fifth of the
+        cached bytes. Neither report shows a byte of either. Patching both
+        to raise is the only check that stays honest as the pipeline moves:
+        a timing assertion would not.
+        """
+        session = "53000000-1111-2222-3333-444444444444"
+        self.claude_session("lazy-tools.jsonl", session)
+
+        def explode(*_args: Any, **_kwargs: Any) -> None:
+            raise AssertionError("tool attribution ran for a report without tools")
+
+        def explode_rows(*_args: Any, **_kwargs: Any) -> None:
+            raise AssertionError("a tool shard was decoded for a report without tools")
+
+        original = QD.attribute_tools
+        original_rows = QD.Cache._load_tool_rows
+        QD.attribute_tools = explode
+        QD.Cache._load_tool_rows = staticmethod(explode_rows)
+        try:
+            reports = (
+                ["sessions"],
+                ["sessions", "--json"],
+                ["timeline"],
+                ["windows"],
+                ["reductions"],
+                ["verify"],
+            )
+            for report in reports:
+                captured = io.StringIO()
+                stdout, sys.stdout = sys.stdout, captured
+                try:
+                    with self.env_applied():
+                        code = QD.main(
+                            report + ["--harness", "claude", "--no-color", "-q"]
+                        )
+                finally:
+                    sys.stdout = stdout
+                self.assertEqual(
+                    code, 0, "%s failed: %s" % (" ".join(report), captured.getvalue())
+                )
+            # And the guard is real: the command that does show tools trips
+            # one of them (the shard decode comes first).
+            QD.Cache._load_tool_rows = original_rows
+            captured = io.StringIO()
+            stdout, sys.stdout = sys.stdout, captured
+            try:
+                with self.env_applied():
+                    with self.assertRaises(AssertionError):
+                        QD.main(["tools", "--harness", "claude", "--no-color", "-q"])
+            finally:
+                sys.stdout = stdout
+        finally:
+            QD.attribute_tools = original
+            QD.Cache._load_tool_rows = original_rows
+
+    def test_shard_round_trip_stores_sizes_only(self) -> None:
+        session = "60000000-1111-2222-3333-444444444444"
+        self.claude_session("shard.jsonl", session)
+        first = self.run_json("tools", "--harness", "claude", "--json")
+        shards = list((self.root / "cache").rglob("*.json"))
+        self.assertTrue(shards)
+        blob = "\n".join(path.read_text(encoding="utf-8") for path in shards)
+        self.assertIn("Bash", blob)
+        self.assertNotIn("x" * 20, blob)
+        self.assertNotIn("y" * 20, blob)
+        # The redacted one-line prompt label is stored on purpose (#26); the
+        # tool payloads around it still are not.
+        self.assertIn("do the thing", blob)
+        # Second run is served from the shard and must agree.
+        second = self.run_json("tools", "--harness", "claude", "--json")
+        self.assertEqual(first["tools"], second["tools"])
+
+    def tool_sibling(self) -> Path:
+        siblings = list((self.root / "cache").rglob("*.tools.json"))
+        self.assertEqual(len(siblings), 1, siblings)
+        return siblings[0]
+
+    def assert_tools_survive(self, damage) -> None:
+        """Damage the tool sibling; the next run must reparse and recover.
+
+        A sibling that is gone, short, or left over from an interrupted
+        flush must make the whole entry miss, because the alternative is a
+        transcript that called tools being reported as one that called none
+        for as long as its size and mtime stay put.
+        """
+        session = "64000000-1111-2222-3333-444444444444"
+        self.claude_session("sibling.jsonl", session)
+        first = self.run_json("tools", "--harness", "claude", "--json")
+        self.assertEqual(first["tool_calls"], 2)
+        damage(self.tool_sibling())
+        after = self.run_json("tools", "--harness", "claude", "--json")
+        self.assertEqual(after["tool_calls"], 2)
+        self.assertEqual(after["tools"], first["tools"])
+        # And the recovered sibling is usable on the run after that.
+        self.assertEqual(
+            self.run_json("tools", "--harness", "claude", "--json")["tools"],
+            first["tools"],
+        )
+
+    def test_deleted_tool_sibling_is_reparsed(self) -> None:
+        self.assert_tools_survive(lambda path: path.unlink())
+
+    def test_truncated_tool_sibling_is_reparsed(self) -> None:
+        self.assert_tools_survive(
+            lambda path: path.write_text("[[", encoding="utf-8")
+        )
+
+    def test_tool_sibling_with_the_wrong_rows_is_reparsed(self) -> None:
+        # Same shape, fewer rows than the shard says it wrote.
+        def drop_a_row(path: Path) -> None:
+            rows = json.loads(path.read_text(encoding="utf-8"))
+            path.write_text(json.dumps(rows[:1]), encoding="utf-8")
+
+        self.assert_tools_survive(drop_a_row)
+
+    def test_interrupted_flush_leaves_no_silent_gap(self) -> None:
+        """A shard that outlived its sibling must not be trusted.
+
+        The sibling is written first so the main shard is the commit point.
+        A crash in between leaves the previous run's sibling under a shard
+        that names the rows of a longer transcript - the case that used to
+        read back as "the tools before the resume offset never happened".
+        """
+        session = "66000000-1111-2222-3333-444444444444"
+        now = self.claude_session("interrupted.jsonl", session)
+        first = self.run_json("tools", "--harness", "claude", "--json")
+        self.assertEqual(first["tool_calls"], 2)
+        stale_rows = self.tool_sibling().read_text(encoding="utf-8")
+
+        # The transcript grows, so the next flush writes a longer sibling.
+        self.write_claude(
+            "interrupted.jsonl",
+            [
+                claude_tool_use_line(
+                    now + 10, session, "msg_3", [("toolu_c", "Read")],
+                    input_tokens=100, cache_read=2200, output_tokens=20,
+                ),
+                claude_tool_output_line(now + 11, session, "toolu_c", "z" * 600),
+                claude_assistant_line(
+                    now + 12, session, "msg_4",
+                    input_tokens=100, cache_read=3000, output_tokens=30,
+                ),
+            ],
+        )
+        grown = self.run_json("tools", "--harness", "claude", "--json")
+        self.assertEqual(grown["tool_calls"], 3)
+
+        # Roll the sibling back to the pre-append copy, leaving the newer
+        # shard in place: exactly what a crash between the two writes does.
+        self.tool_sibling().write_text(stale_rows, encoding="utf-8")
+        recovered = self.run_json("tools", "--harness", "claude", "--json")
+        self.assertEqual(recovered["tool_calls"], 3)
+        self.assertEqual(recovered["tools"], grown["tools"])
+
+    def test_tool_sibling_is_written_before_the_shard(self) -> None:
+        """The main shard is the commit point, so it must land last."""
+        session = "65000000-1111-2222-3333-444444444444"
+        self.claude_session("order.jsonl", session)
+        self.run_json("tools", "--harness", "claude", "--json")
+        sibling = self.tool_sibling()
+        shard = sibling.with_name(sibling.name.replace(".tools.json", ".json"))
+        self.assertTrue(shard.is_file())
+        self.assertLessEqual(sibling.stat().st_mtime, shard.stat().st_mtime)
+        recorded = json.loads(shard.read_text(encoding="utf-8"))
+        self.assertEqual(recorded["tool_count"], 2)
+        self.assertEqual(recorded["tool_bytes"], sibling.stat().st_size)
+
+    def test_absorbing_tools_after_the_merge_is_refused(self) -> None:
+        scan = QD.Scan()
+        entry = QD.FileIndex("claude")
+        self.assertEqual(scan.tools, {"claude": [], "codex": []})
+        with self.assertRaises(RuntimeError):
+            scan.defer_tools(entry, "claude")
+
+    def test_old_schema_shards_are_rebuilt(self) -> None:
+        session = "61000000-1111-2222-3333-444444444444"
+        self.claude_session("schema.jsonl", session)
+        self.run_json("sessions", "--harness", "claude", "--json")
+        current = self.root / "cache" / ("v%d" % QD.CACHE_SCHEMA)
+        self.assertTrue(current.is_dir())
+        stale = self.root / "cache" / ("v%d" % (QD.CACHE_SCHEMA - 1))
+        stale.mkdir(parents=True, exist_ok=True)
+        (stale / "old.json").write_text("{}", encoding="utf-8")
+        payload = self.run_json("tools", "--harness", "claude", "--json")
+        self.assertFalse(stale.exists())
+        self.assertEqual(payload["tool_calls"], 2)
+
+    def test_replayed_tool_calls_count_once(self) -> None:
+        session = "62000000-1111-2222-3333-444444444444"
+        resumed = "63000000-1111-2222-3333-444444444444"
+        now = time.time() - 3600
+        lines = [
+            claude_user_prompt_line(now, session),
+            claude_tool_use_line(
+                now + 1, session, "msg_1", [("toolu_r", "Grep")], output_tokens=5
+            ),
+            claude_tool_output_line(now + 2, session, "toolu_r", "g" * 100),
+        ]
+        self.write_claude("origin.jsonl", lines)
+        # A resumed transcript replays the same call under a new session id.
+        self.write_claude(
+            "resumed.jsonl",
+            [line.replace(session, resumed) for line in lines],
+        )
+        payload = self.run_json("tools", "--harness", "claude", "--json")
+        self.assertEqual(payload["tool_calls"], 1)
+
+
+    def test_tool_input_and_output_never_leave_the_parser(self) -> None:
+        """Sentinels planted in tool inputs and results must not surface."""
+        session = "64000000-1111-2222-3333-444444444444"
+        codex_session = "65000000-1111-2222-3333-444444444444"
+        now = time.time() - 3600
+        self.write_claude(
+            "sentinel.jsonl",
+            [
+                claude_user_prompt_line(now, session),
+                claude_tool_use_line(
+                    now + 1, session, "msg_1",
+                    [("toolu_a", "Bash"), ("toolu_b", "Read")],
+                    input_tokens=100, cache_read=1000, output_tokens=20,
+                ),
+                claude_tool_output_line(
+                    now + 2, session, "toolu_a",
+                    "head " + TOOL_RESULT_SENTINEL + " tail",
+                ),
+                claude_tool_output_line(
+                    now + 3, session, "toolu_b",
+                    [{"type": "text", "text": TOOL_RESULT_SENTINEL},
+                     {"type": "other", "blob": TOOL_RESULT_SENTINEL}],
+                ),
+                claude_assistant_line(
+                    now + 4, session, "msg_2",
+                    input_tokens=100, cache_read=2200, output_tokens=30,
+                ),
+            ],
+        )
+        self.write_codex(
+            "rollout-sentinel.jsonl",
+            [
+                codex_session_meta_line(now, codex_session, "/home/agent/project"),
+                codex_turn_context_line(now + 1, "gpt-5-codex"),
+                codex_task_started_line(now + 1),
+                codex_tool_call_line(now + 2, "call_s", "exec", item="custom_tool_call"),
+                codex_tool_output_line(
+                    now + 3, "call_s",
+                    [{"type": "text", "text": TOOL_RESULT_SENTINEL}],
+                    item="custom_tool_call_output",
+                ),
+                codex_usage_record_line(
+                    now + 4, codex_session, input_tokens=5000,
+                    cached_input_tokens=1000, output_tokens=50, turn_id="turn-1",
+                ),
+            ],
+            day=now,
+        )
+        outputs = [
+            self.run_tool("tools", "--no-color").stdout,
+            self.run_tool("tools", "--json").stdout,
+            self.run_tool("sessions", "--json").stdout,
+            self.run_tool(
+                "prompts", "--session", "64000000", "--tools", "--no-color"
+            ).stdout,
+            self.run_tool("prompts", "--session", "64000000", "--json").stdout,
+        ]
+        shards = list((self.root / "cache").rglob("*.json"))
+        self.assertTrue(shards)
+        outputs.extend(path.read_bytes() for path in shards)
+        for blob in outputs:
+            text = blob.decode("utf-8", "replace")
+            self.assertNotIn(TOOL_INPUT_SENTINEL, text)
+            self.assertNotIn(TOOL_RESULT_SENTINEL, text)
+        # The sizes still made it through, so the screen is not just dropping
+        # the lines it is supposed to measure.
+        payload = self.run_json("tools", "--json")
+        self.assertEqual(payload["tool_calls"], 3)
+        self.assertGreater(payload["result_chars"], 0)
+
+    def test_structured_result_size_counts_nested_strings(self) -> None:
+        session = "66000000-1111-2222-3333-444444444444"
+        now = time.time() - 3600
+        self.write_claude(
+            "nested.jsonl",
+            [
+                claude_user_prompt_line(now, session),
+                claude_tool_use_line(
+                    now + 1, session, "msg_1", [("toolu_n", "Read")], output_tokens=5
+                ),
+                claude_tool_output_line(
+                    now + 2, session, "toolu_n",
+                    [{"kind": "x" * 10, "rows": ["y" * 20, "z" * 30]}],
+                ),
+            ],
+        )
+        payload = self.run_json("tools", "--harness", "claude", "--json")
+        # keys "kind" (4) + "rows" (4) plus the nested strings 10 + 20 + 30.
+        self.assertEqual(payload["tools"][0]["result_chars"], 68)
+
+    def test_pending_tool_ids_expire_at_the_next_prompt(self) -> None:
+        """A result can never arrive after the next turn has started."""
+        session = "67000000-1111-2222-3333-444444444444"
+        now = time.time() - 3600
+        self.write_claude(
+            "expire.jsonl",
+            [
+                claude_user_prompt_line(now, session),
+                claude_tool_use_line(
+                    now + 1, session, "msg_1", [("toolu_x", "Bash")], output_tokens=5
+                ),
+                # No result: the call was interrupted.
+                claude_user_prompt_line(now + 2, session),
+                claude_tool_use_line(
+                    now + 3, session, "msg_2", [("toolu_x", "Read")], output_tokens=5
+                ),
+                claude_tool_output_line(now + 4, session, "toolu_x", "n" * 80),
+            ],
+        )
+        payload = self.run_json("tools", "--harness", "claude", "--json")
+        # The recycled id resolves to the live call, not the abandoned one.
+        self.assertEqual([row["tool"] for row in payload["tools"]], ["Read"])
+        with self.env_applied():
+            index = QD.parse_claude_file(
+                self.claude_projects / "proj" / "expire.jsonl", QD.FileIndex("claude")
+            )
+        self.assertEqual(index.pending_tools, [])
+
+    def test_text_output_marks_measured_as_an_upper_bound(self) -> None:
+        session = "68000000-1111-2222-3333-444444444444"
+        self.claude_session("bound.jsonl", session)
+        text = self.run_tool("tools", "--no-color").stdout.decode("utf-8")
+        self.assertIn("UPPER BOUND", text)
+        payload = self.run_json("tools", "--json")
+        self.assertTrue(payload["measured_is_upper_bound"])
+
+def codex_task_complete_line(epoch: float) -> str:
+    return json.dumps(
+        {"type": "event_msg", "timestamp": iso(epoch),
+         "payload": {"type": "task_complete"}}
+    )
+
+
+def codex_user_message_line(epoch: float, text: str) -> str:
+    """A Codex user turn: the item the prompt label is read from."""
+    return json.dumps(
+        {
+            "type": "response_item",
+            "timestamp": iso(epoch),
+            "payload": {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": text}],
+            },
+        }
+    )
+
+
+class PromptLabelText(unittest.TestCase):
+    """Issue #26: a short redacted label, never the prompt itself."""
+
+    def test_first_line_only(self) -> None:
+        self.assertEqual(
+            QD.prompt_label("fix the parser\nand then rewrite the whole docs tree"),
+            "fix the parser",
+        )
+
+    def test_whitespace_is_collapsed(self) -> None:
+        self.assertEqual(QD.prompt_label("  fix\t  the   parser  "), "fix the parser")
+
+    def test_truncated_to_120_characters(self) -> None:
+        self.assertEqual(len(QD.prompt_label("word " * 200)), QD.PROMPT_LABEL_CHARS)
+        self.assertEqual(QD.PROMPT_LABEL_CHARS, 120)
+
+    def test_multiline_tag_block_is_dropped(self) -> None:
+        text = "<system-reminder>\nbookkeeping noise\n</system-reminder>\nthe real ask"
+        self.assertEqual(QD.prompt_label(text), "the real ask")
+
+    def test_single_line_tag_is_dropped(self) -> None:
+        text = "<command-name>/deploy</command-name>\nship it"
+        self.assertEqual(QD.prompt_label(text), "ship it")
+
+    def test_cross_session_message_is_a_known_block(self) -> None:
+        text = "<cross-session-message>\nINNER CONTENT\n</cross-session-message>"
+        self.assertEqual(QD.prompt_label(text), "(cross-session-message)")
+        self.assertNotIn("INNER CONTENT", QD.prompt_label(text))
+
+    def test_a_body_quoting_its_closing_tag_leaks_nothing(self) -> None:
+        text = (
+            "<system-reminder>\n"
+            "the body writes </system-reminder> INNER CONTENT here\n"
+            "more body\n"
+        )
+        label = QD.prompt_label(text)
+        self.assertEqual(label, "(system-reminder)")
+        self.assertNotIn("INNER CONTENT", label)
+
+    def test_unterminated_block_yields_only_its_name(self) -> None:
+        text = "<user_instructions>\n" + "\n".join("INNER %d" % n for n in range(80))
+        label = QD.prompt_label(text)
+        self.assertEqual(label, "(user_instructions)")
+        self.assertNotIn("INNER", label)
+
+    def test_self_closing_block_keeps_the_typed_remainder(self) -> None:
+        self.assertEqual(
+            QD.prompt_label('<ide_selection file="a.py" lines="1-3" /> fix this line'),
+            "fix this line",
+        )
+        self.assertEqual(QD.prompt_label("<ide_opened_file/>"), "(ide_opened_file)")
+
+    def test_rank_is_carried_not_read_off_the_label_shape(self) -> None:
+        # A typed line that happens to be parenthesised is typed text, and
+        # must outrank a block name for the same prompt.
+        label, rank = QD.prompt_label_parts("(just a parenthesised ask)")
+        self.assertEqual(label, "(just a parenthesised ask)")
+        self.assertEqual(rank, QD.LABEL_RANK_TYPED)
+        self.assertEqual(
+            QD.prompt_label_parts("<system-reminder>x</system-reminder>")[1],
+            QD.LABEL_RANK_BLOCK,
+        )
+        self.assertEqual(QD.prompt_label_parts("")[1], QD.LABEL_RANK_NONE)
+
+    def test_markers_come_from_a_fixed_vocabulary(self) -> None:
+        for text in (
+            "<system-reminder>\nx\n</system-reminder>",
+            "<local-command-stdout>\nx\n</local-command-stdout>",
+        ):
+            label = QD.prompt_label(text)
+            self.assertTrue(label.startswith("(") and label.endswith(")"), label)
+            self.assertIn(label[1:-1], QD.LABEL_INJECTED_TAGS)
+
+    def test_pasted_placeholder_ends_the_scan(self) -> None:
+        # Whatever follows the placeholder is the paste, never a label.
+        self.assertEqual(QD.prompt_label("[Pasted text +240 lines]\nPASTED BODY"), "")
+        self.assertEqual(QD.prompt_label("[Image #1]\nPASTED BODY"), "")
+
+    def test_typed_text_beside_an_injected_block_survives(self) -> None:
+        self.assertEqual(
+            QD.prompt_label("<system-reminder>noise</system-reminder> the real ask"),
+            "the real ask",
+        )
+        self.assertEqual(QD.prompt_label("do X <user_instructions>y</user_instructions>"),
+                         "do X")
+
+    def test_unknown_tag_is_typed_text(self) -> None:
+        self.assertEqual(QD.prompt_label("<Foo> is not closing"), "<Foo> is not closing")
+        self.assertEqual(QD.prompt_label("<div>markup I typed</div>"),
+                         "<div>markup I typed</div>")
+
+    def test_unterminated_injected_block_stops_the_scan(self) -> None:
+        text = "<system-reminder>\n" + "\n".join("noise %d" % n for n in range(10))
+        self.assertEqual(QD.prompt_label(text), "(system-reminder)")
+        self.assertNotIn("noise", QD.prompt_label(text))
+
+    def test_hex_run_after_an_underscore_is_redacted(self) -> None:
+        self.assertEqual(
+            QD.prompt_label("rotate api_key_" + "ab12" * 8), "rotate api_key_[redacted]"
+        )
+        self.assertEqual(
+            QD.prompt_label("tok_" + "Aa0+" * 12 + " please"), "tok_[redacted] please"
+        )
+
+    def test_injected_only_message_is_named_not_quoted(self) -> None:
+        # A turn that is nothing but an injected block is labelled with the
+        # block's name, from a fixed vocabulary - never its contents.
+        self.assertEqual(
+            QD.prompt_label("<environment_context>\nSECRET\n</environment_context>"),
+            "(environment_context)",
+        )
+        self.assertEqual(
+            QD.prompt_label("<task-notification>\nSECRET\nmore"), "(task-notification)"
+        )
+        self.assertEqual(QD.prompt_label(""), "")
+        self.assertEqual(QD.prompt_label(None), "")
+        self.assertEqual(QD.prompt_label("   \n  "), "")
+
+    def test_email_is_redacted(self) -> None:
+        self.assertEqual(
+            QD.prompt_label("mail nobody@example.invalid about it"),
+            "mail [redacted] about it",
+        )
+
+    def test_api_key_is_redacted(self) -> None:
+        label = QD.prompt_label("use sk-EXAMPLEEXAMPLEEXAMPLE for the call")
+        self.assertEqual(label, "use [redacted] for the call")
+
+    def test_github_token_is_redacted(self) -> None:
+        label = QD.prompt_label("push with ghp_EXAMPLEEXAMPLEEXAMPLE0000")
+        self.assertEqual(label, "push with [redacted]")
+
+    def test_bearer_token_is_redacted(self) -> None:
+        label = QD.prompt_label("send Authorization: Bearer EXAMPLEEXAMPLEEXAMPLE")
+        self.assertEqual(label, "send Authorization: [redacted]")
+
+    def test_long_hex_and_base64_are_redacted(self) -> None:
+        self.assertEqual(QD.prompt_label("token " + "ab12" * 10), "token [redacted]")
+        self.assertEqual(QD.prompt_label("token " + "Aa0+" * 12), "token [redacted]")
+
+    def test_short_words_survive(self) -> None:
+        self.assertEqual(QD.prompt_label("rebase onto main and run the tests"),
+                         "rebase onto main and run the tests")
+
+
+class PromptRanking(Harness):
+    """Issue #26: `prompts` without --session ranks across sessions."""
+
+    BUSY = "aaaa2601-1111-2222-3333-444444444444"
+    BIG = "bbbb2602-1111-2222-3333-444444444444"
+
+    def write_two_sessions(self) -> float:
+        now = time.time() - 3600
+        self.write_claude(
+            "busy.jsonl",
+            [claude_user_prompt_line(now, self.BUSY, text="rank me first please")]
+            + [
+                claude_assistant_line(
+                    now + step, self.BUSY, "msg_busy_%d" % step,
+                    input_tokens=1000, output_tokens=10,
+                )
+                for step in (1, 2, 3)
+            ],
+        )
+        self.write_claude(
+            "big.jsonl",
+            [
+                claude_user_prompt_line(now, self.BIG, text="one huge context prompt"),
+                claude_assistant_line(
+                    now + 1, self.BIG, "msg_big", input_tokens=500000, output_tokens=10
+                ),
+            ],
+        )
+        return now
+
+    def test_default_sort_is_turns(self) -> None:
+        self.write_two_sessions()
+        payload = self.run_json("prompts", "--harness", "claude", "--json")
+        rows = payload["prompts"]
+        self.assertEqual(payload["sort"], "turns")
+        self.assertEqual(rows[0]["session_id"], self.BUSY)
+        self.assertEqual(rows[0]["prompt_index"], 1)
+        self.assertEqual(rows[0]["label"], "rank me first please")
+        self.assertEqual(rows[0]["api_turns"], 3)
+        self.assertEqual(rows[1]["session_id"], self.BIG)
+        self.assertEqual(rows[1]["label"], "one huge context prompt")
+
+    def test_sort_context_and_tokens_promote_the_big_prompt(self) -> None:
+        self.write_two_sessions()
+        for key in ("context", "tokens"):
+            payload = self.run_json("prompts", "--harness", "claude", "--sort", key, "--json")
+            self.assertEqual(payload["prompts"][0]["session_id"], self.BIG, key)
+
+    def test_sort_drain_is_accepted(self) -> None:
+        self.write_two_sessions()
+        payload = self.run_json("prompts", "--harness", "claude", "--sort", "drain", "--json")
+        self.assertEqual(len(payload["prompts"]), 2)
+
+    def test_top_limits_the_ranking(self) -> None:
+        self.write_two_sessions()
+        payload = self.run_json("prompts", "--harness", "claude", "--top", "1", "--json")
+        self.assertEqual(len(payload["prompts"]), 1)
+
+    def test_text_ranking_shows_rank_and_label(self) -> None:
+        self.write_two_sessions()
+        result = self.run_tool("prompts", "--harness", "claude", "--no-color", "--width", "160")
+        self.assertEqual(result.returncode, 0, result.stderr.decode())
+        text = result.stdout.decode("utf-8")
+        self.assertIn("top 10 prompts by turns", text)
+        self.assertIn("rank me first please", text)
+        first = [line for line in text.splitlines() if "rank me first please" in line][0]
+        self.assertTrue(first.startswith("   1 "), first)
+        self.assertIn("claude", first)
+        self.assertIn("aaaa2601", first)
+
+    def test_no_label_hides_the_label_column(self) -> None:
+        self.write_two_sessions()
+        result = self.run_tool(
+            "prompts", "--harness", "claude", "--no-color", "--no-label", "--width", "160"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr.decode())
+        text = result.stdout.decode("utf-8")
+        self.assertNotIn("rank me first please", text)
+        self.assertIn("top 10 prompts by turns", text)
+
+    def test_per_session_output_is_unchanged(self) -> None:
+        self.write_two_sessions()
+        result = self.run_tool(
+            "prompts", "--session", "aaaa2601", "--no-color", "--width", "120"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr.decode())
+        text = result.stdout.decode("utf-8")
+        self.assertIn(
+            "#    start              wall  turns  ctx start   ctx peak input sent"
+            "     units note    ",
+            text,
+        )
+        self.assertNotIn("rank me first please", text)
+        self.assertNotIn("label", text)
+
+    def test_label_flag_adds_a_column_to_the_session_view(self) -> None:
+        self.write_two_sessions()
+        result = self.run_tool(
+            "prompts", "--session", "aaaa2601", "--label", "--no-color", "--width", "160"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr.decode())
+        self.assertIn("rank me first please", result.stdout.decode("utf-8"))
+
+    def test_label_survives_the_cache_shard(self) -> None:
+        self.write_two_sessions()
+        first = self.run_json("prompts", "--harness", "claude", "--json")
+        second = self.run_json("prompts", "--harness", "claude", "--json")
+        self.assertEqual(
+            [row["label"] for row in first["prompts"]],
+            [row["label"] for row in second["prompts"]],
+        )
+        self.assertEqual(second["prompts"][0]["label"], "rank me first please")
+
+    def test_cache_schema_is_seven(self) -> None:
+        # 6 split the tool rows into a sibling shard; 7 added the row count
+        # and size that make the sibling checkable. Either older shard
+        # would read back as a transcript that called no tools.
+        self.assertEqual(QD.CACHE_SCHEMA, 7)
+
+    def test_codex_label_comes_from_the_user_message(self) -> None:
+        now = time.time() - 3600
+        session = "cccc2603-1111-2222-3333-444444444444"
+        self.write_codex(
+            "rollout-label.jsonl",
+            [
+                codex_session_meta_line(now, session, "/home/agent/project"),
+                codex_user_message_line(now + 1, "<environment_context>\nnoise\n"
+                                                 "</environment_context>"),
+                codex_task_started_line(now + 2),
+                codex_user_message_line(now + 3, "codex please rank this"),
+                codex_turn_context_line(now + 4, "gpt-5.6-sol"),
+                codex_usage_record_line(
+                    now + 5, session, input_tokens=1000, cached_input_tokens=0,
+                    output_tokens=10, turn_id="turn-1",
+                ),
+            ],
+            day=now,
+        )
+        payload = self.run_json("prompts", "--harness", "codex", "--json")
+        self.assertEqual(payload["prompts"][0]["label"], "codex please rank this")
+
+    def test_pasted_body_never_reaches_the_shard_or_json_claude(self) -> None:
+        session = "dddd2604-1111-2222-3333-444444444444"
+        now = time.time() - 3600
+        self.write_claude(
+            "pasted.jsonl",
+            [
+                claude_user_prompt_line(
+                    now, session, text="[Pasted text +900 lines]\nPASTED BODY LINE"
+                ),
+                claude_assistant_line(now + 1, session, "msg_paste", input_tokens=10,
+                                      output_tokens=5),
+            ],
+        )
+        payload = self.run_json("prompts", "--harness", "claude", "--json")
+        blob = json.dumps(payload)
+        self.assertNotIn("PASTED BODY LINE", blob)
+        self.assertEqual(payload["prompts"][0]["label"], "")
+        shards = "\n".join(
+            path.read_text(encoding="utf-8") for path in (self.root / "cache").rglob("*.json")
+        )
+        self.assertNotIn("PASTED BODY LINE", shards)
+
+    def test_pasted_body_never_reaches_the_shard_or_json_codex(self) -> None:
+        session = "eeee2605-1111-2222-3333-444444444444"
+        now = time.time() - 3600
+        self.write_codex(
+            "rollout-pasted.jsonl",
+            [
+                codex_session_meta_line(now, session, "/home/agent/project"),
+                codex_user_message_line(
+                    now + 1, "[Pasted text +900 lines]\nPASTED BODY LINE"
+                ),
+                codex_task_started_line(now + 2),
+                codex_turn_context_line(now + 3, "gpt-5.6-sol"),
+                codex_usage_record_line(now + 4, session, input_tokens=100,
+                                        cached_input_tokens=0, output_tokens=10,
+                                        turn_id="turn-1"),
+            ],
+            day=now,
+        )
+        payload = self.run_json("prompts", "--harness", "codex", "--json")
+        blob = json.dumps(payload)
+        self.assertNotIn("PASTED BODY LINE", blob)
+        self.assertEqual(payload["prompts"][0]["label"], "")
+        shards = "\n".join(
+            path.read_text(encoding="utf-8") for path in (self.root / "cache").rglob("*.json")
+        )
+        self.assertNotIn("PASTED BODY LINE", shards)
+
+    def test_codex_interjection_does_not_label_the_next_prompt(self) -> None:
+        session = "ffff2606-1111-2222-3333-444444444444"
+        now = time.time() - 3600
+        self.write_codex(
+            "rollout-orphan.jsonl",
+            [
+                codex_session_meta_line(now, session, "/home/agent/project"),
+                codex_user_message_line(now + 1, "first real prompt"),
+                codex_task_started_line(now + 2),
+                codex_turn_context_line(now + 3, "gpt-5.6-sol"),
+                codex_usage_record_line(now + 4, session, input_tokens=100,
+                                        cached_input_tokens=0, output_tokens=10,
+                                        turn_id="turn-1"),
+                # Queued mid-turn; it never opens a boundary of its own.
+                codex_user_message_line(now + 5, "orphan interjection"),
+                codex_task_complete_line(now + 6),
+                codex_task_started_line(now + 40),
+                codex_turn_context_line(now + 41, "gpt-5.6-sol"),
+                codex_usage_record_line(now + 42, session, input_tokens=200,
+                                        cached_input_tokens=0, output_tokens=10,
+                                        turn_id="turn-2"),
+            ],
+            day=now,
+        )
+        payload = self.run_json("prompts", "--harness", "codex", "--json")
+        labels = [row["label"] for row in payload["prompts"]]
+        self.assertIn("first real prompt", labels)
+        self.assertNotIn("orphan interjection", labels)
+
+    def test_parenthesised_typed_prompt_outranks_an_injected_block(self) -> None:
+        session = "abcd2607-1111-2222-3333-444444444444"
+        now = time.time() - 3600
+        self.write_codex(
+            "rollout-rank.jsonl",
+            [
+                codex_session_meta_line(now, session, "/home/agent/project"),
+                codex_user_message_line(
+                    now + 1, "<environment_context>\nINNER\n</environment_context>"
+                ),
+                codex_task_started_line(now + 2),
+                codex_user_message_line(now + 3, "(parenthesised typed ask)"),
+                codex_turn_context_line(now + 4, "gpt-5.6-sol"),
+                codex_usage_record_line(now + 5, session, input_tokens=100,
+                                        cached_input_tokens=0, output_tokens=10,
+                                        turn_id="turn-1"),
+            ],
+            day=now,
+        )
+        payload = self.run_json("prompts", "--harness", "codex", "--json")
+        self.assertEqual(payload["prompts"][0]["label"], "(parenthesised typed ask)")
+
+    def test_block_only_turn_stores_no_inner_content(self) -> None:
+        session = "bcde2608-1111-2222-3333-444444444444"
+        now = time.time() - 3600
+        self.write_claude(
+            "block-only.jsonl",
+            [
+                claude_user_prompt_line(
+                    now, session,
+                    text="<cross-session-message>\nINNER CONTENT\n"
+                         "</cross-session-message>",
+                ),
+                claude_assistant_line(now + 1, session, "msg_block", input_tokens=10,
+                                      output_tokens=5),
+            ],
+        )
+        payload = self.run_json("prompts", "--harness", "claude", "--json")
+        self.assertEqual(payload["prompts"][0]["label"], "(cross-session-message)")
+        self.assertNotIn("INNER CONTENT", json.dumps(payload))
+        shards = "\n".join(
+            path.read_text(encoding="utf-8") for path in (self.root / "cache").rglob("*.json")
+        )
+        self.assertNotIn("INNER CONTENT", shards)
+
+    def test_sort_units_is_accepted(self) -> None:
+        self.write_two_sessions()
+        payload = self.run_json("prompts", "--harness", "claude", "--sort", "units", "--json")
+        self.assertEqual(payload["sort"], "units")
+        self.assertEqual(payload["prompts"][0]["session_id"], self.BIG)
+
+    def test_ranking_shows_and_exports_cwd(self) -> None:
+        self.write_two_sessions()
+        payload = self.run_json("prompts", "--harness", "claude", "--json")
+        self.assertEqual(payload["prompts"][0]["cwd"], "project")
+        result = self.run_tool(
+            "prompts", "--harness", "claude", "--no-color", "--no-label", "--width", "160"
+        )
+        self.assertIn("cwd", result.stdout.decode("utf-8"))
+        self.assertIn("project", result.stdout.decode("utf-8"))
+
+    def test_label_and_no_label_work_in_both_modes(self) -> None:
+        self.write_two_sessions()
+        ranked_off = self.run_tool(
+            "prompts", "--harness", "claude", "--no-label", "--no-color", "--width", "160"
+        )
+        self.assertEqual(ranked_off.returncode, 0)
+        self.assertNotIn("rank me first please", ranked_off.stdout.decode("utf-8"))
+        ranked_on = self.run_tool(
+            "prompts", "--harness", "claude", "--label", "--no-color", "--width", "160"
+        )
+        self.assertEqual(ranked_on.returncode, 0)
+        self.assertIn("rank me first please", ranked_on.stdout.decode("utf-8"))
+        session_off = self.run_tool(
+            "prompts", "--session", "aaaa2601", "--no-label", "--no-color", "--width", "160"
+        )
+        self.assertEqual(session_off.returncode, 0)
+        self.assertNotIn("rank me first please", session_off.stdout.decode("utf-8"))
+        both = self.run_tool(
+            "prompts", "--harness", "claude", "--label", "--no-label", "--no-color"
+        )
+        self.assertNotEqual(both.returncode, 0)
+
+    def test_fanout_sorts_its_top_prompts_by_turns(self) -> None:
+        self.write_two_sessions()
+        default = self.run_json("fanout", "--harness", "claude", "--json")
+        self.assertEqual(default["sort"], "tokens")
+        self.assertEqual(default["top_prompts"][0]["session_id"], self.BIG)
+        by_turns = self.run_json("fanout", "--harness", "claude", "--sort", "turns", "--json")
+        self.assertEqual(by_turns["top_prompts"][0]["session_id"], self.BUSY)
+        self.assertEqual(by_turns["top_prompts"][0]["label"], "rank me first please")
+
+    def test_scanning_prompt_detail_carries_the_label(self) -> None:
+        self.write_two_sessions()
+        from nenpi import scanning
+
+        with self.env_applied():
+            payload = scanning.scan_sources([("claude", str(self.claude_projects))])
+        labels = {row["label"] for row in payload["prompts"]}
+        self.assertIn("rank me first please", labels)
+
+
+class NextStepFooter(Harness):
+    """Issue #27: every command ends with a data-driven stderr footer."""
+
+    # TWIN shares BIG's whole short_id: a suggestion that printed
+    # `short_id` would exit 1 as an ambiguous prefix (#27).
+    BIG = "cc002701-1111-2222-3333-444444444444"
+    TWIN = "cc002701-1111-2222-3333-555555555555"
+    SMALL = "dd002702-1111-2222-3333-444444444444"
+
+    def write_corpus(self) -> float:
+        now = time.time() - 3600
+        self.write_claude(
+            "big.jsonl",
+            [
+                claude_user_prompt_line(now, self.BIG),
+                claude_tool_use_line(
+                    now + 1, self.BIG, "msg_big_1", [("toolu_big", "Bash")],
+                    input_tokens=200, cache_read=4000, output_tokens=50,
+                ),
+                claude_tool_output_line(now + 2, self.BIG, "toolu_big", "x" * 4000),
+                claude_assistant_line(
+                    now + 3, self.BIG, "msg_big_2",
+                    input_tokens=100000, cache_read=200000, output_tokens=500,
+                ),
+                claude_user_prompt_line(now + 10, self.BIG, text="second prompt here"),
+                claude_assistant_line(
+                    now + 11, self.BIG, "msg_big_3",
+                    input_tokens=1000, cache_read=2000, output_tokens=20,
+                ),
+            ],
+        )
+        self.write_claude(
+            "twin.jsonl",
+            [
+                claude_user_prompt_line(now, self.TWIN),
+                claude_assistant_line(
+                    now + 1, self.TWIN, "msg_twin",
+                    input_tokens=100, cache_read=100, output_tokens=5,
+                ),
+            ],
+        )
+        self.write_claude(
+            "small.jsonl",
+            [
+                claude_user_prompt_line(now, self.SMALL),
+                claude_assistant_line(
+                    now + 1, self.SMALL, "msg_small",
+                    input_tokens=100, cache_read=100, output_tokens=5,
+                ),
+            ],
+        )
+        return now
+
+    def footer_lines(self, *arguments: str, extra_env: Optional[Dict[str, str]] = None
+                     ) -> List[str]:
+        result = self.run_tool(*arguments, extra_env=extra_env)
+        self.assertEqual(result.returncode, 0, result.stderr.decode("utf-8", "replace"))
+        return [
+            line
+            for line in result.stderr.decode("utf-8").splitlines()
+            if line.startswith("next:")
+        ]
+
+    # -- present, and data-driven ------------------------------------------
+
+    def test_every_command_ends_with_a_footer(self) -> None:
+        self.write_corpus()
+        commands = (
+            ("sessions",),
+            ("timeline",),
+            ("windows",),
+            ("prompts",),
+            ("prompts", "--session", self.big_prefix()),
+            ("tools",),
+            ("tools", "--session", self.big_prefix()),
+            ("fanout",),
+            ("reductions",),
+            ("verify",),
+            ("config",),
+        )
+        for command in commands:
+            scope = () if command == ("config",) else ("--harness", "claude", "--no-color")
+            lines = self.footer_lines(*command, *scope)
+            self.assertTrue(lines, "no footer for %s" % (command,))
+            self.assertLessEqual(len(lines), 3, "%s footer is too long" % (command,))
+
+    def big_prefix(self) -> str:
+        return QD.pick_id(self.BIG, [self.BIG, self.TWIN, self.SMALL])
+
+    def test_sessions_footer_names_the_top_sessions(self) -> None:
+        self.write_corpus()
+        lines = self.footer_lines("sessions", "--harness", "claude", "--no-color")
+        prefix = self.big_prefix()
+        self.assertIn("top 3 by drain", lines[0])
+        self.assertIn(prefix, lines[0])
+        self.assertTrue(
+            any("nenpi prompts --session %s" % prefix in line for line in lines), lines)
+        self.assertTrue(
+            any("nenpi tools --session %s" % prefix in line for line in lines), lines)
+
+    def test_suggested_prefix_is_unambiguous(self) -> None:
+        """A colliding short_id must never be what the footer prints."""
+        self.write_corpus()
+        prefix = self.big_prefix()
+        self.assertNotEqual(prefix, QD.short_id(self.BIG))
+        self.assertTrue(self.BIG.replace("-", "").startswith(prefix), prefix)
+        lines = self.footer_lines("sessions", "--harness", "claude", "--no-color")
+        for line in lines:
+            self.assertNotIn(" --session %s " % QD.short_id(self.BIG), line + " ")
+        payload = self.run_json("prompts", "--session", prefix, "--harness", "claude",
+                                "--json")
+        self.assertEqual(payload["session_id"], self.BIG)
+        # The ambiguous short id really is ambiguous, so the old footer was wrong.
+        ambiguous = self.run_tool(
+            "prompts", "--session", QD.short_id(self.BIG), "--harness", "claude", "--json")
+        self.assertEqual(ambiguous.returncode, 1)
+
+    def test_sort_start_relabels_the_note_and_keeps_the_drain_leader(self) -> None:
+        self.write_corpus()
+        lines = self.footer_lines(
+            "sessions", "--harness", "claude", "--sort", "start", "--no-color")
+        self.assertIn("top 3 by start", lines[0])
+        # The "Nx the median" claim is about drain, so it must name the drain
+        # leader even when the table is sorted by start.
+        if "drains" in lines[0]:
+            self.assertIn(self.big_prefix(), lines[0].split("drains")[0].split("(")[-1])
+
+    def test_median_is_taken_over_every_session_in_scope(self) -> None:
+        self.write_corpus()
+        # --top 1 shows one row; the median must still come from all three.
+        lines = self.footer_lines(
+            "sessions", "--harness", "claude", "--top", "1", "--no-color")
+        self.assertIn("top 1 by drain", lines[0])
+        self.assertIn("drains", lines[0])
+
+    def test_free_text_flags_are_shell_quoted(self) -> None:
+        namespace = argparse.Namespace(
+            since="2026-01-01 00:00", until=None, harness="claude",
+            account="pool;rm -rf /", sort="drain", json=False, quiet=False)
+        rendered = QD.suggest(namespace, "sessions", "--session", "abcd1234")
+        self.assertIn("'2026-01-01 00:00'", rendered)
+        self.assertIn("'pool;rm -rf /'", rendered)
+        self.assertNotIn("; rm", rendered.replace("'pool;rm -rf /'", ""))
+
+    def test_a_since_with_a_space_survives_the_round_trip(self) -> None:
+        self.write_corpus()
+        stamp = datetime.fromtimestamp(time.time() - 86400).strftime("%Y-%m-%d %H:%M")
+        lines = self.footer_lines(
+            "sessions", "--since", stamp, "--harness", "claude", "--no-color")
+        quoted = "--since '%s'" % stamp
+        for line in lines[1:]:
+            self.assertIn(quoted, line)
+        arguments = shlex.split(lines[1].split("#")[0].split(":", 1)[1])
+        result = self.run_tool(*arguments[1:], "--json")
+        self.assertEqual(result.returncode, 0, result.stderr.decode())
+
+    def test_fanout_json_stays_json_on_an_empty_range(self) -> None:
+        result = self.run_tool("fanout", "--harness", "claude", "--since", "1h", "--json")
+        self.assertEqual(result.returncode, 0, result.stderr.decode())
+        payload = json.loads(result.stdout.decode("utf-8"))
+        self.assertEqual(payload["prompts"], 0)
+        self.assertEqual(payload["top_prompts"], [])
+        self.assertTrue(payload["next"])
+        self.assertNotIn(b"next:", result.stderr)
+
+    def test_snapshot_failure_prints_no_footer(self) -> None:
+        result = self.run_tool("snapshot", "--oauth")
+        self.assertEqual(result.returncode, 1)
+        self.assertNotIn(b"next:", result.stderr)
+
+    def test_no_color_env_disables_footer_color(self) -> None:
+        namespace = argparse.Namespace(no_color=False)
+        saved_stderr, saved_env = sys.stderr, os.environ.get("NO_COLOR")
+        sys.stderr = TtyStringIO()
+        try:
+            os.environ.pop("NO_COLOR", None)
+            self.assertTrue(QD.footer_painter(namespace).enabled)
+            os.environ["NO_COLOR"] = "1"
+            self.assertFalse(QD.footer_painter(namespace).enabled)
+        finally:
+            sys.stderr = saved_stderr
+            if saved_env is None:
+                os.environ.pop("NO_COLOR", None)
+            else:
+                os.environ["NO_COLOR"] = saved_env
+
+    def test_prompts_session_footer_points_at_the_busiest_prompt(self) -> None:
+        self.write_corpus()
+        lines = self.footer_lines(
+            "prompts", "--session", self.big_prefix(), "--harness", "claude", "--no-color")
+        self.assertIn("nenpi tools --session %s --prompt 1" % self.big_prefix(),
+                      " ".join(lines))
+
+    def test_tools_footer_names_the_top_tool_and_session(self) -> None:
+        self.write_corpus()
+        lines = self.footer_lines("tools", "--harness", "claude", "--no-color")
+        self.assertIn("Bash", lines[0])
+        self.assertIn("nenpi tools --session %s" % self.big_prefix(), " ".join(lines))
+
+    def test_timeline_footer_suggests_the_busiest_bucket(self) -> None:
+        self.write_corpus()
+        lines = self.footer_lines("timeline", "--harness", "claude", "--no-color")
+        suggestion = [line for line in lines if "nenpi sessions" in line][0]
+        self.assertIn("--since", suggestion)
+        self.assertIn("--until", suggestion)
+
+    def test_empty_range_suggests_widening_and_config(self) -> None:
+        lines = self.footer_lines(
+            "sessions", "--harness", "claude", "--since", "1h", "--no-color")
+        self.assertIn("no sessions in range", " ".join(lines))
+        self.assertIn("nenpi config", " ".join(lines))
+
+    # -- suppression --------------------------------------------------------
+
+    def test_quiet_flags_suppress_the_footer(self) -> None:
+        self.write_corpus()
+        for flags in (("--quiet",), ("-q",)):
+            result = self.run_tool("sessions", "--harness", "claude", "--no-color", *flags)
+            self.assertEqual(result.returncode, 0)
+            self.assertNotIn(b"next:", result.stderr)
+
+    def test_nenpi_quiet_env_suppresses_the_footer(self) -> None:
+        self.write_corpus()
+        result = self.run_tool("sessions", "--harness", "claude", "--no-color",
+                               extra_env={"NENPI_QUIET": "1"})
+        self.assertEqual(result.returncode, 0)
+        self.assertNotIn(b"next:", result.stderr)
+
+    def test_json_keeps_stdout_pure_and_carries_next(self) -> None:
+        self.write_corpus()
+        for command in (("sessions",), ("prompts",), ("prompts", "--session", self.big_prefix()),
+                        ("tools",), ("fanout",), ("timeline",), ("windows",),
+                        ("reductions",), ("verify",), ("config",)):
+            scope = () if command == ("config",) else ("--harness", "claude")
+            result = self.run_tool(*command, *scope, "--json")
+            self.assertEqual(result.returncode, 0, result.stderr.decode())
+            payload = json.loads(result.stdout.decode("utf-8"))
+            self.assertNotIn(b"next:", result.stderr, command)
+            self.assertTrue(payload["next"], command)
+            for entry in payload["next"]:
+                self.assertEqual(sorted(entry), ["cmd", "why"], command)
+
+    def test_snapshot_stdin_stays_byte_exact_and_silent(self) -> None:
+        payload = json.dumps(
+            {"rate_limits": {"five_hour": {"used_percentage": 11.0,
+                                           "resets_at": "2026-09-16T21:30:00Z"}}}
+        ).encode("utf-8")
+        result = self.run_tool("snapshot", "--stdin", stdin=payload)
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, payload)
+        self.assertEqual(result.stderr, b"")
+
+    # -- the suggestions are runnable --------------------------------------
+
+    def test_suggestions_carry_the_scope_flags(self) -> None:
+        self.write_corpus()
+        lines = self.footer_lines(
+            "sessions", "--since", "7d", "--harness", "claude", "--no-color")
+        for line in lines[1:]:
+            self.assertIn("--since 7d", line)
+            self.assertIn("--harness claude", line)
+
+    def test_suggested_session_prefixes_resolve(self) -> None:
+        self.write_corpus()
+        lines = self.footer_lines("sessions", "--harness", "claude", "--no-color")
+        suggestion = [line for line in lines if "nenpi prompts --session" in line][0]
+        words = suggestion.split()
+        prefix = words[words.index("--session") + 1]
+        payload = self.run_json("prompts", "--session", prefix, "--harness", "claude",
+                                "--json")
+        self.assertEqual(payload["session_id"], self.BIG)
+
+    def test_suggested_commands_run_clean(self) -> None:
+        self.write_corpus()
+        for command in ("sessions", "timeline", "tools", "fanout"):
+            lines = self.footer_lines(command, "--harness", "claude", "--no-color")
+            for line in lines:
+                if "nenpi " not in line:
+                    continue
+                arguments = line.split("#")[0].split()[1:]  # drop "next:" and the why
+                self.assertEqual(arguments[0], "nenpi", line)
+                result = self.run_tool(*arguments[1:], "--json")
+                self.assertEqual(result.returncode, 0,
+                                 "%s -> %s" % (line, result.stderr.decode()))
+                json.loads(result.stdout.decode("utf-8"))
+
+    def test_footer_is_colorless_on_a_pipe(self) -> None:
+        self.write_corpus()
+        result = self.run_tool("sessions", "--harness", "claude")
+        self.assertNotIn(b"\033[", result.stderr)
 
 if __name__ == "__main__":
     unittest.main()

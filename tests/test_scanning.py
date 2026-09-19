@@ -128,7 +128,11 @@ class ScannerApi(Harness):
     def test_scan_sources_returns_prompt_metrics_and_reductions_without_content(self) -> None:
         now = 1_700_000_000.0
         session = "detail-session"
-        lines = [claude_user_prompt_line(now, session, text="PRIVATE PROMPT CONTENT")]
+        lines = [
+            claude_user_prompt_line(
+                now, session, text="the short label\nPRIVATE PROMPT CONTENT"
+            )
+        ]
         for index, context in enumerate([100_000, 200_000, 300_000, 40_000, 45_000, 50_000, 55_000]):
             lines.append(
                 claude_assistant_line(
@@ -160,6 +164,9 @@ class ScannerApi(Harness):
         self.assertEqual(reduction["kind"], "unmarked")
         self.assertEqual(result["sessions"][0]["reductions"], [reduction])
         self.assertEqual(result["sessions"][0]["prompt_details"], [prompt])
+        # The redacted one-line label is deliberately exposed (#8, #26); the
+        # rest of the prompt never leaves the transcript.
+        self.assertEqual(prompt["label"], "the short label")
         self.assertNotIn("PRIVATE PROMPT CONTENT", json.dumps(result))
         self.assertEqual(statuses[-1].phase, "done")
 

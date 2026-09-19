@@ -10,6 +10,15 @@ config (non-empty) replaces defaults; defaults are
 env var first, deduplicated, and missing directories skipped silently. A
 harness that resolves to zero roots gets one warning.
 
+``config.toml`` is also the Textual UI's source store (issue #23): enabled
+sources are ``roots``, sources switched off in the UI are ``disabled``, and
+discovered roots the user removed are ``ignored``. An empty ``roots`` in a
+table the file has means "scan nothing"; only a missing table falls back to
+the defaults. ``[general] ignore_unconfigured`` silences the note about
+sibling harness dirs that are present on the host but in nothing's resolved
+set. Writing the file keeps unknown tables and keys (so a newer or
+hand-written setting survives) but not comments.
+
 Test path overrides use the ``NENPI_*`` environment variables (``HOME_DIR``,
 ``CACHE_DIR``, ``STATE_DIR``, ``CONFIG_DIR``, ``CONFIG_FILE``). The old
 ``QUOTA_DRAIN_*`` names are still honoured for ``HOME_DIR``, ``CACHE_DIR``,
@@ -32,6 +41,18 @@ LEGACY_PREFIX = "QUOTA_DRAIN_"
 MAX_JSON_BYTES = 128 * 1024 * 1024
 
 _WARNED = set()  # type: set
+
+# Advisory notices (as opposed to warnings about broken input) are muted for
+# machine-readable output; ``drain.main`` flips this off for ``--json``.
+_NOTICES = [True]
+
+
+def set_notices_enabled(enabled: bool) -> None:
+    _NOTICES[0] = bool(enabled)
+
+
+def notices_enabled() -> bool:
+    return _NOTICES[0]
 
 
 def warn(message: str) -> None:
@@ -114,6 +135,14 @@ def migrate_dirs() -> None:
 
 
 class Config:
+    """The parsed ``config.toml``, shared by the CLI and the Textual UI.
+
+    ``roots`` is what the CLI scans. ``disabled`` holds roots the UI knows
+    about but has switched off, and ``ignored`` holds discovered roots the
+    user removed, so rediscovery does not bring them back. Both are UI
+    bookkeeping the CLI only has to round-trip.
+    """
+
     def __init__(
         self,
         claude_roots: Optional[Sequence[str]] = None,
@@ -121,19 +150,51 @@ class Config:
         plan_claude: Optional[str] = None,
         plan_codex: Optional[str] = None,
         path: Optional[Path] = None,
+        claude_disabled: Optional[Sequence[str]] = None,
+        codex_disabled: Optional[Sequence[str]] = None,
+        claude_ignored: Optional[Sequence[str]] = None,
+        codex_ignored: Optional[Sequence[str]] = None,
+        ignore_unconfigured: bool = False,
+        tables_present: Optional[Sequence[str]] = None,
+        extras: Optional[Dict[str, Any]] = None,
     ):
         self.claude_roots = list(claude_roots or [])
         self.codex_roots = list(codex_roots or [])
         self.plan_claude = plan_claude
         self.plan_codex = plan_codex
         self.path = path
+        self.claude_disabled = list(claude_disabled or [])
+        self.codex_disabled = list(codex_disabled or [])
+        self.claude_ignored = list(claude_ignored or [])
+        self.codex_ignored = list(codex_ignored or [])
+        self.ignore_unconfigured = bool(ignore_unconfigured)
+        # Which harness tables the file actually had: an empty ``roots`` in a
+        # table the user wrote is a choice ("scan nothing"), while an absent
+        # table means "no opinion" and falls back to the defaults.
+        self.tables_present = set(tables_present or ())
+        # Tables and keys this version does not know about, kept verbatim so
+        # saving never drops a newer (or hand-written) setting.
+        self.extras: Dict[str, Any] = dict(extras or {})
+
+    def roots(self, harness: str) -> List[str]:
+        return self.claude_roots if harness == "claude" else self.codex_roots
+
+    def disabled(self, harness: str) -> List[str]:
+        return self.claude_disabled if harness == "claude" else self.codex_disabled
+
+    def ignored(self, harness: str) -> List[str]:
+        return self.claude_ignored if harness == "claude" else self.codex_ignored
+
+    def has_table(self, name: str) -> bool:
+        return name in self.tables_present
 
 
-_KNOWN_TOP_KEYS = ("claude", "codex", "plan")
+_KNOWN_TOP_KEYS = ("claude", "codex", "plan", "general")
 _KNOWN_SUBKEYS = {
-    "claude": ("roots",),
-    "codex": ("roots",),
+    "claude": ("roots", "disabled", "ignored"),
+    "codex": ("roots", "disabled", "ignored"),
     "plan": ("claude", "codex"),
+    "general": ("ignore_unconfigured",),
 }
 
 
@@ -150,8 +211,8 @@ def _string_list(value: Any) -> List[str]:
     return [item for item in value if isinstance(item, str) and item]
 
 
-def load_config() -> Config:
-    path = config_path()
+def load_config(path: Optional[Path] = None) -> Config:
+    path = path or config_path()
     try:
         raw = path.read_bytes()
     except OSError:
@@ -163,20 +224,26 @@ def load_config() -> Config:
     if not isinstance(data, dict):
         raise SystemExit("nenpi: config %s: expected a table at the top level" % path)
 
+    tables_present = []
+    extras = {}  # type: Dict[str, Any]
     for key in data:
         if key not in _KNOWN_TOP_KEYS:
             warn_once("config %s: unknown key [%s]" % (path, key))
+            extras[key] = data[key]
             continue
         block = data.get(key)
         if not isinstance(block, dict):
             continue
+        tables_present.append(key)
         for subkey in block:
             if subkey not in _KNOWN_SUBKEYS[key]:
                 warn_once("config %s: unknown key %s.%s" % (path, key, subkey))
+                extras.setdefault(key, {})[subkey] = block[subkey]
 
     claude_block = data.get("claude") if isinstance(data.get("claude"), dict) else {}
     codex_block = data.get("codex") if isinstance(data.get("codex"), dict) else {}
     plan_block = data.get("plan") if isinstance(data.get("plan"), dict) else {}
+    general_block = data.get("general") if isinstance(data.get("general"), dict) else {}
 
     plan_claude = plan_block.get("claude")
     plan_codex = plan_block.get("codex")
@@ -187,7 +254,185 @@ def load_config() -> Config:
         plan_claude=plan_claude if isinstance(plan_claude, str) else None,
         plan_codex=plan_codex if isinstance(plan_codex, str) else None,
         path=path,
+        claude_disabled=_string_list(claude_block.get("disabled")),
+        codex_disabled=_string_list(codex_block.get("disabled")),
+        claude_ignored=_string_list(claude_block.get("ignored")),
+        codex_ignored=_string_list(codex_block.get("ignored")),
+        ignore_unconfigured=general_block.get("ignore_unconfigured") is True,
+        tables_present=tables_present,
+        extras=extras,
     )
+
+
+# --------------------------------------------------------------------------
+# writing config.toml
+#
+# The standard library reads TOML (``tomllib``) but cannot write it, and
+# nenpi stays dependency-free, so this is the smallest writer that covers
+# the schema above: basic strings and arrays of them, plus one boolean.
+
+
+def toml_escape(value: str) -> str:
+    """Quote a string as a TOML basic string, without the quotes."""
+
+    out = []
+    for char in value:
+        if char == "\\":
+            out.append("\\\\")
+        elif char == '"':
+            out.append('\\"')
+        elif char == "\n":
+            out.append("\\n")
+        elif char == "\r":
+            out.append("\\r")
+        elif char == "\t":
+            out.append("\\t")
+        elif char < " " or char == "\x7f":
+            out.append("\\u%04x" % ord(char))
+        else:
+            out.append(char)
+    return "".join(out)
+
+
+def toml_string(value: str) -> str:
+    return '"%s"' % toml_escape(value)
+
+
+def toml_value(value: Any) -> Optional[str]:
+    """Render a scalar or flat array; ``None`` when this writer cannot."""
+
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, str):
+        return toml_string(value)
+    if isinstance(value, int) or isinstance(value, float):
+        return repr(value)
+    if isinstance(value, list):
+        rendered = [toml_value(item) for item in value]
+        if any(item is None for item in rendered):
+            return None
+        return "[%s]" % ", ".join(rendered)  # type: ignore[arg-type]
+    return None
+
+
+def _extra_lines(prefix: str, block: Any) -> List[str]:
+    """Re-emit a preserved table (one level of sub-tables) as TOML."""
+
+    lines = []
+    nested = []
+    if not isinstance(block, dict):
+        rendered = toml_value(block)
+        return ["%s = %s" % (prefix, rendered)] if rendered is not None else []
+    lines.append("[%s]" % prefix)
+    for key, value in block.items():
+        if isinstance(value, dict):
+            nested.append((key, value))
+            continue
+        rendered = toml_value(value)
+        if rendered is None:
+            warn_once("config: cannot rewrite %s.%s; it is dropped" % (prefix, key))
+            continue
+        lines.append("%s = %s" % (key, rendered))
+    lines.append("")
+    for key, value in nested:
+        lines.extend(_extra_lines("%s.%s" % (prefix, key), value))
+    return lines
+
+
+def _root_array(
+    key: str, values: Sequence[str], comments: Optional[Dict[str, str]] = None
+) -> List[str]:
+    if not values:
+        return ["%s = []" % key]
+    lines = ["%s = [" % key]
+    for value in values:
+        comment = (comments or {}).get(value)
+        lines.append(
+            "    %s,%s" % (toml_string(value), ("  # %s" % comment) if comment else "")
+        )
+    lines.append("]")
+    return lines
+
+
+def dump_config(
+    config: Config,
+    comments: Optional[Dict[str, str]] = None,
+    header: Optional[Sequence[str]] = None,
+) -> str:
+    """Render a :class:`Config` as ``config.toml`` text."""
+
+    lines = list(header or ())
+    if lines:
+        lines.append("")
+    for harness in ("claude", "codex"):
+        lines.append("[%s]" % harness)
+        lines.extend(_root_array("roots", config.roots(harness), comments))
+        if config.disabled(harness):
+            lines.append("# disabled in the UI; kept so the choice survives rediscovery")
+            lines.extend(_root_array("disabled", config.disabled(harness)))
+        if config.ignored(harness):
+            lines.append("# removed in the UI; not offered again by discovery")
+            lines.extend(_root_array("ignored", config.ignored(harness)))
+        for key, value in (config.extras.get(harness) or {}).items():
+            rendered = toml_value(value)
+            if rendered is None:
+                warn_once("config: cannot rewrite %s.%s; it is dropped" % (harness, key))
+                continue
+            lines.append("%s = %s" % (key, rendered))
+        lines.append("")
+    plan_extras = config.extras.get("plan") or {}
+    general_extras = config.extras.get("general") or {}
+    if config.plan_claude or config.plan_codex or plan_extras:
+        lines.append("[plan]  # display only")
+        if config.plan_claude:
+            lines.append("claude = %s" % toml_string(config.plan_claude))
+        if config.plan_codex:
+            lines.append("codex = %s" % toml_string(config.plan_codex))
+        for key, value in plan_extras.items():
+            rendered = toml_value(value)
+            if rendered is not None:
+                lines.append("%s = %s" % (key, rendered))
+        lines.append("")
+    else:
+        lines.append("# [plan]  # optional, display only")
+        lines.append('# claude = "max_20x"')
+        lines.append('# codex = "pro"')
+        lines.append("")
+    if config.ignore_unconfigured or general_extras:
+        lines.append("[general]")
+        if config.ignore_unconfigured:
+            lines.append("ignore_unconfigured = true")
+        for key, value in general_extras.items():
+            rendered = toml_value(value)
+            if rendered is not None:
+                lines.append("%s = %s" % (key, rendered))
+        lines.append("")
+    else:
+        lines.append("# [general]")
+        lines.append("# ignore_unconfigured = true  # silence the unconfigured-dir note")
+        lines.append("")
+    for key, value in config.extras.items():
+        if key in _KNOWN_TOP_KEYS:
+            continue
+        lines.extend(_extra_lines(key, value))
+    return "\n".join(lines)
+
+
+def save_config(
+    config: Config,
+    path: Optional[Path] = None,
+    comments: Optional[Dict[str, str]] = None,
+    header: Optional[Sequence[str]] = None,
+) -> Path:
+    """Write ``config.toml`` atomically and return the path written."""
+
+    path = path or config.path or config_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(path.name + ".tmp")
+    temporary.write_text(dump_config(config, comments, header), encoding="utf-8")
+    os.replace(str(temporary), str(path))
+    config.tables_present.update(("claude", "codex"))
+    return path
 
 
 # --------------------------------------------------------------------------
@@ -251,6 +496,7 @@ def resolve_roots(
     config: Config,
     quiet: bool = False,
     keep_missing: bool = False,
+    notify: bool = True,
 ) -> List[Path]:
     flag_paths = [normalize_root_flag(value, harness) for value in flags if value]
     if flag_paths:
@@ -263,12 +509,19 @@ def resolve_roots(
             resolved = _dedup_existing(
                 [Path(item).expanduser() for item in configured], keep_missing=keep_missing
             )
+        elif config.has_table(harness):
+            # The file has a [claude]/[codex] table and it resolves to
+            # nothing: every root was disabled or removed on purpose, so the
+            # defaults must not creep back in.
+            resolved = []
         else:
             resolved = _dedup_existing(
                 _default_root_candidates(harness), keep_missing=keep_missing
             )
     if not resolved and not quiet:
         warn_once("no %s roots found; see `nenpi config`" % harness)
+    if notify and not quiet and not flag_paths:
+        warn_unconfigured_roots(config)
     return resolved
 
 
@@ -294,6 +547,66 @@ def discover_candidate_roots(harness: str) -> List[Path]:
             seen.add(key)
             candidates.append(candidate)
     return [candidate for candidate in candidates if (candidate / leaf).is_dir()]
+
+
+def display_path(path: Path) -> str:
+    """``~``-shorten a path for messages, without resolving symlinks."""
+
+    home = str(home_dir())
+    text = str(path)
+    if text == home:
+        return "~"
+    if text.startswith(home + os.sep):
+        return "~" + text[len(home) :]
+    return text
+
+
+def unconfigured_roots(config: Config) -> Dict[str, List[Path]]:
+    """Harness dirs that exist on this host but are not in the resolved set.
+
+    One glob per harness plus an ``is_dir`` per hit; no directory walks.
+    Roots the user disabled or removed in the UI are not "unconfigured".
+    """
+
+    result = {}  # type: Dict[str, List[Path]]
+    for harness in ("claude", "codex"):
+        resolved = {
+            str(path)
+            for path in resolve_roots(
+                harness, [], config, quiet=True, keep_missing=True, notify=False
+            )
+        }
+        known = set(resolved)
+        for item in list(config.disabled(harness)) + list(config.ignored(harness)):
+            known.add(str(Path(item).expanduser()))
+        # A config file that names roots and leaves out ~/.claude left it out
+        # on purpose; the note is about siblings nothing knows about.
+        known.update(str(path) for path in _default_root_candidates(harness))
+        missing = [
+            candidate
+            for candidate in discover_candidate_roots(harness)
+            if str(candidate) not in known
+        ]
+        if missing:
+            result[harness] = missing
+    return result
+
+
+def warn_unconfigured_roots(config: Config) -> None:
+    """Emit one stderr note about harness dirs that nothing will scan."""
+
+    if config.ignore_unconfigured or not notices_enabled():
+        return
+    found = unconfigured_roots(config)
+    paths = [display_path(path) for harness in ("claude", "codex")
+             for path in found.get(harness, [])]
+    if not paths:
+        return
+    warn_once(
+        "found unconfigured harness dirs: %s; run `nenpi config --init` to "
+        "include them (or set [general] ignore_unconfigured = true)"
+        % ", ".join(paths)
+    )
 
 
 # --------------------------------------------------------------------------

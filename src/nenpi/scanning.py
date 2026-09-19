@@ -199,7 +199,9 @@ def scan_sources(
     The mapping contains ``prompts`` and ``reductions`` drilldown lists;
     prompt rows expose ``turns``, ``input_tokens`` (also
     ``input_side_tokens``), ``context_start``, ``context_peak``, and
-    ``context_growth``.  No prompt or tool content is returned.
+    ``context_growth``, ``label`` (the redacted one-line prompt label), and
+    per-prompt tool counts and result SIZES.  No other prompt or tool content
+    is returned.
     Callers that need full structured lifecycle events should call
     ``nenpi.drain.prepare`` with a ``ScanStatus`` callback instead.
     """
@@ -275,6 +277,11 @@ def scan_sources(
     check_facade_cancelled()
     reductions_found = drain.detect_reductions_cached(analysis)
     check_facade_cancelled()
+    # `_prompt_detail` reports each prompt's tool counts, which
+    # `attribute_tools` writes onto the prompts as a side effect, so the
+    # attribution `drain.prepare` now leaves lazy is forced here.
+    _ = analysis.tool_calls
+    check_facade_cancelled()
     all_prompts = [
         prompt
         for prompt_rows in analysis.prompts.values()
@@ -298,8 +305,18 @@ def scan_sources(
         check_facade_cancelled()
         payload = drain.row_json(row)
         key = (payload["harness"], payload["session_id"])
-        payload["prompt_details"] = prompts_by_session.get(key, [])
+        details = prompts_by_session.get(key, [])
+        payload["prompt_details"] = details
         payload["reductions"] = reductions_by_session.get(key, [])
+        # Tool names and sizes only, rolled up from the prompt rows.
+        payload["tools"] = {
+            "calls": sum(int(item["tool_calls"]) for item in details),
+            "result_chars": sum(int(item["tool_result_chars"]) for item in details),
+            "est_tokens": sum(float(item["tool_est_tokens"]) for item in details),
+            "measured_tokens": sum(
+                float(item["tool_measured_tokens"]) for item in details
+            ),
+        }
         session_payload.append(payload)
     if status_callback is not None and final_status[0] is not None:
         status_callback(final_status[0])
@@ -340,6 +357,14 @@ def _prompt_detail(prompt: Any) -> Dict[str, Any]:
         "drain_percent": raw["drain_percent"],
         "model": raw["model"],
         "reduction": raw["reduction"],
+        # The redacted one-line prompt label, never the prompt itself.
+        "label": raw.get("label", ""),
+        "tool_calls": raw["tool_calls"],
+        "tool_result_chars": raw["tool_result_chars"],
+        "tool_est_tokens": raw["tool_est_tokens"],
+        "tool_measured_tokens": raw["tool_measured_tokens"],
+        "largest_tool": raw["largest_tool"],
+        "largest_tool_chars": raw["largest_tool_chars"],
     }
 
 
