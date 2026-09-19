@@ -586,6 +586,55 @@ class CodexParsing(Harness):
         self.assertEqual(row["tokens"]["input"], 20_000)
         self.assertEqual(row["tokens"]["output"], 700)
 
+    def test_verify_aggregates_thread_reports_for_codex_subagents(self) -> None:
+        now = time.time() - 1200
+        session = "codex-parent-4444"
+        subagent = "codex-subagent-4444"
+        subagent_path = self.write_codex(
+            "rollout-subagent-4444.jsonl",
+            [
+                codex_subagent_meta_line(
+                    now, subagent, session, "/home/agent/subagent"
+                ),
+                codex_turn_context_line(now, "gpt-5.6-sol"),
+                codex_usage_record_line(
+                    now + 10,
+                    session,
+                    input_tokens=90_000,
+                    cached_input_tokens=0,
+                    output_tokens=900,
+                    thread_total={"input_tokens": 90_000, "output_tokens": 900},
+                ),
+            ],
+        )
+        root_path = self.write_codex(
+            "rollout-root-4444.jsonl",
+            [
+                codex_session_meta_line(now, session, "/home/agent/root"),
+                codex_turn_context_line(now, "gpt-5.6-sol"),
+                codex_usage_record_line(
+                    now + 20,
+                    session,
+                    input_tokens=10_000,
+                    cached_input_tokens=0,
+                    output_tokens=100,
+                    thread_total={"input_tokens": 10_000, "output_tokens": 100},
+                ),
+            ],
+        )
+        # Make the root the last file absorbed. The old implementation then
+        # compares the parent-plus-subagent sum with the root thread only.
+        os.utime(subagent_path, (now, now))
+        os.utime(root_path, (now + 1, now + 1))
+
+        payload = self.run_json("verify", "--harness", "codex", "--json")
+        rows = [row for row in payload["rows"] if row["short_id"] == QD.short_id(session)]
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["deduped"]["input"], 100_000)
+        self.assertEqual(rows[0]["deduped"]["output"], 1_000)
+        self.assertEqual(rows[0]["thread_token_usage"]["input"], 100_000)
+        self.assertEqual(rows[0]["thread_token_usage"]["output"], 1_000)
+
     def test_cached_input_is_a_subset_of_input(self) -> None:
         tokens = QD.codex_usage_tokens(
             {
