@@ -882,6 +882,7 @@ class SessionSummary:
         self.end = None  # type: Optional[float]
         self.cost_state = None  # type: Optional[Dict[str, Any]]
         self.thread_usage = None  # type: Optional[Dict[str, int]]
+        self.thread_usages = {}  # type: Dict[str, Dict[str, int]]
         self.originator = ""
         # Filled by rebuild_totals from the surviving events.
         self.models = {}  # type: Dict[str, Dict[str, int]]
@@ -925,6 +926,8 @@ class SessionSummary:
             payload["cost_state"] = self.cost_state
         if self.thread_usage is not None:
             payload["thread_usage"] = self.thread_usage
+        if self.thread_usages:
+            payload["thread_usages"] = self.thread_usages
         if self.originator:
             payload["originator"] = self.originator
         return payload
@@ -939,6 +942,14 @@ class SessionSummary:
         summary.end = payload.get("end")
         summary.cost_state = payload.get("cost_state")
         summary.thread_usage = payload.get("thread_usage")
+        thread_usages = payload.get("thread_usages")
+        if isinstance(thread_usages, Mapping):
+            for thread_id, usage in thread_usages.items():
+                if not isinstance(usage, Mapping):
+                    continue
+                summary.thread_usages[str(thread_id)] = dict(
+                    (kind, int(usage.get(kind, 0) or 0)) for kind in CODEX_KINDS
+                )
         summary.originator = str(payload.get("originator", ""))
         return summary
 
@@ -953,6 +964,15 @@ class SessionSummary:
             self.cost_state = other.cost_state
         if other.thread_usage is not None:
             self.thread_usage = other.thread_usage
+        for thread_id, usage in other.thread_usages.items():
+            previous = self.thread_usages.get(thread_id)
+            if previous is None:
+                self.thread_usages[thread_id] = dict(usage)
+            else:
+                self.thread_usages[thread_id] = dict(
+                    (kind, max(previous.get(kind, 0), usage.get(kind, 0)))
+                    for kind in CODEX_KINDS
+                )
 
 
 class FileIndex:
@@ -1601,6 +1621,8 @@ def parse_codex_file(
             thread_usage = payload.get("thread_token_usage")
             if isinstance(thread_usage, dict):
                 summary.thread_usage = codex_usage_tokens(thread_usage)
+                thread_id = index.thread_id or path.stem
+                summary.thread_usages[thread_id] = codex_usage_tokens(thread_usage)
             turn_id = payload.get("turn_id")
             response_id = payload.get("response_id")
             record_event(
@@ -6255,13 +6277,21 @@ def command_verify(args: argparse.Namespace) -> int:
                     }
                 )
         else:
-            thread = summary.thread_usage
-            if not thread:
+            threads = summary.thread_usages
+            if not threads and summary.thread_usage:
+                # Compatibility for cache entries written before per-thread
+                # reports were retained. Fresh scans always populate the map.
+                threads = {"": summary.thread_usage}
+            if not threads:
                 continue
             observed = empty_tokens(CODEX_KINDS)
             for tokens in summary.models.values():
                 for kind in CODEX_KINDS:
                     observed[kind] += int(tokens.get(kind, 0))
+            reported = empty_tokens(CODEX_KINDS)
+            for thread in threads.values():
+                for kind in CODEX_KINDS:
+                    reported[kind] += int(thread.get(kind, 0))
             report.append(
                 {
                     "harness": "codex",
@@ -6269,7 +6299,7 @@ def command_verify(args: argparse.Namespace) -> int:
                     "short_id": short_id(session_id),
                     "model": "-",
                     "deduped": observed,
-                    "thread_token_usage": thread,
+                    "thread_token_usage": reported,
                 }
             )
     hints = verify_hints(args, report, analysis_session_ids(analysis))
