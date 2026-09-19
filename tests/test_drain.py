@@ -1235,7 +1235,12 @@ class AttributionCap(Harness):
         self.assertEqual(len(with_prompt_event), QD.EVENT_PROMPT + 1)
         weights = QD.Weights({"codex": {"models": {"m": {"input": 1.0}}}}, ["test"])
         args = argparse.Namespace(long_context_multiplier=1.0, claude_cache_read_weight=None)
-        QD.attribute([interval], [no_prompt_event, with_prompt_event], weights, args)
+        # attribute() falls back to reading state_dir()/"codex-weights.json"
+        # (real ~/.local/state/nenpi without this) when weights aren't
+        # already "calibrated" - apply the fixture's env so that read stays
+        # inside the temp root instead of whatever the host has fitted.
+        with self.env_applied():
+            QD.attribute([interval], [no_prompt_event, with_prompt_event], weights, args)
         session_share = interval.sessions[session_id]
         self.assertAlmostEqual(session_share, 10.0, places=6)
         prompt_total = sum(
