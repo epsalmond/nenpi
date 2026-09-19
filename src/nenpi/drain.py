@@ -32,7 +32,7 @@ import urllib.error
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, Iterator, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterable, Iterator, List, Mapping, Optional, Sequence, Tuple
 
 from nenpi.config import (
     Config,
@@ -78,7 +78,7 @@ except ImportError:  # bench can load drain.py as a standalone quota module.
         serialized_cache,
     )
 
-CACHE_SCHEMA = 5
+CACHE_SCHEMA = 6
 JSON_SCHEMA = 1
 LONG_CONTEXT_THRESHOLD = 200_000
 CONTEXT_REDUCTION_FRACTION = 0.30
@@ -974,7 +974,12 @@ class FileIndex:
         self.boundaries = []  # type: List[List[Any]]
         self.compactions = []  # type: List[List[Any]]
         # One row per completed tool call; see the TOOL_* layout below.
-        self.tools = []  # type: List[List[Any]]
+        # Tool rows are a fifth of the cached bytes and only `tools`,
+        # `prompts` and `fanout` ever look at them, so they live in a
+        # sibling shard that `tools_loader` reads on first touch. `sessions`
+        # and `timeline` never decode them.
+        self._tools = []  # type: List[List[Any]]
+        self.tools_loader = None  # type: Optional[Callable[[], List[List[Any]]]]
         # tool-call id -> [name, sidechain, spawn] for calls whose result has
         # not been read yet. Kept across incremental parses because a call and
         # its result can straddle the resume offset.
@@ -988,6 +993,24 @@ class FileIndex:
         self.is_subagent = False
         self.head_hash = ""
         self.tail_hash = ""
+
+    @property
+    def tools(self) -> List[List[Any]]:
+        loader = self.tools_loader
+        if loader is not None:
+            self.tools_loader = None
+            self._tools = loader()
+        return self._tools
+
+    @tools.setter
+    def tools(self, rows: List[List[Any]]) -> None:
+        self.tools_loader = None
+        self._tools = rows
+
+    @property
+    def tools_pending(self) -> bool:
+        """True when tool rows exist on disk but have not been read."""
+        return self.tools_loader is not None
 
     def to_json(self) -> Dict[str, Any]:
         return {
@@ -1005,7 +1028,6 @@ class FileIndex:
             "last_model": self.last_model,
             "boundaries": self.boundaries,
             "compactions": self.compactions,
-            "tools": self.tools,
             "pending_tools": self.pending_tools,
             "pending_label": self.pending_label,
             "pending_label_rank": self.pending_label_rank,
@@ -1032,7 +1054,6 @@ class FileIndex:
         index.last_model = str(payload.get("last_model", UNWEIGHTED))
         index.boundaries = list(payload.get("boundaries") or [])
         index.compactions = list(payload.get("compactions") or [])
-        index.tools = list(payload.get("tools") or [])
         index.pending_tools = list(payload.get("pending_tools") or [])
         index.pending_label = str(payload.get("pending_label", ""))
         index.pending_label_rank = int(payload.get("pending_label_rank") or 0)
@@ -1833,6 +1854,23 @@ class Cache:
         digest = hashlib.sha1(key.encode("utf-8")).hexdigest()
         return self.root / ("v%d" % CACHE_SCHEMA) / digest[:2] / (digest + ".json")
 
+    def tools_path(self, key: str) -> Path:
+        """Sibling shard holding this transcript's tool rows.
+
+        Tool rows are a fifth of the cached bytes and most commands never
+        read one, so they are parked beside the shard instead of inside it:
+        `sessions` then decodes only what it reports on.
+        """
+        return self.shard_path(key).with_suffix(".tools.json")
+
+    @staticmethod
+    def _load_tool_rows(path: Path) -> List[List[Any]]:
+        try:
+            rows = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return []
+        return list(rows) if isinstance(rows, list) else []
+
     def stored(self, key: str, harness: str) -> Optional[FileIndex]:
         if self.rebuild:
             return None
@@ -1851,6 +1889,9 @@ class Cache:
             return None
         if entry.harness != harness:
             return None
+        tools_file = self.tools_path(key)
+        if tools_file.is_file():
+            entry.tools_loader = lambda path=tools_file: self._load_tool_rows(path)
         self.entries[key] = entry
         return entry
 
@@ -1902,7 +1943,10 @@ class Cache:
             root = self.root / ("v%d" % CACHE_SCHEMA)
             if not root.is_dir():
                 return
-            expected = set(self.shard_path(key).name for key in live)
+            expected = set()  # type: set
+            for key in live:
+                expected.add(self.shard_path(key).name)
+                expected.add(self.tools_path(key).name)
             for shard in root.rglob("*.json"):
                 check_cancelled(cancellation)
                 if shard.name in expected:
@@ -1927,19 +1971,37 @@ class Cache:
             payload["path"] = key
             destination = self.shard_path(key)
             destination.parent.mkdir(parents=True, exist_ok=True)
-            temporary = destination.with_name(
-                "%s.%d.%d.tmp" % (destination.name, os.getpid(), time.time_ns())
-            )
-            try:
-                with open(temporary, "w", encoding="utf-8") as handle:
-                    json.dump(payload, handle, separators=(",", ":"))
-                os.replace(str(temporary), str(destination))
-            finally:
-                try:
-                    temporary.unlink()
-                except OSError:
-                    pass
+            self._write_atomic(destination, payload)
+            # A dirty entry was parsed, and parsing appends to `tools`, so
+            # its rows are always loaded here; the guard only keeps an
+            # untouched entry from being rewritten from an unread loader.
+            if not entry.tools_pending:
+                tools_file = self.tools_path(key)
+                if entry.tools:
+                    self._write_atomic(tools_file, entry.tools)
+                else:
+                    # An empty list would cost a file and a decode per
+                    # transcript that never called a tool.
+                    try:
+                        tools_file.unlink()
+                    except OSError:
+                        pass
         self.dirty.clear()
+
+    @staticmethod
+    def _write_atomic(destination: Path, payload: Any) -> None:
+        temporary = destination.with_name(
+            "%s.%d.%d.tmp" % (destination.name, os.getpid(), time.time_ns())
+        )
+        try:
+            with open(temporary, "w", encoding="utf-8") as handle:
+                json.dump(payload, handle, separators=(",", ":"))
+            os.replace(str(temporary), str(destination))
+        finally:
+            try:
+                temporary.unlink()
+            except OSError:
+                pass
 
     def flush(self) -> None:
         with serialized_cache(self.root):
@@ -1983,7 +2045,14 @@ class Scan:
     def __init__(self):
         self.sessions = {}  # type: Dict[Tuple[str, str], SessionSummary]
         self.events = {"claude": [], "codex": []}  # type: Dict[str, List[List[Any]]]
-        self.tools = {"claude": [], "codex": []}  # type: Dict[str, List[List[Any]]]
+        # Tool rows stay in their per-file shards until something asks for
+        # them. `absorb` only records where they are; the dedup merge and
+        # the range/account filters below replay on first read, in the same
+        # order they were applied, so the rows come out identical to the
+        # eager build. See `FileIndex.tools`.
+        self._tool_sources = []  # type: List[Tuple[FileIndex, str]]
+        self._tool_filters = []  # type: List[Callable[[str, List[List[Any]]], List[List[Any]]]]
+        self._tools = None  # type: Optional[Dict[str, List[List[Any]]]]
         self.claimed_tools = {}  # type: Dict[Tuple[str, str], str]
         self.snapshots = []  # type: List[Dict[str, Any]]
         self.boundaries = {}  # type: Dict[Tuple[str, str], List[float]]
@@ -2001,6 +2070,47 @@ class Scan:
         self.files_read = 0
         self.files_seen = 0
         self.bytes_read = 0
+
+    def defer_tools(self, entry: "FileIndex", harness: str) -> None:
+        self._tool_sources.append((entry, harness))
+
+    def filter_tools(
+        self, keep: "Callable[[str, List[List[Any]]], List[List[Any]]]"
+    ) -> None:
+        """Record a filter to apply when the tool rows are finally read."""
+        if self._tools is None:
+            self._tool_filters.append(keep)
+            return
+        for harness, rows in self._tools.items():
+            self._tools[harness] = keep(harness, rows)
+
+    @property
+    def tools(self) -> Dict[str, List[List[Any]]]:
+        if self._tools is None:
+            merged = {"claude": [], "codex": []}  # type: Dict[str, List[List[Any]]]
+            claimed = self.claimed_tools
+            for entry, harness in self._tool_sources:
+                kept = merged.setdefault(harness, [])
+                for row in entry.tools:
+                    tool_id = (harness, row[TOOL_ID]) if row[TOOL_ID] else None
+                    if tool_id is not None:
+                        if tool_id in claimed:
+                            # The same call replayed into a resumed or
+                            # forked transcript.
+                            continue
+                        claimed[tool_id] = row[TOOL_SESSION]
+                    kept.append(row)
+            for keep in self._tool_filters:
+                for harness, rows in merged.items():
+                    merged[harness] = keep(harness, rows)
+            self._tool_filters = []
+            self._tools = merged
+        return self._tools
+
+    @tools.setter
+    def tools(self, value: Dict[str, List[List[Any]]]) -> None:
+        self._tools = value
+        self._tool_filters = []
 
 
 def collect(
@@ -2161,16 +2271,7 @@ def absorb(scan: Scan, entry: FileIndex, harness: str, account: str, account_lab
                 continue
             claimed[call_id] = row_session
         kept.append(row)
-    kept_tools = scan.tools[harness]
-    claimed_tools = scan.claimed_tools
-    for row in entry.tools:
-        tool_id = (harness, row[TOOL_ID]) if row[TOOL_ID] else None
-        if tool_id is not None:
-            if tool_id in claimed_tools:
-                # The same call replayed into a resumed or forked transcript.
-                continue
-            claimed_tools[tool_id] = row[TOOL_SESSION]
-        kept_tools.append(row)
+    scan.defer_tools(entry, harness)
     for row in entry.snapshots:
         stamped_row = dict(row)
         stamped_row["account"] = account
@@ -2206,14 +2307,14 @@ def window_events(
             if (since is None or row[EVENT_TS] >= since)
             and (until is None or row[EVENT_TS] <= until)
         ]
-    for harness, tools in scan.tools.items():
-        check_cancelled(cancellation)
-        scan.tools[harness] = [
+    scan.filter_tools(
+        lambda _harness, rows: [
             row
-            for row in tools
+            for row in rows
             if (since is None or row[TOOL_TS] >= since)
             and (until is None or row[TOOL_TS] <= until)
         ]
+    )
 
 
 def rebuild_totals(scan: Scan, cancellation: Cancellation = None) -> None:
@@ -4644,12 +4745,29 @@ class Analysis:
         self.until = until
         self.window = None  # type: Optional[str]
         self.intervals = []  # type: List[Interval]
-        self.prompts = {}  # type: Dict[Tuple[str, str], List[Prompt]]
-        self.tool_calls = []  # type: List[ToolCall]
         # (harness, session) -> total positive input growth across its calls,
         # the denominator for a tool's share of context growth.
         self.growth_totals = {}  # type: Dict[Tuple[str, str], int]
         self.reductions = None  # type: Optional[List[Reduction]]
+        self.prompts = {}  # type: Dict[Tuple[str, str], List[Prompt]]
+        # Tool attribution walks every recorded tool result and every API
+        # call to split context growth between them. Only `tools`, `prompts`
+        # and `fanout` ever read the answer, so it is computed on first use
+        # rather than by `prepare`: `sessions` and `timeline` were paying for
+        # a whole second pass over the corpus they never looked at.
+        #
+        # Prompt assembly stays eager because `attribute()` reads the prompt
+        # index that `assemble_prompts` writes onto each codex event, so
+        # every command that reports drain already depends on it.
+        self.cancellation = None  # type: Cancellation
+        self._tool_calls = None  # type: Optional[List[ToolCall]]
+
+    @property
+    def tool_calls(self) -> List[ToolCall]:
+        if self._tool_calls is None:
+            with profile_phase("tools"):
+                self._tool_calls = attribute_tools(self.scan, self, self.cancellation)
+        return self._tool_calls
 
     def prompts_for(self, harness: str, session_id: str) -> List[Prompt]:
         return self.prompts.get((harness, session_id), [])
@@ -4702,10 +4820,11 @@ def filter_by_account(scan: Scan, label: str) -> None:
         scan.events[harness] = [
             row for row in events if (harness, row[EVENT_SESSION]) in keep
         ]
-    for harness, tools in scan.tools.items():
-        scan.tools[harness] = [
-            row for row in tools if (harness, row[TOOL_SESSION]) in keep
+    scan.filter_tools(
+        lambda harness, rows: [
+            row for row in rows if (harness, row[TOOL_SESSION]) in keep
         ]
+    )
     scan.snapshots = [row for row in scan.snapshots if row.get("account") in account_keys]
     scan.boundaries = dict(
         (key, value) for key, value in scan.boundaries.items() if key in keep
@@ -4745,12 +4864,11 @@ def prepare(
                 window_events(scan, since, until, cancellation)
             rebuild_totals(scan, cancellation)
         analysis = Analysis(scan, weights, since, until, args)
+        analysis.cancellation = cancellation
         # Prompt keys must exist before attribution so measured drain can be split
         # down to the prompt as well as the session.
         with profile_phase("prompts"):
             analysis.prompts = assemble_prompts(scan, weights, args, cancellation)
-        with profile_phase("tools"):
-            analysis.tool_calls = attribute_tools(scan, analysis, cancellation)
         run.check()
         with profile_phase("intervals"):
             analysis.window = choose_window(scan.snapshots, args.window)
@@ -5513,6 +5631,10 @@ def command_prompts_ranked(args: argparse.Namespace, analysis: "Analysis") -> in
 
 def command_prompts(args: argparse.Namespace) -> int:
     analysis = prepare(args)
+    # Every prompt row this command prints or serializes carries its tool
+    # counts, which `attribute_tools` writes onto the prompts as a side
+    # effect, so the lazy attribution is forced before any prompt is read.
+    _ = analysis.tool_calls
     if not getattr(args, "session", None):
         return command_prompts_ranked(args, analysis)
     candidates = dict(
@@ -5828,6 +5950,10 @@ def command_tools(args: argparse.Namespace) -> int:
 
 def command_fanout(args: argparse.Namespace) -> int:
     analysis = prepare(args)
+    # Every prompt row this command prints or serializes carries its tool
+    # counts, which `attribute_tools` writes onto the prompts as a side
+    # effect, so the lazy attribution is forced before any prompt is read.
+    _ = analysis.tool_calls
     prompts = [
         prompt
         for prompts in analysis.prompts.values()

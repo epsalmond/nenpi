@@ -4556,6 +4556,53 @@ class ToolAttribution(Harness):
         self.assertEqual(prompt["tool_result_chars"], 1200)
         self.assertEqual(prompt["largest_tool"], "mcp__github__list_issues")
 
+    def test_reports_that_show_no_tools_never_attribute_them(self) -> None:
+        """`sessions`/`timeline` must not pay for anything tool-shaped.
+
+        Attribution is a second pass over every recorded tool result and
+        every API call, and decoding the tool shards is a fifth of the
+        cached bytes. Neither report shows a byte of either. Patching both
+        to raise is the only check that stays honest as the pipeline moves:
+        a timing assertion would not.
+        """
+        session = "53000000-1111-2222-3333-444444444444"
+        self.claude_session("lazy-tools.jsonl", session)
+
+        def explode(*_args: Any, **_kwargs: Any) -> None:
+            raise AssertionError("tool attribution ran for a report without tools")
+
+        def explode_rows(*_args: Any, **_kwargs: Any) -> None:
+            raise AssertionError("a tool shard was decoded for a report without tools")
+
+        original = QD.attribute_tools
+        original_rows = QD.Cache._load_tool_rows
+        QD.attribute_tools = explode
+        QD.Cache._load_tool_rows = staticmethod(explode_rows)
+        try:
+            for command in ("sessions", "timeline", "windows"):
+                captured = io.StringIO()
+                stdout, sys.stdout = sys.stdout, captured
+                try:
+                    with self.env_applied():
+                        code = QD.main([command, "--harness", "claude", "--no-color", "-q"])
+                finally:
+                    sys.stdout = stdout
+                self.assertEqual(code, 0, "%s failed: %s" % (command, captured.getvalue()))
+            # And the guard is real: the command that does show tools trips
+            # one of them (the shard decode comes first).
+            QD.Cache._load_tool_rows = original_rows
+            captured = io.StringIO()
+            stdout, sys.stdout = sys.stdout, captured
+            try:
+                with self.env_applied():
+                    with self.assertRaises(AssertionError):
+                        QD.main(["tools", "--harness", "claude", "--no-color", "-q"])
+            finally:
+                sys.stdout = stdout
+        finally:
+            QD.attribute_tools = original
+            QD.Cache._load_tool_rows = original_rows
+
     def test_shard_round_trip_stores_sizes_only(self) -> None:
         session = "60000000-1111-2222-3333-444444444444"
         self.claude_session("shard.jsonl", session)
@@ -5013,8 +5060,10 @@ class PromptRanking(Harness):
         )
         self.assertEqual(second["prompts"][0]["label"], "rank me first please")
 
-    def test_cache_schema_is_five(self) -> None:
-        self.assertEqual(QD.CACHE_SCHEMA, 5)
+    def test_cache_schema_is_six(self) -> None:
+        # Bumped by the tool-row shard split; a v5 shard still carries its
+        # tool rows inline and would read back as a file with none.
+        self.assertEqual(QD.CACHE_SCHEMA, 6)
 
     def test_codex_label_comes_from_the_user_message(self) -> None:
         now = time.time() - 3600

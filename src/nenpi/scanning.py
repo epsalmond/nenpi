@@ -277,6 +277,11 @@ def scan_sources(
     check_facade_cancelled()
     reductions_found = drain.detect_reductions_cached(analysis)
     check_facade_cancelled()
+    # `_prompt_detail` reports each prompt's tool counts, which
+    # `attribute_tools` writes onto the prompts as a side effect, so the
+    # attribution `drain.prepare` now leaves lazy is forced here.
+    _ = analysis.tool_calls
+    check_facade_cancelled()
     all_prompts = [
         prompt
         for prompt_rows in analysis.prompts.values()
