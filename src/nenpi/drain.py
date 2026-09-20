@@ -1174,6 +1174,33 @@ def vector_units(vector: Sequence[Tuple[int, float]], event: Sequence[Any]) -> f
 TOOL_SESSION, TOOL_TS, TOOL_NAME = 0, 1, 2
 TOOL_CHARS, TOOL_SUB, TOOL_SPAWN, TOOL_ID = 3, 4, 5, 6
 
+# Command text is deliberately not part of a cached tool row.  `tools
+# --explain` rereads the source transcript and uses this transient provenance
+# to associate that text with the already deduplicated, scoped row.
+EXPLAIN_MAX_EXAMPLES = 3
+EXPLAIN_MAX_TOP_CALLS = 10
+EXPLAIN_EXAMPLE_CHARS = 180
+EXPLAIN_SHAPE_CHARS = 180
+COMMAND_VALUE_OPTIONS = frozenset(
+    (
+        "-C", "-A", "-B", "-g", "-t", "-j", "-m", "-M", "-f", "-c",
+        "--after-context", "--before-context", "--context", "--glob",
+        "--type", "--type-not", "--threads", "--max-count", "--max-depth",
+        "--color", "--sort", "--strip-ansi", "--exclude", "--include",
+        "--file", "--regexp", "--pattern", "--workdir", "--timeout",
+    )
+)
+COMMAND_OPTION_ALIASES = {
+    "--line-number": "-n",
+    "--no-heading": "-N",
+    "--fixed-strings": "-F",
+    "--hidden": "--hidden",
+}
+SHELL_TOOL_NAMES = frozenset(
+    ("bash", "shell", "exec", "exec_command", "run_shell_command", "local_shell")
+)
+SHELL_OPERATORS = frozenset(("|", "|&", "&&", "||", ";", "&", ">", ">>", "<", "<<"))
+
 
 def content_chars(value: Any) -> int:
     """Size of a tool result in characters, without keeping any of it.
@@ -1210,6 +1237,356 @@ def content_chars(value: Any) -> int:
             total += content_chars(part)
         return total
     return len(str(value))
+
+
+def command_text(value: Any) -> str:
+    """Turn a transcript command field into one shell-like string.
+
+    Codex has emitted both a string command and argv-shaped lists over time;
+    accepting both here keeps explanation mode useful across rollout versions.
+    This value exists only during the requested source reread.
+    """
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (list, tuple)):
+        parts = [part for part in value if isinstance(part, (str, int, float))]
+        if not parts:
+            return ""
+        return shlex.join([str(part) for part in parts])
+    if isinstance(value, Mapping):
+        for key in ("command", "cmd", "argv", "args"):
+            if key in value:
+                result = command_text(value.get(key))
+                if result:
+                    return result
+    return ""
+
+
+def command_from_payload(payload: Mapping[str, Any], item: str) -> str:
+    """Extract a shell command from Claude or Codex's call payload."""
+    if item == "local_shell_call":
+        action = payload.get("action")
+        result = command_text(action)
+        if result:
+            return result
+    for key in ("command", "cmd", "argv"):
+        result = command_text(payload.get(key))
+        if result:
+            return result
+    for key in ("arguments", "input", "parameters"):
+        value = payload.get(key)
+        if isinstance(value, str):
+            try:
+                value = json.loads(value)
+            except (TypeError, ValueError):
+                # A plain string is itself useful for custom shell tools.
+                return value if item != "function_call" else ""
+        result = command_text(value)
+        if result:
+            return result
+    return ""
+
+
+def source_tool_commands(
+    path: Path, harness: str
+) -> Iterator[Tuple[str, str, str]]:
+    """Yield ``(call id, session id, command)`` from one live transcript.
+
+    This is intentionally a small, command-only rereader rather than a second
+    full parser.  It never writes the extracted strings to a cache.
+    """
+    session_id = ""
+    try:
+        lines = read_lines_from(path, 0)
+        for _position, raw in lines:
+            if harness == "claude":
+                # Result lines can contain arbitrarily large tool output;
+                # the tool-use record itself carries the session id needed for
+                # the provenance key, so no other Claude record is needed.
+                if b'"tool_use"' not in raw:
+                    continue
+            else:
+                # Keep the reread command-only.  In particular, do not JSON
+                # decode function/custom/local-shell outputs, whose output
+                # fields may be much larger than the call record.
+                if any(marker in raw for marker in (
+                    b'"function_call_output"',
+                    b'"custom_tool_call_output"',
+                    b'"local_shell_call_output"',
+                )):
+                    continue
+                if (
+                    b'"session_meta"' not in raw
+                    and b'"function_call"' not in raw
+                    and b'"local_shell_call"' not in raw
+                ):
+                    continue
+            try:
+                record = json.loads(raw)
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(record, Mapping):
+                continue
+            if harness == "claude":
+                candidate = record.get("sessionId")
+                if isinstance(candidate, str) and candidate:
+                    session_id = candidate
+                if record.get("type") != "assistant":
+                    continue
+                message = record.get("message")
+                if not isinstance(message, Mapping):
+                    continue
+                content = message.get("content")
+                if not isinstance(content, list):
+                    continue
+                for block in content:
+                    if not isinstance(block, Mapping) or block.get("type") != "tool_use":
+                        continue
+                    name = block.get("name")
+                    call_id = block.get("id")
+                    if not isinstance(call_id, str) or not isinstance(name, str):
+                        continue
+                    if name.lower() != "bash":
+                        continue
+                    command = command_text(block.get("input"))
+                    if command:
+                        yield call_id, session_id, command
+                continue
+            kind = record.get("type")
+            payload = record.get("payload")
+            if not isinstance(payload, Mapping):
+                continue
+            if kind == "session_meta":
+                candidate = payload.get("session_id") or payload.get("id")
+                if isinstance(candidate, str) and candidate:
+                    session_id = candidate
+                continue
+            if kind != "response_item":
+                continue
+            item = payload.get("type")
+            if item not in CODEX_TOOL_CALL_ITEMS:
+                continue
+            call_id = payload.get("call_id") or payload.get("id")
+            name = codex_tool_name(payload, str(item))
+            if not isinstance(call_id, str) or not call_id:
+                continue
+            # local_shell_call is the canonical Codex shell item.  The
+            # function-call names cover older and provider-backed shell APIs.
+            if item != "local_shell_call" and (
+                item != "function_call"
+                or name.lower().split(".")[-1] not in SHELL_TOOL_NAMES
+            ):
+                continue
+            command = command_from_payload(payload, str(item))
+            if command:
+                yield call_id, session_id, command
+    except OSError:
+        return
+
+
+def escaped_command(value: str, limit: int = EXPLAIN_EXAMPLE_CHARS) -> str:
+    """Make a command one-line and terminal-safe before displaying it."""
+    output = []
+    length = 0
+    for char in value:
+        code = ord(char)
+        if char == "\\":
+            piece = "\\\\"
+        elif char == "\n":
+            piece = "\\n"
+        elif char == "\r":
+            piece = "\\r"
+        elif char == "\t":
+            piece = "\\t"
+        elif code < 0x20 or code == 0x7F:
+            piece = "\\x%02x" % code
+        else:
+            piece = char
+        if length + len(piece) > limit:
+            return "".join(output)[: max(0, limit - 3)] + "..."
+        output.append(piece)
+        length += len(piece)
+    return "".join(output)
+
+
+def _command_tokens(command: str) -> Optional[List[str]]:
+    try:
+        lexer = shlex.shlex(command, posix=True, punctuation_chars="|&;<>()")
+        lexer.whitespace_split = True
+        return list(lexer)
+    except ValueError:
+        return None
+
+
+def _simple_command_shape(tokens: Sequence[str]) -> str:
+    if not tokens:
+        return "<empty>"
+    tokens = list(tokens)
+    # The development wrapper is also commonly present in captured prompts;
+    # grouping the underlying command makes `rtk rg` comparable with `rg`.
+    while tokens and tokens[0] in ("rtk", "command"):
+        tokens.pop(0)
+    if tokens and tokens[0] == "env":
+        tokens.pop(0)
+        while tokens and ("=" in tokens[0] or tokens[0].startswith("-")):
+            tokens.pop(0)
+    while tokens and re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", tokens[0]):
+        tokens.pop(0)
+    if not tokens:
+        return "<empty>"
+    executable = os.path.basename(tokens[0]) or tokens[0]
+    options = []  # type: List[str]
+    positional = []  # type: List[str]
+    git_subcommand = False
+    git_action = ""
+    index = 1
+    while index < len(tokens):
+        token = tokens[index]
+        if token in SHELL_OPERATORS:
+            index += 1
+            continue
+        if token.startswith("-") and token != "-":
+            option = token
+            value = None
+            if "=" in option and option.startswith("--"):
+                option, _ = option.split("=", 1)
+                value = "<arg>"
+            elif option in COMMAND_OPTION_ALIASES:
+                option = COMMAND_OPTION_ALIASES[option]
+            elif option.startswith("-") and not option.startswith("--") and len(option) > 2:
+                # Short flag clusters have no semantic order; sorting their
+                # letters makes `rg -nH` and `rg -Hn` one shape.
+                option = "-" + "".join(sorted(option[1:]))
+            if value is None and option in COMMAND_VALUE_OPTIONS and index + 1 < len(tokens):
+                index += 1
+                value = "<arg>"
+            options.append(option if value is None else option + " <arg>")
+        else:
+            if executable == "git" and not git_subcommand:
+                # Git's first non-option token is an actionable subcommand;
+                # retain it while normalizing paths and revisions after it.
+                git_action = token
+                git_subcommand = True
+            else:
+                positional.append("<arg>")
+        index += 1
+    options.sort()
+    prefix = [executable]
+    if git_action:
+        prefix.append(git_action)
+    return " ".join(prefix + options + positional)[:EXPLAIN_SHAPE_CHARS]
+
+
+def command_shape(command: str) -> str:
+    """Normalize a shell command into a deterministic, readable shape."""
+    normalized = command.strip()
+    tokens = _command_tokens(normalized)
+    if not tokens:
+        # Keep a stable fallback for malformed/unterminated shell syntax.
+        return "compound: " + escaped_command(command, EXPLAIN_SHAPE_CHARS - 10)
+    if "\n" in normalized:
+        # shlex treats newlines as whitespace. Split them before tokenizing so
+        # `rg foo\nsed bar` cannot silently turn into one `rg` shape.
+        parts = [command_shape(line) for line in normalized.splitlines() if line.strip()]
+        return "compound: " + " ; ".join(parts)[: EXPLAIN_SHAPE_CHARS - 10]
+    if any(token in SHELL_OPERATORS for token in tokens):
+        parts = []
+        segment = []
+        for token in tokens:
+            if token in SHELL_OPERATORS:
+                if segment:
+                    parts.append(_simple_command_shape(segment))
+                    segment = []
+                parts.append(token)
+            else:
+                segment.append(token)
+        if segment:
+            parts.append(_simple_command_shape(segment))
+        return "compound: " + " ".join(parts)[: EXPLAIN_SHAPE_CHARS - 10]
+    return _simple_command_shape(tokens)
+
+
+def explain_command_calls(
+    scan: Scan, calls: Sequence[ToolCall]
+) -> Tuple[List[Dict[str, Any]], List[ToolCall]]:
+    """Attach live command text to already-scoped calls, without persistence."""
+    wanted = {
+        (call.harness, call.call_id, call.session_id, call.source)
+        for call in calls
+        if call.call_id and call.source
+    }
+    found = {}  # type: Dict[Tuple[str, str, str, str], str]
+    wanted_sources = {call.source for call in calls if call.call_id and call.source}
+    sources = {
+        (harness, str(source))
+        for _entry, harness, source in scan._tool_sources
+        if source is not None and str(source) in wanted_sources
+    }
+    for harness, source in sorted(sources):
+        path = Path(source)
+        for call_id, session_id, command in source_tool_commands(path, harness):
+            key = (harness, call_id, session_id, source)
+            if key in wanted and key not in found:
+                found[key] = command
+    records = []  # type: List[Tuple[ToolCall, str, str]]
+    for call in calls:
+        command = found.get((call.harness, call.call_id, call.session_id, call.source))
+        if command:
+            records.append((call, command, command_shape(command)))
+    grouped = {}  # type: Dict[str, Dict[str, Any]]
+    for call, command, shape in records:
+        row = grouped.get(shape)
+        if row is None:
+            row = {
+                "shape": shape,
+                "calls": 0,
+                "result_chars": 0,
+                "est_tokens": 0.0,
+                "measured_tokens": 0.0,
+                "mean_result_chars": 0.0,
+                "max_result_chars": 0,
+                "mean_est_tokens": 0.0,
+                "max_est_tokens": 0.0,
+                "examples": [],
+            }
+            grouped[shape] = row
+        row["calls"] += 1
+        row["result_chars"] += call.chars
+        row["est_tokens"] += call.est_tokens
+        row["measured_tokens"] += call.measured
+        row["max_result_chars"] = max(row["max_result_chars"], call.chars)
+        row["max_est_tokens"] = max(row["max_est_tokens"], call.est_tokens)
+        if len(row["examples"]) < EXPLAIN_MAX_EXAMPLES:
+            example = escaped_command(command)
+            if example not in row["examples"]:
+                row["examples"].append(example)
+    for row in grouped.values():
+        calls_count = row["calls"]
+        row["mean_result_chars"] = row["result_chars"] / calls_count if calls_count else 0.0
+        row["mean_est_tokens"] = row["est_tokens"] / calls_count if calls_count else 0.0
+    shapes = sorted(
+        grouped.values(), key=lambda row: (row["est_tokens"], row["calls"], row["shape"]),
+        reverse=True,
+    )
+    top_calls = sorted(
+        records, key=lambda item: (item[0].chars, item[0].ts, item[1]), reverse=True
+    )[:EXPLAIN_MAX_TOP_CALLS]
+    top = []
+    for call, command, shape in top_calls:
+        top.append(
+            {
+                "command": escaped_command(command),
+                "shape": shape,
+                "harness": call.harness,
+                "session_id": call.session_id,
+                "short_id": short_id(call.session_id),
+                "prompt": call.prompt,
+                "result_chars": call.chars,
+                "est_tokens": call.est_tokens,
+                "measured_tokens": call.measured,
+            }
+        )
+    return shapes, top
 
 
 def is_spawn_tool(name: str) -> bool:
@@ -2127,9 +2504,13 @@ class Scan:
         # the range/account filters below replay on first read, in the same
         # order they were applied, so the rows come out identical to the
         # eager build. See `FileIndex.tools`.
-        self._tool_sources = []  # type: List[Tuple[FileIndex, str]]
+        self._tool_sources = []  # type: List[Tuple[FileIndex, str, Optional[Path]]]
         self._tool_filters = []  # type: List[Callable[[str, List[List[Any]]], List[List[Any]]]]
         self._tools = None  # type: Optional[Dict[str, List[List[Any]]]]
+        # `id(row)` is stable for the in-memory list owned by a FileIndex and
+        # lets explain mode recover the exact source file after deduplication.
+        # It is intentionally transient and never serialized.
+        self.tool_provenance = {}  # type: Dict[int, str]
         self.claimed_tools = {}  # type: Dict[Tuple[str, str], str]
         self.snapshots = []  # type: List[Dict[str, Any]]
         self.boundaries = {}  # type: Dict[Tuple[str, str], List[float]]
@@ -2148,14 +2529,16 @@ class Scan:
         self.files_seen = 0
         self.bytes_read = 0
 
-    def defer_tools(self, entry: "FileIndex", harness: str) -> None:
+    def defer_tools(
+        self, entry: "FileIndex", harness: str, source: Optional[Path] = None
+    ) -> None:
         if self._tools is not None:
             # The merge has already run, so this file's rows would never
             # reach it and the report would quietly be short a transcript.
             raise RuntimeError(
                 "tool rows were absorbed after the merged list was read"
             )
-        self._tool_sources.append((entry, harness))
+        self._tool_sources.append((entry, harness, source))
 
     def filter_tools(
         self, keep: "Callable[[str, List[List[Any]]], List[List[Any]]]"
@@ -2172,7 +2555,7 @@ class Scan:
         if self._tools is None:
             merged = {"claude": [], "codex": []}  # type: Dict[str, List[List[Any]]]
             claimed = self.claimed_tools
-            for entry, harness in self._tool_sources:
+            for entry, harness, source in self._tool_sources:
                 kept = merged.setdefault(harness, [])
                 for row in entry.tools:
                     tool_id = (harness, row[TOOL_ID]) if row[TOOL_ID] else None
@@ -2182,6 +2565,8 @@ class Scan:
                             # forked transcript.
                             continue
                         claimed[tool_id] = row[TOOL_SESSION]
+                    if source is not None:
+                        self.tool_provenance[id(row)] = str(source)
                     kept.append(row)
             for keep in self._tool_filters:
                 for harness, rows in merged.items():
@@ -2294,7 +2679,7 @@ def collect(
             if account_key not in account_cache:
                 account_cache[account_key] = account_for_root(root, kind)
             account_label, account = account_cache[account_key]
-            absorb(scan, entry, kind, account, account_label)
+            absorb(scan, entry, kind, account, account_label, path)
             try:
                 cache._flush_unlocked()
             except OSError as error:
@@ -2311,7 +2696,10 @@ def collect(
     return scan
 
 
-def absorb(scan: Scan, entry: FileIndex, harness: str, account: str, account_label: str) -> None:
+def absorb(
+    scan: Scan, entry: FileIndex, harness: str, account: str, account_label: str,
+    source: Optional[Path] = None,
+) -> None:
     """Merge one parsed (possibly cached) file into the scan.
 
     `account`/`account_label` come from the resolved root this file lives
@@ -2354,7 +2742,10 @@ def absorb(scan: Scan, entry: FileIndex, harness: str, account: str, account_lab
                 continue
             claimed[call_id] = row_session
         kept.append(row)
-    scan.defer_tools(entry, harness)
+    # Keep the path only in this process.  It is needed by the opt-in command
+    # explanation to reread command arguments, but must never enter a cache
+    # shard or make a default report touch transcript content.
+    scan.defer_tools(entry, harness, source)
     for row in entry.snapshots:
         stamped_row = dict(row)
         stamped_row["account"] = account
@@ -3161,11 +3552,12 @@ class ToolCall:
 
     __slots__ = (
         "harness", "session_id", "prompt", "ts", "name", "chars",
-        "measured", "subagent", "spawn",
+        "measured", "subagent", "spawn", "call_id", "source",
     )
 
     def __init__(self, harness: str, session_id: str, prompt: int, ts: float,
-                 name: str, chars: int, subagent: bool, spawn: bool):
+                 name: str, chars: int, subagent: bool, spawn: bool,
+                 call_id: str = "", source: str = ""):
         self.harness = harness
         self.session_id = session_id
         self.prompt = prompt
@@ -3175,6 +3567,8 @@ class ToolCall:
         self.measured = 0.0
         self.subagent = subagent
         self.spawn = spawn
+        self.call_id = call_id
+        self.source = source
 
     @property
     def est_tokens(self) -> float:
@@ -3240,7 +3634,10 @@ def attribute_tools(
             check_cancelled(cancellation)
             rows.sort(key=lambda item: item[TOOL_TS])
             calls.extend(
-                attribute_tool_stream(harness, key[0], rows, events.get(key, []))
+                attribute_tool_stream(
+                    harness, key[0], rows, events.get(key, []),
+                    analysis.scan.tool_provenance,
+                )
             )
     calls.sort(key=lambda call: call.ts)
     attach_prompt_tools(analysis, calls)
@@ -3250,6 +3647,7 @@ def attribute_tools(
 def attribute_tool_stream(
     harness: str, session_id: str, rows: Sequence[List[Any]],
     stream_events: Sequence[List[Any]],
+    provenance: Optional[Mapping[int, str]] = None,
 ) -> List[ToolCall]:
     starts = [row[EVENT_TS] for row in stream_events]
     calls = []  # type: List[ToolCall]
@@ -3266,6 +3664,8 @@ def attribute_tool_stream(
         call = ToolCall(
             harness, session_id, prompt, float(row[TOOL_TS]), str(row[TOOL_NAME]),
             int(row[TOOL_CHARS]), bool(row[TOOL_SUB]), bool(row[TOOL_SPAWN]),
+            str(row[TOOL_ID]) if len(row) > TOOL_ID and row[TOOL_ID] else "",
+            (provenance or {}).get(id(row), ""),
         )
         calls.append(call)
         if position < len(stream_events):
@@ -5935,6 +6335,17 @@ def command_tools(args: argparse.Namespace) -> int:
     shown = rows[: args.top] if args.top else rows
     largest = sorted(calls, key=lambda call: call.chars, reverse=True)[:5]
     measured_total = sum(call.measured for call in calls)
+    command_shapes = []  # type: List[Dict[str, Any]]
+    top_commands = []  # type: List[Dict[str, Any]]
+    explained_calls = 0
+    if getattr(args, "explain", False):
+        command_shapes, top_commands = explain_command_calls(analysis.scan, calls)
+        explained_calls = sum(int(row["calls"]) for row in command_shapes)
+    explain_scope = (
+        "selected prompt calls; context_growth_tokens remains session-wide"
+        if getattr(args, "prompt", None) is not None
+        else "selected sessions"
+    )
     hints = tools_hints(
         args, session_id, calls, shown, analysis_session_ids(analysis))
     if args.json:
@@ -5964,6 +6375,25 @@ def command_tools(args: argparse.Namespace) -> int:
                         for row in shown
                     ],
                     "largest_results": [call.to_json() for call in largest],
+                    **({"context_growth_scope": explain_scope}
+                       if getattr(args, "explain", False) else {}),
+                    **({
+                        # Keep the drilldown easy to consume alongside the
+                        # existing top-level `tools` and `largest_results`
+                        # fields; the nested object carries the scope note.
+                        "command_shapes": command_shapes[: args.top] if args.top else command_shapes,
+                        "top_commands": top_commands,
+                    } if getattr(args, "explain", False) else {}),
+                    **({
+                        "explain": {
+                            "shell_calls": explained_calls,
+                            "unexplained_tool_calls": max(0, len(calls) - explained_calls),
+                            "command_shapes": command_shapes[: args.top] if args.top else command_shapes,
+                            "top_commands": top_commands,
+                            "context_growth_tokens": growth_total,
+                            "context_growth_scope": explain_scope,
+                        }
+                    } if getattr(args, "explain", False) else {}),
                 },
                 indent=2,
                 sort_keys=True,
@@ -6019,6 +6449,61 @@ def command_tools(args: argparse.Namespace) -> int:
                 format_tokens(call.est_tokens),
                 short_id(call.session_id),
                 call.prompt,
+            )
+        )
+    if getattr(args, "explain", False):
+        print("")
+        print(paint("command-shape drilldown (shell calls only)", "bold"))
+        print(
+            paint(
+                "command text is reread from live transcripts for this report; "
+                "nothing is cached",
+                "dim",
+            )
+        )
+        if not command_shapes:
+            print("no shell command text found in the selected calls")
+        else:
+            print(
+                paint(
+                    "%4s %-34s %6s %9s %9s %9s %10s %10s %s"
+                    % ("#", "shape", "calls", "chars", "est total", "est mean", "est max", "measured", "examples"),
+                    "bold",
+                )
+            )
+            for rank, row in enumerate(command_shapes[: args.top] if args.top else command_shapes, 1):
+                examples = "; ".join(row["examples"])
+                print(
+                    "%4d %-34s %6d %9s %9s %9s %10s %10s %s"
+                    % (
+                        rank,
+                        row["shape"][:34],
+                        row["calls"],
+                        format_tokens(row["result_chars"]),
+                        format_tokens(row["est_tokens"]),
+                        format_tokens(row["mean_est_tokens"]),
+                        format_tokens(row["max_est_tokens"]),
+                        format_tokens(row["measured_tokens"]),
+                        examples[:80],
+                    )
+                )
+            print("")
+            print(paint("largest individual shell calls", "bold"))
+            for row in top_commands:
+                print(
+                    "%10s %-10s prompt %-4d %s"
+                    % (
+                        format_tokens(row["est_tokens"]),
+                        short_id(row["session_id"]),
+                        row["prompt"],
+                        row["command"],
+                    )
+                )
+        print(
+            paint(
+                "context_growth_tokens is provider input growth for the %s; "
+                "est tokens are result characters / %d" % (explain_scope, int(CHARS_PER_TOKEN)),
+                "dim",
             )
         )
     print("")
@@ -7019,7 +7504,8 @@ def build_parser() -> argparse.ArgumentParser:
         "tools", help="rank tool calls by the context they add",
         description=(
             "Rank tool names by estimated context added. Only tool names and "
-            "result sizes are read; no tool input or output text is stored or shown."
+            "result sizes are used by default. With --explain, reread live "
+            "transcripts to group Claude Bash and Codex shell command shapes."
         ),
         epilog="Example:\n  nenpi tools --since 7d --sort context --top 15",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -7036,6 +7522,10 @@ def build_parser() -> argparse.ArgumentParser:
     tools.add_argument(
         "--prompt", type=int, default=None, metavar="N",
         help="limit to one prompt index within the selected session",
+    )
+    tools.add_argument(
+        "--explain", action="store_true",
+        help="opt in to transient shell command-shape grouping and bounded examples",
     )
     tools.add_argument(
         "--sort", choices=("context", "calls", "mean"), default="context",

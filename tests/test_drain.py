@@ -289,6 +289,7 @@ def claude_tool_use_line(
     cache_read: int = 0,
     output_tokens: int = 0,
     sidechain: bool = False,
+    commands: Optional[Dict[str, str]] = None,
 ) -> str:
     """An assistant line that issues tool calls: (tool_use_id, tool name)."""
     return json.dumps(
@@ -309,7 +310,7 @@ def claude_tool_use_line(
                         "id": call_id,
                         "name": name,
                         "input": {
-                            "command": TOOL_INPUT_SENTINEL,
+                            "command": (commands or {}).get(call_id, TOOL_INPUT_SENTINEL),
                             "nested": {"path": TOOL_INPUT_SENTINEL},
                         },
                     }
@@ -358,14 +359,17 @@ def codex_tool_call_line(
     *,
     item: str = "function_call",
     namespace: Optional[str] = None,
+    command: Optional[Any] = None,
 ) -> str:
     payload = {"type": item, "id": "item-" + call_id, "call_id": call_id, "name": name}
     if namespace is not None:
         payload["namespace"] = namespace
-    if item == "custom_tool_call":
-        payload["input"] = TOOL_INPUT_SENTINEL
+    if item == "local_shell_call":
+        payload["action"] = {"type": "exec", "command": command or TOOL_INPUT_SENTINEL}
+    elif item == "custom_tool_call":
+        payload["input"] = command or TOOL_INPUT_SENTINEL
     else:
-        payload["arguments"] = json.dumps({"command": TOOL_INPUT_SENTINEL})
+        payload["arguments"] = json.dumps({"command": command or TOOL_INPUT_SENTINEL})
     return json.dumps(
         {"type": "response_item", "timestamp": iso(epoch), "payload": payload}
     )
@@ -4524,6 +4528,78 @@ class ToolAttribution(Harness):
         self.assertEqual(sorted(names), ["exec", "mcp__docs.search"])
         self.assertEqual(names["exec"]["result_chars"], 600)
         self.assertEqual(names["mcp__docs.search"]["result_chars"], 200)
+
+    def test_explain_groups_shell_shapes_and_survives_warm_cache(self) -> None:
+        session = "21000000-1111-2222-3333-444444444444"
+        now = time.time() - 3600
+        commands = {
+            "toolu_one": "rg --line-number first src/a",
+            "toolu_two": "rg -n second src/b",
+            "toolu_three": "sed -n '1,4p' src/a\n",
+        }
+        self.write_claude(
+            "explain.jsonl",
+            [
+                claude_user_prompt_line(now, session),
+                claude_tool_use_line(
+                    now + 1, session, "msg_1",
+                    [("toolu_one", "Bash"), ("toolu_two", "Bash")],
+                    output_tokens=5, commands=commands,
+                ),
+                claude_tool_output_line(now + 2, session, "toolu_one", "a" * 40),
+                claude_tool_output_line(now + 3, session, "toolu_two", "b" * 80),
+                claude_tool_use_line(
+                    now + 4, session, "msg_2", [("toolu_three", "Bash")],
+                    output_tokens=5, commands=commands,
+                ),
+                claude_tool_output_line(now + 5, session, "toolu_three", "c" * 20),
+            ],
+        )
+        plain = self.run_tool("tools", "--harness", "claude", "--json")
+        self.assertEqual(plain.returncode, 0, plain.stderr.decode("utf-8", "replace"))
+        self.assertNotIn("rg --line-number first", plain.stdout.decode("utf-8"))
+        explained = self.run_json("tools", "--harness", "claude", "--explain", "--json")
+        details = explained["explain"]
+        self.assertEqual(details["shell_calls"], 3)
+        self.assertEqual(details["command_shapes"][0]["calls"], 2)
+        self.assertEqual(details["command_shapes"][0]["shape"], "rg -n <arg> <arg>")
+        self.assertTrue(any("\\n" in item["command"] for item in details["top_commands"]))
+        warm = self.run_json("tools", "--harness", "claude", "--explain", "--json")
+        self.assertEqual(explained["explain"], warm["explain"])
+        cache_blob = "\n".join(
+            path.read_text(encoding="utf-8")
+            for path in (self.root / "cache").rglob("*.json")
+        )
+        self.assertNotIn("rg --line-number first", cache_blob)
+
+    def test_explain_reads_codex_local_shell_call(self) -> None:
+        session = "22000000-1111-2222-3333-444444444444"
+        now = time.time() - 3600
+        self.write_codex(
+            "rollout-explain-codex.jsonl",
+            [
+                codex_session_meta_line(now, session, "/home/agent/project"),
+                codex_turn_context_line(now + 1, "gpt-5-codex"),
+                codex_task_started_line(now + 1),
+                codex_tool_call_line(
+                    now + 2, "call_shell", "exec", item="local_shell_call",
+                    command=["rg", "--line-number", "needle", "src"],
+                ),
+                codex_tool_output_line(
+                    now + 3, "call_shell", "z" * 90,
+                    item="local_shell_call_output",
+                ),
+                codex_usage_record_line(
+                    now + 4, session, input_tokens=5000,
+                    cached_input_tokens=1000, output_tokens=50, turn_id="turn-1",
+                ),
+            ],
+            day=now,
+        )
+        payload = self.run_json("tools", "--harness", "codex", "--explain", "--json")
+        self.assertEqual(payload["explain"]["shell_calls"], 1)
+        self.assertEqual(payload["explain"]["command_shapes"][0]["shape"], "rg -n <arg> <arg>")
+        self.assertIn("rg --line-number needle src", payload["explain"]["top_commands"][0]["command"])
 
     def test_session_prefix_scopes_the_report(self) -> None:
         first = "30000000-1111-2222-3333-444444444444"
