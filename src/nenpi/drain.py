@@ -166,6 +166,8 @@ CODEX_LINE_MARKERS = (
     b'"compacted"',
     b'"role":"user"',
     b'"role": "user"',
+    b'"role":"assistant"',
+    b'"role": "assistant"',
 )
 
 # A Claude user line that carries a tool result is a fan-out step, not a new
@@ -2220,7 +2222,7 @@ def codex_response_action(payload: Mapping[str, Any], item: Any) -> str:
 
 
 def is_message_action(action: str) -> bool:
-    return action.split(".")[-1] in {"send_message", "message", "spawn_agent"}
+    return action.split(".")[-1] in {"send_message", "spawn_agent"}
 
 
 def _decode_structural_payload(value: Any) -> Any:
@@ -2236,7 +2238,14 @@ def _decode_structural_payload(value: Any) -> Any:
 
 
 def codex_message_metadata(payload: Mapping[str, Any]) -> Tuple[str, Optional[int]]:
-    request = payload.get("arguments") or payload.get("input") or payload.get("action")
+    missing = object()
+    request = missing
+    for key in ("arguments", "input", "action"):
+        if key in payload and payload[key] is not None:
+            request = payload[key]
+            break
+    if request is missing:
+        return "unknown", None
     request_map = _decode_structural_payload(request)
     if request_map is None:
         request_map = {}
@@ -2252,8 +2261,11 @@ def codex_message_metadata(payload: Mapping[str, Any]) -> Tuple[str, Optional[in
             target = value[:128]
             break
     try:
-        payload_size = len(json.dumps(request, ensure_ascii=False, separators=(",", ":")))
-    except (TypeError, ValueError):
+        if isinstance(request, str):
+            payload_size = len(request.encode("utf-8"))
+        else:
+            payload_size = len(json.dumps(request, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+    except (TypeError, ValueError, UnicodeEncodeError):
         payload_size = None
     return target, payload_size
 
@@ -3976,6 +3988,42 @@ def _drill_add_messages(bucket: Dict[str, Any], rows: Sequence[Sequence[Any]]) -
     bucket["messages"]["routes"] = sorted(routes.values(), key=lambda item: (item["calls"], item["payload_bytes"]), reverse=True)
 
 
+def _drill_thread_classification(
+    metadata: Mapping[Tuple[str, str, str], Mapping[str, Any]],
+    session_id: str,
+    thread_id: str,
+    memo: Dict[str, str],
+    visiting: Optional[set] = None,
+) -> str:
+    if thread_id == session_id:
+        return "root"
+    if thread_id in memo:
+        return memo[thread_id]
+    visiting = set(visiting or ())
+    if thread_id in visiting:
+        memo[thread_id] = "unknown"
+        return "unknown"
+    visiting.add(thread_id)
+    info = metadata.get(("codex", session_id, thread_id))
+    if not info:
+        classification = "unknown"
+    else:
+        parent = info.get("parent_thread_id")
+        if not isinstance(parent, str) or not parent:
+            classification = "root" if info.get("classification") == "root" else "unknown"
+        else:
+            parent_classification = _drill_thread_classification(
+                metadata, session_id, parent, memo, visiting
+            )
+            classification = (
+                "descendant"
+                if parent_classification in {"root", "descendant"}
+                else "unknown"
+            )
+    memo[thread_id] = classification
+    return classification
+
+
 def drilldown_for_prompt(analysis: "Analysis", prompt: Prompt) -> Dict[str, Any]:
     scan = analysis.scan
     rows = [
@@ -3985,41 +4033,40 @@ def drilldown_for_prompt(analysis: "Analysis", prompt: Prompt) -> Dict[str, Any]
     ]
     metadata = scan.thread_metadata
     partitions = {}
-    unknown_events = []
+    classifications = {}
+
+    def classify(thread: str) -> str:
+        return _drill_thread_classification(
+            metadata, prompt.session_id, thread, classifications
+        )
+
+    def ensure_bucket(thread: str) -> Dict[str, Any]:
+        classification = classify(thread)
+        key = (classification, thread)
+        if key not in partitions:
+            info = metadata.get(("codex", prompt.session_id, thread))
+            if info is None and thread == prompt.session_id:
+                info = {"thread_id": thread, "depth": 0, "classification": "root"}
+            partitions[key] = _drill_bucket(thread, classification, info)
+        return partitions[key]
+
     for row in rows:
         thread = str(row[EVENT_THREAD] or "")
-        info = metadata.get(("codex", prompt.session_id, thread))
-        if info is None and thread == prompt.session_id:
-            classification = "root"
-            info = {"thread_id": thread, "depth": 0}
-        else:
-            classification = str((info or {}).get("classification") or "unknown")
-        if classification == "root":
-            key = ("root", thread)
-        elif classification == "descendant":
-            key = ("descendant", thread)
-        else:
-            key = ("unknown", "")
-            unknown_events.append(row)
-        if key not in partitions:
-            partitions[key] = _drill_bucket(thread if key[0] != "unknown" else "", classification, info)
-        _drill_add_event(partitions[key], row, analysis.weights)
+        _drill_add_event(ensure_bucket(thread), row, analysis.weights)
 
     calls = [
         call for call in analysis.tool_calls
         if call.harness == "codex" and call.session_id == prompt.session_id and call.prompt == prompt.index
     ]
     for call in calls:
-        key = ("root", call.thread_id) if ("codex", prompt.session_id, call.thread_id) in metadata and metadata[("codex", prompt.session_id, call.thread_id)].get("classification") == "root" else (
-            ("descendant", call.thread_id) if ("codex", prompt.session_id, call.thread_id) in metadata and metadata[("codex", prompt.session_id, call.thread_id)].get("classification") == "descendant" else ("unknown", "")
-        )
-        bucket = partitions.setdefault(key, _drill_bucket(key[1], key[0], metadata.get(("codex", prompt.session_id, key[1]))))
-        _drill_add_tools(bucket, [call])
+        ensure_bucket(call.thread_id)
 
     for key, bucket in partitions.items():
         thread = key[1]
-        bucket["wait_streaks"] = _drill_wait_streaks([row for row in rows if str(row[EVENT_THREAD] or "") == thread]) if thread else []
-        _drill_add_tools(bucket, [call for call in calls if (call.thread_id == thread and thread) or (not thread and not call.thread_id)])
+        bucket["wait_streaks"] = _drill_wait_streaks(
+            [row for row in rows if str(row[EVENT_THREAD] or "") == thread]
+        )
+        _drill_add_tools(bucket, [call for call in calls if call.thread_id == thread])
         message_rows = [
             row for row in scan.messages
             if row[0] == "codex" and row[1] == prompt.session_id and str(row[3] or "") == thread
@@ -4028,8 +4075,31 @@ def drilldown_for_prompt(analysis: "Analysis", prompt: Prompt) -> Dict[str, Any]
         _drill_add_messages(bucket, message_rows)
 
     root = next((bucket for (kind, _), bucket in partitions.items() if kind == "root"), _drill_bucket("", "root"))
-    descendants = [bucket for (kind, _), bucket in sorted(partitions.items()) if kind == "descendant"]
-    unknown = next((bucket for (kind, _), bucket in partitions.items() if kind == "unknown"), _drill_bucket("", "unknown"))
+    descendants = [
+        bucket for (kind, _), bucket in sorted(partitions.items()) if kind == "descendant"
+    ]
+    unknown_threads = [
+        bucket for (kind, _), bucket in sorted(partitions.items()) if kind == "unknown"
+    ]
+    unknown = _drill_bucket("", "unknown")
+    for bucket in unknown_threads:
+        for field in ("api_calls", "uncached_input_tokens", "cached_input_tokens", "input_context_tokens", "output_tokens", "reasoning_output_tokens", "cache_write_input_tokens"):
+            unknown[field] += bucket[field]
+        unknown["weighted_units"] += bucket["weighted_units"]
+        for action, count in bucket["action_counts"].items():
+            unknown["action_counts"][action] = unknown["action_counts"].get(action, 0) + count
+        unknown["wait_streaks"].extend(bucket["wait_streaks"])
+    unknown["wait_streaks"].sort(key=lambda streak: (streak["start"], streak["end"]))
+    unknown_calls = [call for call in calls if classify(call.thread_id) == "unknown"]
+    _drill_add_tools(unknown, unknown_calls)
+    unknown_message_rows = [
+        row for row in scan.messages
+        if row[0] == "codex" and row[1] == prompt.session_id
+        and classify(str(row[3] or "")) == "unknown"
+        and prompt.start is not None and prompt.end is not None
+        and prompt.start <= float(row[2]) <= prompt.end
+    ]
+    _drill_add_messages(unknown, unknown_message_rows)
     all_buckets = [root] + descendants + [unknown]
     combined = _drill_bucket("combined", "combined")
     for bucket in all_buckets:
@@ -4063,6 +4133,7 @@ def drilldown_for_prompt(analysis: "Analysis", prompt: Prompt) -> Dict[str, Any]
             "api_calls": bucket["api_calls"],
         })
     return {"root": root, "descendants": descendants, "unknown": unknown,
+            "unknown_threads": unknown_threads,
             "combined": combined, "reconciliation": reconciliation,
             "agent_rankings": agent_rankings,
             "caveats": ["descendant membership is temporal", "measured tool growth is an upper bound", "unknown lineage is not inferred"],
@@ -4078,7 +4149,11 @@ def render_drilldown(drilldown: Mapping[str, Any]) -> None:
             item["rank"], item["classification"], item["thread_id"] or "unknown",
             item["weighted_units"], item["uncached_input_tokens"], item["api_calls"],
         ))
-    for label, bucket in [("root", drilldown["root"])] + [("descendant", item) for item in drilldown["descendants"]] + [("unknown", drilldown["unknown"])]:
+    entries = [("root", drilldown["root"])]
+    entries += [("descendant", item) for item in drilldown["descendants"]]
+    entries += [("unknown thread", item) for item in drilldown.get("unknown_threads", [])]
+    entries.append(("unknown aggregate", drilldown["unknown"]))
+    for label, bucket in entries:
         print("%s agent/thread=%s parent=%s depth=%s" % (
             label, bucket.get("thread_id") or "unknown", bucket.get("parent_thread_id") or "unknown", bucket.get("depth", "unknown")
         ))
@@ -4096,9 +4171,10 @@ def render_drilldown(drilldown: Mapping[str, Any]) -> None:
             ", ".join("%s=%d" % (route["target"], route["calls"]) for route in messages["routes"]) or "none",
         ))
         for streak in bucket["wait_streaks"]:
-            print("  wait streak: length=%d context_delta=%d mean_delta=%s uncached_input=%d cached_replay=%d" % (
-                streak["length"], streak["context_delta"], streak["mean_context_delta_per_transition"] if streak["mean_context_delta_per_transition"] is not None else "n/a",
-                streak["uncached_input_tokens"], streak["cached_replay_tokens"],
+            print("  wait streak: length=%d first_context=%d last_context=%d context_delta=%d mean_delta=%s uncached_input=%d cached_replay=%d start=%s end=%s" % (
+                streak["length"], streak["first_context"], streak["last_context"], streak["context_delta"],
+                streak["mean_context_delta_per_transition"] if streak["mean_context_delta_per_transition"] is not None else "n/a",
+                streak["uncached_input_tokens"], streak["cached_replay_tokens"], streak["start"], streak["end"],
             ))
     reconciliation = drilldown["reconciliation"]
     print("combined totals: calls=%d uncached_input=%d cached_replay=%d output=%d reasoning_output=%d units=%.4f" % (

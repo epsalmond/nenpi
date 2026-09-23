@@ -157,7 +157,8 @@ at least a 0.01 margin so near-ties report as linear.
 selected prompt without changing ordinary prompt accounting. The report keeps
 the existing deduplicated prompt totals and partitions them into the root
 thread, descendants with explicit `parent_thread_id` lineage, and an `unknown`
-partition when lineage metadata is unavailable. Descendant membership is
+partition when lineage metadata is unavailable. Unknown threads retain their
+own auxiliary details before the aggregate is formed. Descendant membership is
 temporal to the selected prompt; it is not evidence that an unrelated thread
 was spawned by that prompt.
 
@@ -166,10 +167,13 @@ context attribution (an upper bound where other context growth is present),
 safe collaboration targets and serialized request-payload sizes, reasoning
 output as a subset of output, and contiguous `wait_agent` API streaks. Wait
 streak context deltas compare first and last context observations; they are not
-new-token totals. Raw messages, arguments, and encrypted bodies are never
-cached or decoded. `--prompt` requires `--session`; `--drilldown` requires both
-flags and is Codex-only. Use `--json` for the same accounting fields in a
-machine-readable response.
+new-token totals. For a raw string argument, payload size is the exact UTF-8
+byte length of that original string. Structured arguments use compact JSON with
+`ensure_ascii=False` and UTF-8 encoding; a missing or unavailable payload is
+reported as unknown rather than measured as the bytes of `null`. Raw messages,
+arguments, and encrypted bodies are never cached or decoded. `--prompt` requires
+`--session`; `--drilldown` requires both flags and is Codex-only. Use `--json`
+for the same accounting fields in a machine-readable response.
 
 ### tools
 

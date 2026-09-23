@@ -17,6 +17,7 @@ from tests.test_drain import (
     codex_turn_context_line,
     iso,
 )
+from nenpi.drain import codex_message_metadata
 
 
 def codex_usage_line(
@@ -75,6 +76,131 @@ def unknown_meta_line(epoch: float, thread_id: str, session_id: str) -> str:
 
 
 class TestCodexPromptDrilldown(Harness):
+    def test_broken_cyclic_and_missing_parent_chains_are_unknown(self) -> None:
+        base = time.time() - 900
+        session = "lineage-session-0001"
+        missing = "lineage-missing-0001"
+        broken_parent = "lineage-broken-parent-0001"
+        broken = "lineage-broken-0001"
+        cycle_a = "lineage-cycle-a-0001"
+        cycle_b = "lineage-cycle-b-0001"
+        self.write_codex("rollout-root.jsonl", [
+            codex_session_meta_line(base, session, "/home/agent/project"),
+            codex_task_started_line(base + 1),
+            codex_turn_context_line(base + 1.1, "gpt-5.5"),
+            codex_usage_line(base + 2, session, session, input_tokens=1, cached_input_tokens=0, output_tokens=1),
+        ], day=base)
+        self.write_codex("rollout-missing.jsonl", [
+            nested_meta_line(base + 1.2, missing, session, "absent-parent-0001", 1),
+            codex_usage_line(base + 2.2, session, missing, input_tokens=2, cached_input_tokens=0, output_tokens=1),
+        ], day=base)
+        self.write_codex("rollout-broken.jsonl", [
+            nested_meta_line(base + 1.3, broken_parent, session, "absent-parent-0002", 1),
+            nested_meta_line(base + 1.4, broken, session, broken_parent, 2),
+            codex_usage_line(base + 2.25, session, broken_parent, input_tokens=2, cached_input_tokens=0, output_tokens=1),
+            codex_usage_line(base + 2.3, session, broken, input_tokens=3, cached_input_tokens=0, output_tokens=1),
+        ], day=base)
+        self.write_codex("rollout-cycle.jsonl", [
+            nested_meta_line(base + 1.5, cycle_a, session, cycle_b, 1),
+            nested_meta_line(base + 1.6, cycle_b, session, cycle_a, 1),
+            codex_usage_line(base + 2.4, session, cycle_a, input_tokens=4, cached_input_tokens=0, output_tokens=1),
+            codex_usage_line(base + 2.5, session, cycle_b, input_tokens=5, cached_input_tokens=0, output_tokens=1),
+        ], day=base)
+
+        result = self.run_tool(
+            "prompts", "--harness", "codex", "--codex-root", str(self.home / ".codex"),
+            "--session", session, "--prompt", "1", "--drilldown", "--json",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr.decode("utf-8", "replace"))
+        drilldown = json.loads(result.stdout.decode("utf-8"))["drilldown"]
+        unknown_threads = {item["thread_id"] for item in drilldown["unknown_threads"]}
+        self.assertEqual(unknown_threads, {missing, broken_parent, broken, cycle_a, cycle_b})
+        self.assertEqual(len(drilldown["descendants"]), 0)
+
+    def test_message_payload_sizes_use_utf8_bytes_and_missing_is_unknown(self) -> None:
+        raw = '{"target_thread_id":"child","message":"café"}'
+        target, payload_size = codex_message_metadata({"arguments": raw})
+        self.assertEqual(target, "child")
+        self.assertEqual(payload_size, len(raw.encode("utf-8")))
+
+        structured = {"target_thread_id": "child", "message": "café"}
+        _, structured_size = codex_message_metadata({"input": structured})
+        expected = json.dumps(structured, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        self.assertEqual(structured_size, len(expected))
+        self.assertEqual(codex_message_metadata({}), ("unknown", None))
+
+    def test_assistant_message_breaks_pure_wait_streak(self) -> None:
+        base = time.time() - 900
+        session = "wait-break-session-0001"
+        assistant_message = json.dumps({
+            "type": "response_item",
+            "timestamp": iso(base + 2.5),
+            "payload": {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "done"}],
+            },
+        })
+        self.write_codex("rollout-wait-break.jsonl", [
+            codex_session_meta_line(base, session, "/home/agent/project"),
+            codex_task_started_line(base + 1),
+            codex_turn_context_line(base + 1.1, "gpt-5.5"),
+            codex_tool_call_line(base + 2, "wait-1", "wait_agent", namespace="collaboration"),
+            codex_usage_line(base + 2.1, session, session, input_tokens=10, cached_input_tokens=1, output_tokens=1),
+            assistant_message,
+            codex_tool_call_line(base + 3, "wait-2", "wait_agent", namespace="collaboration"),
+            codex_usage_line(base + 3.1, session, session, input_tokens=12, cached_input_tokens=2, output_tokens=1),
+        ], day=base)
+
+        result = self.run_tool(
+            "prompts", "--harness", "codex", "--codex-root", str(self.home / ".codex"),
+            "--session", session, "--prompt", "1", "--drilldown", "--json",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr.decode("utf-8", "replace"))
+        drilldown = json.loads(result.stdout.decode("utf-8"))["drilldown"]
+        self.assertEqual([streak["length"] for streak in drilldown["root"]["wait_streaks"]], [1])
+        text_result = self.run_tool(
+            "prompts", "--harness", "codex", "--codex-root", str(self.home / ".codex"),
+            "--session", session, "--prompt", "1", "--drilldown", "--no-color",
+        )
+        text = text_result.stdout.decode("utf-8")
+        for label in ("first_context=", "last_context=", "start=", "end="):
+            self.assertIn(label, text)
+
+    def test_unknown_thread_keeps_auxiliary_data_before_aggregate(self) -> None:
+        base = time.time() - 900
+        session = "unknown-data-session-0001"
+        thread = "unknown-data-thread-0001"
+        self.write_codex("rollout-root.jsonl", [
+            codex_session_meta_line(base, session, "/home/agent/project"),
+            codex_task_started_line(base + 1),
+            codex_turn_context_line(base + 1.1, "gpt-5.5"),
+            codex_usage_line(base + 2, session, session, input_tokens=1, cached_input_tokens=0, output_tokens=1),
+        ], day=base)
+        self.write_codex("rollout-unknown-data.jsonl", [
+            nested_meta_line(base + 1.2, thread, session, "missing-parent-0001", 1),
+            codex_tool_call_line(
+                base + 2.1, "message-unknown", "send_message", namespace="collaboration",
+                command=json.dumps({"target_thread_id": "other-thread", "message": "opaque"}),
+            ),
+            codex_tool_output_line(base + 2.2, "message-unknown", "result"),
+            codex_usage_line(base + 2.3, session, thread, input_tokens=7, cached_input_tokens=0, output_tokens=1),
+            codex_tool_call_line(base + 3.1, "wait-unknown", "wait_agent", namespace="collaboration"),
+            codex_usage_line(base + 3.2, session, thread, input_tokens=8, cached_input_tokens=1, output_tokens=1),
+        ], day=base)
+
+        result = self.run_tool(
+            "prompts", "--harness", "codex", "--codex-root", str(self.home / ".codex"),
+            "--session", session, "--prompt", "1", "--drilldown", "--json",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr.decode("utf-8", "replace"))
+        drilldown = json.loads(result.stdout.decode("utf-8"))["drilldown"]
+        self.assertEqual([item["thread_id"] for item in drilldown["unknown_threads"]], [thread])
+        self.assertEqual(drilldown["unknown_threads"][0]["messages"]["calls"], 1)
+        self.assertEqual(drilldown["unknown_threads"][0]["tool_family_rankings"][0]["tool"], "collaboration.send_message")
+        self.assertEqual(len(drilldown["unknown_threads"][0]["wait_streaks"]), 1)
+        self.assertEqual(drilldown["unknown"]["messages"]["calls"], 1)
+
     def test_inherited_root_metadata_does_not_reparent_child_usage(self) -> None:
         base = time.time() - 900
         session = "inherited-session-0001"
