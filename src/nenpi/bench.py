@@ -237,7 +237,8 @@ def expected_tokens(scenario: Scenario, first_call: bool,
     context = float(scenario.context_tokens)
     output = float(LONG_OUTPUT_TOKENS if scenario.output == "long" else SHORT_OUTPUT_TOKENS)
     tokens = {"input": 0.0, "cache_read": 0.0, "cache_write_5m": 0.0,
-              "cache_write_1h": 0.0, "output": output}
+              "cache_write_1h": 0.0, "output": output,
+              "cache_write_unknown": 0.0}
     fresh_prefix = scenario.cache != "warm" or first_call
     if not fresh_prefix:
         tokens["cache_read"] = context
@@ -444,25 +445,14 @@ def usage_tokens(usage: Mapping[str, Any]) -> Dict[str, int]:
         value = usage.get(name)
         return int(value) if isinstance(value, (int, float)) else 0
 
-    creation = usage.get("cache_creation")
-    write_5m = write_1h = 0
-    if isinstance(creation, Mapping):
-        for key, value in creation.items():
-            if not isinstance(value, (int, float)):
-                continue
-            if "1h" in key:
-                write_1h += int(value)
-            else:
-                write_5m += int(value)
-    total_write = count("cache_creation_input_tokens")
-    if write_5m + write_1h == 0:
-        write_5m = total_write
+    write_5m, write_1h, write_unknown = _QD.claude_cache_write_tokens(usage)
     return {
         "input": count("input_tokens"),
         "cache_read": count("cache_read_input_tokens"),
         "cache_write_5m": write_5m,
         "cache_write_1h": write_1h,
         "output": count("output_tokens"),
+        "cache_write_unknown": write_unknown,
     }
 
 
@@ -475,9 +465,10 @@ def model_usage_tokens(entry: Mapping[str, Any]) -> Dict[str, int]:
     return {
         "input": count("inputTokens"),
         "cache_read": count("cacheReadInputTokens"),
-        "cache_write_5m": count("cacheCreationInputTokens"),
+        "cache_write_5m": 0,
         "cache_write_1h": 0,
         "output": count("outputTokens"),
+        "cache_write_unknown": count("cacheCreationInputTokens"),
     }
 
 
@@ -623,6 +614,7 @@ class ScenarioRun:
                 + requested.get("cache_read", 0)
                 + requested.get("cache_write_5m", 0)
                 + requested.get("cache_write_1h", 0)
+                + requested.get("cache_write_unknown", 0)
             )
 
     def record_tick(self, sample: Sample, percent: float) -> None:
@@ -1094,6 +1086,7 @@ def list_price_weights(usd_per_percent: float) -> Dict[str, Dict[str, float]]:
             "cache_write_5m": price[2] / usd_per_percent,
             "cache_write_1h": price[3] / usd_per_percent,
             "output": price[4] / usd_per_percent,
+            "cache_write_unknown": price[2] / usd_per_percent,
         }
     return models
 
@@ -1261,7 +1254,11 @@ def render_report(meta: Mapping[str, Any], estimates: Sequence[Mapping[str, Any]
                 item["percent"],
                 _QD.format_tokens(per.get("input", 0.0)),
                 _QD.format_tokens(per.get("cache_read", 0.0)),
-                _QD.format_tokens(per.get("cache_write_5m", 0.0) + per.get("cache_write_1h", 0.0)),
+                _QD.format_tokens(
+                    per.get("cache_write_5m", 0.0)
+                    + per.get("cache_write_1h", 0.0)
+                    + per.get("cache_write_unknown", 0.0)
+                ),
                 _QD.format_tokens(per.get("output", 0.0)),
                 ", ".join(flags) or "-",
             )
@@ -1285,7 +1282,8 @@ def render_report(meta: Mapping[str, Any], estimates: Sequence[Mapping[str, Any]
     lines.append("| model | kind | %/Mtok | ratio to input | list ratio |")
     lines.append("| --- | --- | --- | --- | --- |")
     list_ratio = {"input": 1.0, "cache_read": 0.1, "cache_write_5m": 1.25,
-                  "cache_write_1h": 2.0, "output": 5.0}
+                  "cache_write_1h": 2.0, "output": 5.0,
+                  "cache_write_unknown": 1.25}
     for model in sorted(fit["models"]):
         entry = fit["models"][model]
         base = entry.get("input")

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import time
 import unittest
 from typing import Any, Dict
@@ -393,6 +394,8 @@ class TestClaudePromptDrilldown(Harness):
         self.assertEqual(drilldown["descendants"][0]["thread_id"], child)
         self.assertEqual(drilldown["root"]["action_counts"]["Agent"], 1)
         self.assertEqual(drilldown["descendants"][0]["reasoning_unknown_calls"], 1)
+        self.assertIsNone(drilldown["descendants"][0]["reasoning_output_tokens"])
+        self.assertEqual(drilldown["descendants"][0]["known_reasoning_output_tokens"], 0)
         self.assertEqual(drilldown["root"]["reasoning_output_tokens"], 2)
 
         cached = ""
@@ -468,6 +471,99 @@ class TestClaudePromptDrilldown(Harness):
         self.assertEqual(unknown, {missing, unmatched})
         self.assertTrue(drilldown["reconciliation"]["matches_prompt"])
 
+    def test_claude_wait_streaks_keep_thread_provenance(self) -> None:
+        base = time.time() - 900
+        session = "claude-wait-lineage-session-0001"
+        child = "claude-wait-child-0001"
+
+        def event(epoch: float, message_id: str, sidechain: bool,
+                  action: str | None) -> str:
+            row = json.loads(
+                claude_assistant_line(
+                    epoch, session, message_id, input_tokens=int(epoch - base),
+                    output_tokens=1, sidechain=sidechain,
+                )
+            )
+            row["message"]["content"] = (
+                [{"type": "tool_use", "id": "wait-" + message_id,
+                  "name": "TaskOutput", "input": {"block": True}}]
+                if action == "wait" else
+                [{"type": "tool_use", "id": "run-" + message_id,
+                  "name": "Bash", "input": {}}]
+                if action == "other" else []
+            )
+            return json.dumps(row)
+
+        self.write_claude(session + ".jsonl", [
+            claude_user_prompt_line(base + 1, session),
+            event(base + 2, "wait-root-first", False, "wait"),
+            event(base + 5, "wait-root-last", False, "wait"),
+        ])
+        self.write_claude(
+            "subagents/agent-%s.jsonl" % child,
+            [
+                event(base + 3, "wait-child-first", True, "wait"),
+                event(base + 4, "wait-child-nonwait", True, "other"),
+            ],
+        )
+
+        drilldown = self.run_json(
+            "prompts", "--harness", "claude", "--claude-root", str(self.home / ".claude"),
+            "--session", session, "--prompt", "1", "--drilldown", "--json", "--quiet",
+        )["drilldown"]
+        streaks = drilldown["combined"]["wait_streaks"]
+        by_thread = {item["thread_id"]: item for item in streaks}
+        self.assertEqual(set(by_thread), {session, child})
+        self.assertEqual(by_thread[session]["length"], 2)
+        self.assertEqual(by_thread[child]["length"], 1)
+
+    def test_streamed_duplicate_updates_wait_and_reasoning_evidence(self) -> None:
+        base = time.time() - 900
+        session = "claude-stream-merge-session-0001"
+
+        def event(message_id: str, epoch: float, output: int,
+                  actions: list[dict[str, Any]], thinking: int | None) -> str:
+            row = json.loads(
+                claude_assistant_line(epoch, session, message_id, output_tokens=output)
+            )
+            row["message"]["content"] = actions
+            if thinking is None:
+                row["message"]["usage"].pop("output_tokens_details")
+            else:
+                row["message"]["usage"]["output_tokens_details"] = {
+                    "thinking_tokens": thinking,
+                }
+            return json.dumps(row)
+
+        wait_action = {
+            "type": "tool_use", "id": "streamed-wait-call", "name": "TaskOutput",
+            "input": {"block": True},
+        }
+        extra_action = {
+            "type": "tool_use", "id": "streamed-extra-call", "name": "Bash",
+            "input": {},
+        }
+        self.write_claude(session + ".jsonl", [
+            claude_user_prompt_line(base + 1, session),
+            event("streamed-wait-message", base + 2, 5, [], None),
+            event("streamed-wait-message", base + 2, 5, [wait_action], None),
+            event("streamed-mixed-message", base + 3, 1, [wait_action], None),
+            event("streamed-mixed-message", base + 3, 10, [extra_action], 5),
+        ])
+
+        drilldown = self.run_json(
+            "prompts", "--harness", "claude", "--claude-root", str(self.home / ".claude"),
+            "--session", session, "--prompt", "1", "--drilldown", "--json", "--quiet",
+        )["drilldown"]
+        self.assertEqual([item["length"] for item in drilldown["root"]["wait_streaks"]], [1])
+        self.assertAlmostEqual(
+            drilldown["root"]["wait_streaks"][0]["start"], base + 2, places=2
+        )
+        self.assertEqual(drilldown["root"]["api_calls"], 2)
+        self.assertEqual(drilldown["root"]["output_tokens"], 6)
+        self.assertIsNone(drilldown["root"]["reasoning_output_tokens"])
+        self.assertEqual(drilldown["root"]["known_reasoning_output_tokens"], 1)
+
     def test_sidecar_arrival_and_edits_reparse_unchanged_transcript(self) -> None:
         base = time.time() - 900
         session = "claude-sidecar-cache-session-0001"
@@ -522,6 +618,48 @@ class TestClaudePromptDrilldown(Harness):
         )["drilldown"]
         self.assertEqual(drilldown["descendants"], [])
         self.assertEqual([row["thread_id"] for row in drilldown["unknown_threads"]], [child])
+
+    def test_resumed_file_merges_safe_actions_onto_first_deduplicated_call(self) -> None:
+        base = time.time() - 900
+        session = "claude-resume-lineage-session-0001"
+        call_id = "resume-agent-call-0001"
+        child = "claude-resume-child-0001"
+        original = self.write_claude(session + "-original.jsonl", [
+            claude_user_prompt_line(base + 1, session),
+            claude_assistant_line(base + 2, session, "resumed-message-id", output_tokens=3),
+        ])
+        resumed = json.loads(
+            claude_assistant_line(base + 2.1, session, "resumed-message-id", output_tokens=99)
+        )
+        resumed["message"]["content"] = [{
+            "type": "tool_use", "id": call_id, "name": "Agent",
+            "input": {"prompt": "SYNTHETIC RESUMED ARGUMENT"},
+        }]
+        resumed_path = self.write_claude(session + "-resumed.jsonl", [json.dumps(resumed)])
+        os.utime(original, (base + 10, base + 10))
+        os.utime(resumed_path, (base + 20, base + 20))
+        child_path = self.write_claude(
+            "subagents/agent-%s.jsonl" % child,
+            [claude_assistant_line(base + 3, session, "resumed-child-message",
+                                   output_tokens=5, sidechain=True)],
+        )
+        child_path.with_suffix(".meta.json").write_text(json.dumps({
+            "toolUseId": call_id, "spawnDepth": 1, "agentType": "Explore",
+        }), encoding="utf-8")
+
+        drilldown = self.run_json(
+            "prompts", "--harness", "claude", "--claude-root", str(self.home / ".claude"),
+            "--session", session, "--prompt", "1", "--drilldown", "--json", "--quiet",
+        )["drilldown"]
+        self.assertTrue(drilldown["reconciliation"]["matches_prompt"])
+        self.assertEqual(drilldown["root"]["api_calls"], 1)
+        self.assertEqual(drilldown["root"]["output_tokens"], 3)
+        self.assertEqual(drilldown["root"]["action_counts"]["Agent"], 1)
+        self.assertEqual([row["thread_id"] for row in drilldown["descendants"]], [child])
+        cached = ""
+        for path in (self.root / "cache").rglob("*.json"):
+            cached += path.read_text(encoding="utf-8")
+        self.assertNotIn("SYNTHETIC RESUMED ARGUMENT", cached)
 
     def test_cache_write_breakdown_keeps_unknown_tokens_and_legacy_price(self) -> None:
         self.assertEqual(

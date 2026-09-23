@@ -1872,6 +1872,48 @@ def merge_claude_actions(
     return merged
 
 
+def claude_wait_for_actions(actions: Any) -> bool:
+    """Recognize only a lone TaskOutput call with explicit block=true."""
+    return bool(
+        isinstance(actions, list)
+        and len(actions) == 1
+        and isinstance(actions[0], Mapping)
+        and actions[0].get("name") == "TaskOutput"
+        and actions[0].get("blocking") is True
+    )
+
+
+def merge_claude_event_metadata(
+    retained: List[Any], duplicate: Sequence[Any]
+) -> None:
+    """Merge safe metadata from a streamed/resumed duplicate into its first call."""
+    if len(retained) <= EVENT_ACTIONS:
+        retained.extend([None] * (EVENT_ACTIONS + 1 - len(retained)))
+    additions = duplicate[EVENT_ACTIONS] if len(duplicate) > EVENT_ACTIONS else None
+    retained[EVENT_ACTIONS] = merge_claude_actions(retained[EVENT_ACTIONS], additions or [])
+    if len(retained) <= EVENT_WAIT:
+        retained.extend([None] * (EVENT_WAIT + 1 - len(retained)))
+    retained[EVENT_WAIT] = claude_wait_for_actions(retained[EVENT_ACTIONS])
+
+    duplicate_known = (
+        len(duplicate) > EVENT_REASONING_KNOWN
+        and duplicate[EVENT_REASONING_KNOWN] is True
+    )
+    retained_known = (
+        len(retained) > EVENT_REASONING_KNOWN
+        and retained[EVENT_REASONING_KNOWN] is True
+    )
+    if duplicate_known and not retained_known:
+        if len(retained) <= EVENT_REASONING_KNOWN:
+            retained.extend([None] * (EVENT_REASONING_KNOWN + 1 - len(retained)))
+        output_slot = EVENT_KINDS + CLAUDE_KINDS.index("output")
+        retained_output = max(0, int(retained[output_slot]))
+        retained[EVENT_REASONING] = min(
+            max(0, int(duplicate[EVENT_REASONING])), retained_output
+        )
+        retained[EVENT_REASONING_KNOWN] = True
+
+
 def claude_file_thread(path: Path, session_id: str, sidechain: bool) -> Tuple[str, str]:
     """Return a safe thread ID and its initial lineage class for one record."""
     child_id = claude_agent_id(path)
@@ -2023,6 +2065,9 @@ def parse_claude_file(
                         existing[EVENT_ACTIONS] if len(existing) > EVENT_ACTIONS else None,
                         actions,
                     )
+                    if len(existing) <= EVENT_WAIT:
+                        existing.extend([None] * (EVENT_WAIT + 1 - len(existing)))
+                    existing[EVENT_WAIT] = claude_wait_for_actions(existing[EVENT_ACTIONS])
                     detail = usage.get("output_tokens_details")
                     thinking = detail.get("thinking_tokens") if isinstance(detail, Mapping) else None
                     if (
@@ -2031,8 +2076,11 @@ def parse_claude_file(
                     ) and isinstance(thinking, (int, float)) and not isinstance(thinking, bool):
                         if len(existing) <= EVENT_REASONING_KNOWN:
                             existing.extend([None] * (EVENT_REASONING_KNOWN + 1 - len(existing)))
-                        output_tokens = int(usage.get("output_tokens") or 0)
-                        existing[EVENT_REASONING] = min(max(0, int(thinking)), max(0, output_tokens))
+                        output_slot = EVENT_KINDS + CLAUDE_KINDS.index("output")
+                        retained_output = max(0, int(existing[output_slot]))
+                        existing[EVENT_REASONING] = min(
+                            max(0, int(thinking)), retained_output
+                        )
                         existing[EVENT_REASONING_KNOWN] = True
                 continue
             seen_ids.add(message_id)
@@ -2075,8 +2123,7 @@ def parse_claude_file(
                 1 if long_context else 0, 1 if sidechain else 0,
                 "", thread_id, message_id if isinstance(message_id, str) else "",
                 None, reasoning, actions,
-                bool(len(actions) == 1 and actions[0].get("name") == "TaskOutput"
-                     and actions[0].get("blocking") is True),
+                claude_wait_for_actions(actions),
                 bool(reasoning_known),
             ]
             index.events.append(event)
@@ -2930,6 +2977,9 @@ class Scan:
         self.prompt_labels = {}  # type: Dict[Tuple[str, str], Dict[float, str]]
         self.compactions = {}  # type: Dict[Tuple[str, str], List[float]]
         self.claimed = {}  # type: Dict[Tuple[str, str], str]
+        # First in-memory event row for a deduplicated message ID. Claude
+        # resumed files can add safe tool-use metadata to that surviving row.
+        self.claimed_event_rows = {}  # type: Dict[Tuple[str, str], List[Any]]
         self.forks = {}  # type: Dict[Tuple[str, str], Dict[str, int]]
         self.thread_metadata = {}  # type: Dict[Tuple[str, str, str], Dict[str, Any]]
         self.messages = []  # type: List[List[Any]]
@@ -3187,8 +3237,14 @@ def absorb(
                 if owner != row_session:
                     forks = scan.forks.setdefault((harness, row_session), {})
                     forks[owner] = forks.get(owner, 0) + 1
+                elif harness == "claude":
+                    retained = scan.claimed_event_rows.get(call_id)
+                    if retained is not None:
+                        merge_claude_event_metadata(retained, row)
                 continue
             claimed[call_id] = row_session
+            if harness == "claude":
+                scan.claimed_event_rows[call_id] = row
         kept.append(row)
     for thread_id, metadata in entry.thread_metadata.items():
         metadata = dict(metadata)
@@ -4481,6 +4537,7 @@ def _claude_drill_bucket(
         "cache_write_unknown_input_tokens": 0,
         "output_tokens": 0,
         "reasoning_output_tokens": 0,
+        "known_reasoning_output_tokens": 0,
         "reasoning_unknown_calls": 0,
         "fallback_priced_cache_write_tokens": 0,
         "weighted_units": 0.0,
@@ -4503,38 +4560,46 @@ def _claude_drill_bucket(
 
 def _claude_drill_wait_streaks(events: Sequence[Sequence[Any]]) -> List[Dict[str, Any]]:
     streaks = []
-    current = []
+    by_thread = {}  # type: Dict[str, List[Sequence[Any]]]
+    for row in events:
+        thread_id = str(row[EVENT_THREAD] or "")
+        by_thread.setdefault(thread_id, []).append(row)
+    for thread_id, thread_events in by_thread.items():
+        current = []
 
-    def flush() -> None:
-        if not current:
-            return
-        first = event_context(current[0], "claude")
-        last = event_context(current[-1], "claude")
-        delta = last - first
-        streaks.append({
-            "kind": "TaskOutput(block=true)",
-            "length": len(current),
-            "first_context": first,
-            "last_context": last,
-            "context_delta": delta,
-            "mean_context_delta_per_transition": (
-                delta / (len(current) - 1) if len(current) > 1 else None
-            ),
-            "uncached_input_tokens": sum(int(row[3]) for row in current),
-            "cached_replay_tokens": sum(int(row[4]) for row in current),
-            "cache_write_tokens": sum(int(row[5]) + int(row[6]) + int(row[8]) for row in current),
-            "start": current[0][EVENT_TS],
-            "end": current[-1][EVENT_TS],
-        })
-        current.clear()
+        def flush() -> None:
+            if not current:
+                return
+            first = event_context(current[0], "claude")
+            last = event_context(current[-1], "claude")
+            delta = last - first
+            streaks.append({
+                "thread_id": thread_id or None,
+                "kind": "TaskOutput(block=true)",
+                "length": len(current),
+                "first_context": first,
+                "last_context": last,
+                "context_delta": delta,
+                "mean_context_delta_per_transition": (
+                    delta / (len(current) - 1) if len(current) > 1 else None
+                ),
+                "uncached_input_tokens": sum(int(row[3]) for row in current),
+                "cached_replay_tokens": sum(int(row[4]) for row in current),
+                "cache_write_tokens": sum(
+                    int(row[5]) + int(row[6]) + int(row[8]) for row in current
+                ),
+                "start": current[0][EVENT_TS],
+                "end": current[-1][EVENT_TS],
+            })
+            current.clear()
 
-    for row in sorted(events, key=lambda item: item[EVENT_TS]):
-        if len(row) > EVENT_WAIT and row[EVENT_WAIT] is True:
-            current.append(row)
-        else:
-            flush()
-    flush()
-    return streaks
+        for row in sorted(thread_events, key=lambda item: item[EVENT_TS]):
+            if len(row) > EVENT_WAIT and row[EVENT_WAIT] is True:
+                current.append(row)
+            else:
+                flush()
+        flush()
+    return sorted(streaks, key=lambda item: (item["start"], item["end"], item["thread_id"] or ""))
 
 
 def _claude_drill_add_events(
@@ -4566,7 +4631,7 @@ def _claude_drill_add_events(
             len(row) > EVENT_REASONING_KNOWN and row[EVENT_REASONING_KNOWN] is True
         )
         if known_reasoning:
-            bucket["reasoning_output_tokens"] += int(row[EVENT_REASONING])
+            bucket["known_reasoning_output_tokens"] += int(row[EVENT_REASONING])
         else:
             bucket["reasoning_unknown_calls"] += 1
         unit = weights.claude_units(
@@ -4620,6 +4685,10 @@ def _claude_drill_add_events(
         reverse=True,
     )
     bucket["wait_streaks"] = _claude_drill_wait_streaks(events)
+    bucket["reasoning_output_tokens"] = (
+        None if bucket["reasoning_unknown_calls"]
+        else bucket["known_reasoning_output_tokens"]
+    )
 
 
 def drilldown_for_claude_prompt(
@@ -4740,6 +4809,10 @@ def drilldown_for_claude_prompt(
         caveats.append(
             "cache creation without a complete TTL breakdown uses the historical 5-minute price as an estimate"
         )
+    if combined["reasoning_unknown_calls"]:
+        caveats.append(
+            "thinking output is a known subtotal because some usage records omit its token count"
+        )
     return {
         "root": root,
         "descendants": descendants,
@@ -4762,16 +4835,21 @@ def render_claude_drilldown(drilldown: Mapping[str, Any]) -> None:
     entries.append(("unknown aggregate", drilldown["unknown"]))
     for label, bucket in entries:
         tokens = bucket["tokens"]
+        thinking = (
+            str(bucket["reasoning_output_tokens"])
+            if bucket["reasoning_output_tokens"] is not None
+            else "partial"
+        )
         print("%s %s parent=%s depth=%s agent_type=%s model=%s" % (
             label, bucket["thread_id"] or "-", bucket["parent_thread_id"] or "-",
             bucket["depth"] if bucket["depth"] is not None else "unknown",
             bucket["agent_type"] or "-", bucket["model"] or "-",
         ))
-        print("  totals: calls=%d input=%d cache_read=%d write_5m=%d write_1h=%d write_unknown=%d output=%d thinking=%d thinking_unknown_calls=%d units=%.4f" % (
+        print("  totals: calls=%d input=%d cache_read=%d write_5m=%d write_1h=%d write_unknown=%d output=%d thinking=%s known_thinking=%d thinking_unknown_calls=%d units=%.4f" % (
             bucket["api_calls"], tokens["input"], tokens["cache_read"],
             tokens["cache_write_5m"], tokens["cache_write_1h"],
-            tokens["cache_write_unknown"], tokens["output"],
-            bucket["reasoning_output_tokens"], bucket["reasoning_unknown_calls"],
+            tokens["cache_write_unknown"], tokens["output"], thinking,
+            bucket["known_reasoning_output_tokens"], bucket["reasoning_unknown_calls"],
             bucket["weighted_units"],
         ))
         print("  actions: %s" % (
@@ -4807,11 +4885,16 @@ def render_claude_drilldown(drilldown: Mapping[str, Any]) -> None:
             ))
     combined = drilldown["combined"]
     tokens = combined["tokens"]
-    print("combined totals: calls=%d input=%d cache_read=%d write_5m=%d write_1h=%d write_unknown=%d output=%d thinking=%d units=%.4f" % (
+    thinking = (
+        str(combined["reasoning_output_tokens"])
+        if combined["reasoning_output_tokens"] is not None else "partial"
+    )
+    print("combined totals: calls=%d input=%d cache_read=%d write_5m=%d write_1h=%d write_unknown=%d output=%d thinking=%s known_thinking=%d thinking_unknown_calls=%d units=%.4f" % (
         combined["api_calls"], tokens["input"], tokens["cache_read"],
         tokens["cache_write_5m"], tokens["cache_write_1h"],
         tokens["cache_write_unknown"], tokens["output"],
-        combined["reasoning_output_tokens"], combined["weighted_units"],
+        thinking, combined["known_reasoning_output_tokens"],
+        combined["reasoning_unknown_calls"], combined["weighted_units"],
     ))
     reconciliation = drilldown["reconciliation"]
     print("reconciliation: %s" % ("ok" if reconciliation["matches_prompt"] else "mismatch"))

@@ -178,8 +178,10 @@ context observations; they are not new-token totals. For a raw string argument,
 payload size is its UTF-8 byte length. Structured arguments use compact JSON
 with `ensure_ascii=False` and UTF-8 encoding; a missing payload is reported as
 unknown rather than measured as the bytes of `null`. Raw messages, arguments,
-and encrypted bodies are never cached or decoded. Thinking token totals are
-unknown when a Claude usage record omits `output_tokens_details.thinking_tokens`.
+and encrypted bodies are never cached or decoded. If any Claude call omits
+`output_tokens_details.thinking_tokens`, JSON reports
+`reasoning_output_tokens: null` plus `known_reasoning_output_tokens`; text labels
+that number as a known subtotal.
 Claude's aggregate cache-creation count remains disjoint from uncached input
 and cache reads. Any aggregate write tokens without a complete 5-minute / 1-hour
 split appear in `cache_write_unknown`; they use the historical 5-minute price

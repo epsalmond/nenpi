@@ -1278,11 +1278,11 @@ class AttributionCap(Harness):
         interval = QD.Interval(("acct", "lim", "plan", 300), 0.0, 100.0, 10.0, None, False)
         session_id = "sess-1"
         # event without a prompt key (e.g. a sub-thread row outside any
-        # prompt group): row length 13, no EVENT_PROMPT slot at all.
-        no_prompt_event = [session_id, "m", 10.0, 100_000, 0, 0, 0, 0, 0, 0, "", "", ""]
-        # event with a prompt key: row length 14, EVENT_PROMPT set.
+        # prompt group): row length 14, no EVENT_PROMPT slot at all.
+        no_prompt_event = [session_id, "m", 10.0, 100_000, 0, 0, 0, 0, 0, 0, 0, "", "", ""]
+        # event with a prompt key: row length 15, EVENT_PROMPT set.
         with_prompt_event = (
-            [session_id, "m", 20.0, 200_000, 0, 0, 0, 0, 0, 0, "", "", ""] + [1]
+            [session_id, "m", 20.0, 200_000, 0, 0, 0, 0, 0, 0, 0, "", "", ""] + [1]
         )
         self.assertEqual(len(no_prompt_event), QD.EVENT_PROMPT)
         self.assertEqual(len(with_prompt_event), QD.EVENT_PROMPT + 1)
@@ -5305,8 +5305,8 @@ class PromptRanking(Harness):
         self.assertEqual(second["prompts"][0]["label"], "rank me first please")
 
     def test_cache_schema_includes_drilldown_metadata(self) -> None:
-        # 8 adds lineage, action, reasoning, and safe message metadata.
-        self.assertEqual(QD.CACHE_SCHEMA, 8)
+        # 9 adds Claude sidecar lineage and disjoint unknown cache-write data.
+        self.assertEqual(QD.CACHE_SCHEMA, 9)
 
     def test_codex_label_comes_from_the_user_message(self) -> None:
         now = time.time() - 3600
