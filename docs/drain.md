@@ -174,6 +174,9 @@ reported as unknown rather than measured as the bytes of `null`. Raw messages,
 arguments, and encrypted bodies are never cached or decoded. `--prompt` requires
 `--session`; `--drilldown` requires both flags and is Codex-only. Use `--json`
 for the same accounting fields in a machine-readable response.
+Aggregates retain `known_payload_bytes` and mark `payload_bytes` as partial when
+any contributing message payload is unavailable; route entries expose the same
+known subtotal and unknown count.
 
 ### tools
 

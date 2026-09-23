@@ -3969,23 +3969,42 @@ def _drill_add_tools(bucket: Dict[str, Any], calls: Sequence[ToolCall]) -> None:
 
 def _drill_add_messages(bucket: Dict[str, Any], rows: Sequence[Sequence[Any]]) -> None:
     routes = {}
+    messages = bucket["messages"]
     for row in rows:
         target = row[5] if len(row) > 5 else "unknown"
         size = row[6] if len(row) > 6 else None
-        bucket["messages"]["calls"] += 1
+        messages["calls"] += 1
         if target == "unknown":
-            bucket["messages"]["unknown_target_calls"] += 1
+            messages["unknown_target_calls"] += 1
         if isinstance(size, int):
-            bucket["messages"]["payload_bytes"] += size
-            bucket["messages"]["known_payload_bytes"] += size
+            messages["known_payload_bytes"] += size
         else:
-            bucket["messages"]["unknown_payload_calls"] += 1
+            messages["unknown_payload_calls"] += 1
         key = str(target)
-        route = routes.setdefault(key, {"target": target, "calls": 0, "payload_bytes": 0})
+        route = routes.setdefault(key, {
+            "target": target,
+            "calls": 0,
+            "payload_bytes": 0,
+            "known_payload_bytes": 0,
+            "unknown_payload_calls": 0,
+        })
         route["calls"] += 1
         if isinstance(size, int):
-            route["payload_bytes"] += size
-    bucket["messages"]["routes"] = sorted(routes.values(), key=lambda item: (item["calls"], item["payload_bytes"]), reverse=True)
+            route["known_payload_bytes"] += size
+        else:
+            route["unknown_payload_calls"] += 1
+    messages["payload_bytes"] = (
+        None if messages["unknown_payload_calls"] else messages["known_payload_bytes"]
+    )
+    for route in routes.values():
+        route["payload_bytes"] = (
+            None if route["unknown_payload_calls"] else route["known_payload_bytes"]
+        )
+    messages["routes"] = sorted(
+        routes.values(),
+        key=lambda item: (item["calls"], item["known_payload_bytes"]),
+        reverse=True,
+    )
 
 
 def _drill_thread_classification(
@@ -4108,6 +4127,13 @@ def drilldown_for_prompt(analysis: "Analysis", prompt: Prompt) -> Dict[str, Any]
         combined["weighted_units"] += bucket["weighted_units"]
         for action, count in bucket["action_counts"].items():
             combined["action_counts"][action] = combined["action_counts"].get(action, 0) + count
+    combined_message_rows = [
+        row for row in scan.messages
+        if row[0] == "codex" and row[1] == prompt.session_id
+        and prompt.start is not None and prompt.end is not None
+        and prompt.start <= float(row[2]) <= prompt.end
+    ]
+    _drill_add_messages(combined, combined_message_rows)
     prompt_tokens = prompt.tokens
     reconciliation = {
         "matches_prompt": combined["api_calls"] == prompt.turns
@@ -4166,9 +4192,17 @@ def render_drilldown(drilldown: Mapping[str, Any]) -> None:
             item["tool"], item["calls"], item["measured_tokens"], item["result_chars"]
         ) for item in bucket["tool_family_rankings"]) or "none"))
         messages = bucket["messages"]
-        print("  messages: calls=%d payload_bytes=%d unknown_targets=%d unknown_payloads=%d routes=%s" % (
-            messages["calls"], messages["payload_bytes"], messages["unknown_target_calls"], messages["unknown_payload_calls"],
-            ", ".join("%s=%d" % (route["target"], route["calls"]) for route in messages["routes"]) or "none",
+        payload_bytes = messages["payload_bytes"] if messages["payload_bytes"] is not None else "unknown/partial"
+        routes = ", ".join(
+            "%s calls=%d payload_bytes=%s known_payload_bytes=%d unknown_payloads=%d" % (
+                route["target"], route["calls"],
+                route["payload_bytes"] if route["payload_bytes"] is not None else "unknown/partial",
+                route["known_payload_bytes"], route["unknown_payload_calls"],
+            ) for route in messages["routes"]
+        ) or "none"
+        print("  messages: calls=%d payload_bytes=%s known_payload_bytes=%d unknown_targets=%d unknown_payloads=%d routes=%s" % (
+            messages["calls"], payload_bytes, messages["known_payload_bytes"],
+            messages["unknown_target_calls"], messages["unknown_payload_calls"], routes,
         ))
         for streak in bucket["wait_streaks"]:
             print("  wait streak: length=%d first_context=%d last_context=%d context_delta=%d mean_delta=%s uncached_input=%d cached_replay=%d start=%s end=%s" % (

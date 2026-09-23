@@ -129,6 +129,69 @@ class TestCodexPromptDrilldown(Harness):
         self.assertEqual(structured_size, len(expected))
         self.assertEqual(codex_message_metadata({}), ("unknown", None))
 
+    def test_mixed_message_payload_aggregates_are_partial_not_zero(self) -> None:
+        base = time.time() - 900
+        session = "mixed-payload-session-0001"
+        unknown_thread = "mixed-payload-unknown-0001"
+        missing_payload = json.dumps({
+            "type": "response_item",
+            "timestamp": iso(base + 2.5),
+            "payload": {
+                "type": "function_call",
+                "call_id": "missing-payload",
+                "name": "send_message",
+                "namespace": "collaboration",
+            },
+        })
+        self.write_codex("rollout-root.jsonl", [
+            codex_session_meta_line(base, session, "/home/agent/project"),
+            codex_task_started_line(base + 1),
+            codex_turn_context_line(base + 1.1, "gpt-5.5"),
+            codex_tool_call_line(
+                base + 2, "known-payload", "send_message", namespace="collaboration",
+                command=json.dumps({"target_thread_id": unknown_thread, "message": "known"}),
+            ),
+            codex_tool_output_line(base + 2.1, "known-payload", "ok"),
+            codex_usage_line(base + 2.2, session, session, input_tokens=10, cached_input_tokens=0, output_tokens=1),
+        ], day=base)
+        self.write_codex("rollout-unknown.jsonl", [
+            nested_meta_line(base + 1.2, unknown_thread, session, "missing-parent-0001", 1),
+            missing_payload,
+            codex_tool_output_line(base + 2.6, "missing-payload", "ok"),
+            codex_usage_line(base + 2.7, session, unknown_thread, input_tokens=11, cached_input_tokens=0, output_tokens=1),
+        ], day=base)
+
+        result = self.run_tool(
+            "prompts", "--harness", "codex", "--codex-root", str(self.home / ".codex"),
+            "--session", session, "--prompt", "1", "--drilldown", "--json",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr.decode("utf-8", "replace"))
+        drilldown = json.loads(result.stdout.decode("utf-8"))["drilldown"]
+        root_messages = drilldown["root"]["messages"]
+        unknown_messages = drilldown["unknown"]["messages"]
+        combined_messages = drilldown["combined"]["messages"]
+        self.assertEqual(root_messages["calls"], 1)
+        self.assertEqual(root_messages["payload_bytes"], root_messages["known_payload_bytes"])
+        self.assertGreater(root_messages["known_payload_bytes"], 0)
+        self.assertIsNone(unknown_messages["payload_bytes"])
+        self.assertEqual(unknown_messages["known_payload_bytes"], 0)
+        self.assertEqual(unknown_messages["unknown_payload_calls"], 1)
+        self.assertIsNone(combined_messages["payload_bytes"])
+        self.assertEqual(combined_messages["known_payload_bytes"], root_messages["known_payload_bytes"])
+        routes = {str(route["target"]): route for route in unknown_messages["routes"]}
+        self.assertIsNone(routes["unknown"]["payload_bytes"])
+        self.assertEqual(routes["unknown"]["unknown_payload_calls"], 1)
+        self.assertEqual(routes["unknown"]["known_payload_bytes"], 0)
+
+        text_result = self.run_tool(
+            "prompts", "--harness", "codex", "--codex-root", str(self.home / ".codex"),
+            "--session", session, "--prompt", "1", "--drilldown", "--no-color",
+        )
+        text = text_result.stdout.decode("utf-8")
+        self.assertIn("payload_bytes=unknown/partial", text)
+        self.assertIn("known_payload_bytes=0", text)
+        self.assertIn("unknown_payloads=1", text)
+
     def test_assistant_message_breaks_pure_wait_streak(self) -> None:
         base = time.time() - 900
         session = "wait-break-session-0001"
