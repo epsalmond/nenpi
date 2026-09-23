@@ -35,6 +35,7 @@ nenpi sessions    [--harness claude|codex|all] [--since 7d|2026-09-10] [--until 
                   [--sort drain|tokens|start] [--json] [--no-color] [--width N]
 nenpi prompts     [--sort turns|context|drain|tokens|units] [--top N]
                   [--label | --no-label] [--session <id-prefix> [--first] [--tools]]
+                  [--prompt N [--drilldown]]
 nenpi tools       [--session <id-prefix>] [--first] [--prompt N] [--top N]
                   [--sort context|calls|mean] [--harness ...] [--json]
 nenpi fanout      [--since ...] [--harness ...] [--sort tokens|turns|...]
@@ -149,6 +150,33 @@ quadratic x^2 term 9.98 (R^2 0.998) | last 20% of prompts = 41% of session cost
 The fit is ordinary least squares of per-prompt weighted units against prompt
 index, once linear and once quadratic; `better` names the higher R², requiring
 at least a 0.01 margin so near-ties report as linear.
+
+#### Codex prompt drilldown
+
+`nenpi prompts --harness codex --session ID --prompt N --drilldown` explains one
+selected prompt without changing ordinary prompt accounting. The report keeps
+the existing deduplicated prompt totals and partitions them into the root
+thread, descendants with explicit `parent_thread_id` lineage, and an `unknown`
+partition when lineage metadata is unavailable. Unknown threads retain their
+own auxiliary details before the aggregate is formed. Descendant membership is
+temporal to the selected prompt; it is not evidence that an unrelated thread
+was spawned by that prompt.
+
+The drilldown also reports per-thread tool-family call counts and measured
+context attribution (an upper bound where other context growth is present),
+safe collaboration targets and serialized request-payload sizes, reasoning
+output as a subset of output, and contiguous `wait_agent` API streaks. Wait
+streak context deltas compare first and last context observations; they are not
+new-token totals. For a raw string argument, payload size is the exact UTF-8
+byte length of that original string. Structured arguments use compact JSON with
+`ensure_ascii=False` and UTF-8 encoding; a missing or unavailable payload is
+reported as unknown rather than measured as the bytes of `null`. Raw messages,
+arguments, and encrypted bodies are never cached or decoded. `--prompt` requires
+`--session`; `--drilldown` requires both flags and is Codex-only. Use `--json`
+for the same accounting fields in a machine-readable response.
+Aggregates retain `known_payload_bytes` and mark `payload_bytes` as partial when
+any contributing message payload is unavailable; route entries expose the same
+known subtotal and unknown count.
 
 ### tools
 
