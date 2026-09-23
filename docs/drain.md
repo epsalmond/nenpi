@@ -151,32 +151,44 @@ The fit is ordinary least squares of per-prompt weighted units against prompt
 index, once linear and once quadratic; `better` names the higher R², requiring
 at least a 0.01 margin so near-ties report as linear.
 
-#### Codex prompt drilldown
+#### Prompt drilldown
 
-`nenpi prompts --harness codex --session ID --prompt N --drilldown` explains one
-selected prompt without changing ordinary prompt accounting. The report keeps
-the existing deduplicated prompt totals and partitions them into the root
-thread, descendants with explicit `parent_thread_id` lineage, and an `unknown`
-partition when lineage metadata is unavailable. Unknown threads retain their
-own auxiliary details before the aggregate is formed. Descendant membership is
-temporal to the selected prompt; it is not evidence that an unrelated thread
-was spawned by that prompt.
+`nenpi prompts --session ID --prompt N --drilldown` explains one selected
+Claude or Codex prompt without changing ordinary prompt accounting. The report
+keeps the existing deduplicated prompt totals and partitions them into the root
+thread, descendants with explicit lineage, and an `unknown` partition when
+lineage metadata is unavailable. Unknown threads retain their own auxiliary
+details before the aggregate is formed.
 
-The drilldown also reports per-thread tool-family call counts and measured
-context attribution (an upper bound where other context growth is present),
-safe collaboration targets and serialized request-payload sizes, reasoning
-output as a subset of output, and contiguous `wait_agent` API streaks. Wait
-streak context deltas compare first and last context observations; they are not
-new-token totals. For a raw string argument, payload size is the exact UTF-8
-byte length of that original string. Structured arguments use compact JSON with
-`ensure_ascii=False` and UTF-8 encoding; a missing or unavailable payload is
-reported as unknown rather than measured as the bytes of `null`. Raw messages,
-arguments, and encrypted bodies are never cached or decoded. `--prompt` requires
-`--session`; `--drilldown` requires both flags and is Codex-only. Use `--json`
-for the same accounting fields in a machine-readable response.
-Aggregates retain `known_payload_bytes` and mark `payload_bytes` as partial when
-any contributing message payload is unavailable; route entries expose the same
-known subtotal and unknown count.
+For Claude, `subagents/agent-<id>.meta.json` links a child to its parent only
+when `toolUseId` exactly matches an Agent or legacy Task tool-use ID in the
+shared session. Missing sidecars, missing IDs, and unmatched IDs stay in
+unknown thread rows. The sidecar's agent type, model, and spawn depth are shown
+when present. Child calls are assigned to prompts by their timestamps, as in
+the normal prompt report; exact lineage does not establish prompt ownership
+for background work that overlaps a later prompt. Claude `TaskOutput` wait
+streaks are reported only when the tool input explicitly has `block: true`.
+Missing `block` evidence is shown as unclassified.
+
+The drilldown also reports per-thread tool-family counts and measured context
+attribution (an upper bound where other context growth is present), safe target
+IDs and derived payload sizes, reasoning output as a subset of output, and
+explicit wait evidence. Wait streak context deltas compare first and last
+context observations; they are not new-token totals. For a raw string argument,
+payload size is its UTF-8 byte length. Structured arguments use compact JSON
+with `ensure_ascii=False` and UTF-8 encoding; a missing payload is reported as
+unknown rather than measured as the bytes of `null`. Raw messages, arguments,
+and encrypted bodies are never cached or decoded. Thinking token totals are
+unknown when a Claude usage record omits `output_tokens_details.thinking_tokens`.
+Claude's aggregate cache-creation count remains disjoint from uncached input
+and cache reads. Any aggregate write tokens without a complete 5-minute / 1-hour
+split appear in `cache_write_unknown`; they use the historical 5-minute price
+as an estimate, and the report labels that assumption. Use `--json` for the
+same accounting fields in a machine-readable response.
+
+Codex aggregates retain `known_payload_bytes` and mark `payload_bytes` as
+partial when any contributing message payload is unavailable; route entries
+expose the same known subtotal and unknown count.
 
 ### tools
 

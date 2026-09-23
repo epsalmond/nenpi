@@ -78,7 +78,7 @@ except ImportError:  # bench can load drain.py as a standalone quota module.
         serialized_cache,
     )
 
-CACHE_SCHEMA = 8
+CACHE_SCHEMA = 9
 JSON_SCHEMA = 1
 LONG_CONTEXT_THRESHOLD = 200_000
 CONTEXT_REDUCTION_FRACTION = 0.30
@@ -108,7 +108,10 @@ MIN_RATE_UNITS = 1.0  # ...and at least this much weighted-unit coverage.
 DEDUP_CARRY_IDS = 64
 PROGRESS_INTERVAL_SECONDS = 0.5
 
-CLAUDE_KINDS = ("input", "cache_read", "cache_write_5m", "cache_write_1h", "output")
+CLAUDE_KINDS = (
+    "input", "cache_read", "cache_write_5m", "cache_write_1h", "output",
+    "cache_write_unknown",
+)
 CODEX_KINDS = ("input", "cached_input", "cache_write", "output")
 CODEX_FIT_KINDS = ("input", "cached_input", "output")
 
@@ -519,6 +522,9 @@ def builtin_weights() -> Dict[str, Any]:
             "cache_write_5m": price[2],
             "cache_write_1h": price[3],
             "output": price[4],
+            # Legacy aggregate-only transcripts did not expose a TTL split;
+            # keep their historical 5-minute pricing as an explicit estimate.
+            "cache_write_unknown": price[2],
         }
     codex_models = {}
     for name, credit in CODEX_CREDITS.items():
@@ -559,6 +565,12 @@ def claude_price(entry: Mapping[str, Any], model: str, kind: str) -> float:
     value = entry.get(kind)
     if isinstance(value, (int, float)):
         return float(value)
+    if kind == "cache_write_unknown":
+        known_5m = entry.get("cache_write_5m")
+        if isinstance(known_5m, (int, float)):
+            return float(known_5m)
+        price = CLAUDE_PRICES.get(normalize_claude_model(model))
+        return float(price[2]) if price is not None else 0.0
     price = CLAUDE_PRICES.get(normalize_claude_model(model))
     if price is None or kind not in CLAUDE_KINDS:
         return 0.0
@@ -759,6 +771,54 @@ def calibrated_codex_table(rate_card: Mapping[str, Any], fit: Mapping[str, Any]
 
 # --------------------------------------------------------------------------
 # transcript discovery
+
+
+def claude_agent_id(path: Path) -> str:
+    """Return the opaque ID from ``subagents/agent-<id>.jsonl`` paths."""
+    if path.parent.name != "subagents" or not path.stem.startswith("agent-"):
+        return ""
+    value = path.stem[len("agent-"):]
+    return value if re.fullmatch(r"[A-Za-z0-9_-]{1,160}", value) else ""
+
+
+def claude_sidecar(path: Path) -> Tuple[str, Dict[str, Any]]:
+    """Read only the safe structural fields from an agent metadata sidecar.
+
+    The digest is used solely to notice any sidecar edit. No raw sidecar,
+    prompt, or tool argument text enters the cache.
+    """
+    if not claude_agent_id(path):
+        return "", {}
+    sidecar = path.with_suffix(".meta.json")
+    try:
+        raw = sidecar.read_bytes()
+    except OSError:
+        return "", {}
+    signature = hashlib.sha256(raw).hexdigest()
+    try:
+        payload = json.loads(raw)
+    except (UnicodeDecodeError, ValueError):
+        return signature, {}
+    if not isinstance(payload, Mapping):
+        return signature, {}
+
+    def safe_id(value: Any) -> str:
+        if not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9_.:-]{1,160}", value):
+            return ""
+        return value
+
+    metadata: Dict[str, Any] = {}
+    tool_use_id = safe_id(payload.get("toolUseId"))
+    if tool_use_id:
+        metadata["tool_use_id"] = tool_use_id
+    depth = payload.get("spawnDepth")
+    if isinstance(depth, int) and not isinstance(depth, bool) and 0 <= depth <= 128:
+        metadata["depth"] = depth
+    for source, target in (("agentType", "agent_type"), ("model", "model")):
+        value = safe_id(payload.get(source))
+        if value:
+            metadata[target] = value
+    return signature, metadata
 
 
 def claude_transcripts(
@@ -1020,6 +1080,10 @@ class FileIndex:
         self.is_subagent = False
         self.thread_metadata = {}  # type: Dict[str, Dict[str, Any]]
         self.message_rows = []  # type: List[List[Any]]
+        # A sidecar edit invalidates its transcript shard even when the
+        # transcript JSONL itself has not changed.
+        self.claude_sidecar_signature = ""
+        self.claude_agent_metadata = {}  # type: Dict[str, Any]
         self.pending_actions = []  # type: List[str]
         self.pending_response_seen = False
         self.head_hash = ""
@@ -1068,6 +1132,8 @@ class FileIndex:
             "is_subagent": self.is_subagent,
             "thread_metadata": self.thread_metadata,
             "message_rows": self.message_rows,
+            "claude_sidecar_signature": self.claude_sidecar_signature,
+            "claude_agent_metadata": self.claude_agent_metadata,
             "pending_actions": self.pending_actions,
             "pending_response_seen": self.pending_response_seen,
             "head_hash": self.head_hash,
@@ -1100,6 +1166,8 @@ class FileIndex:
         index.is_subagent = bool(payload.get("is_subagent"))
         index.thread_metadata = dict(payload.get("thread_metadata") or {})
         index.message_rows = list(payload.get("message_rows") or [])
+        index.claude_sidecar_signature = str(payload.get("claude_sidecar_signature", ""))
+        index.claude_agent_metadata = dict(payload.get("claude_agent_metadata") or {})
         index.pending_actions = [str(item) for item in payload.get("pending_actions") or []]
         index.pending_response_seen = bool(payload.get("pending_response_seen"))
         index.head_hash = str(payload.get("head_hash", ""))
@@ -1149,16 +1217,17 @@ def content_fingerprint(path: Path, offset: int) -> Tuple[str, str]:
 # harnesses; Codex uses four kinds and leaves the fifth zero.
 EVENT_SESSION, EVENT_MODEL, EVENT_TS = 0, 1, 2
 EVENT_KINDS = 3
-EVENT_KIND_SLOTS = 5
-EVENT_LONG = 8
-EVENT_SUB = 9
-EVENT_TURN = 10
-EVENT_THREAD = 11
-EVENT_ID = 12
-EVENT_PROMPT = 13
-EVENT_REASONING = 14
-EVENT_ACTIONS = 15
-EVENT_WAIT = 16
+EVENT_KIND_SLOTS = 6
+EVENT_LONG = 9
+EVENT_SUB = 10
+EVENT_TURN = 11
+EVENT_THREAD = 12
+EVENT_ID = 13
+EVENT_PROMPT = 14
+EVENT_REASONING = 15
+EVENT_ACTIONS = 16
+EVENT_WAIT = 17
+EVENT_REASONING_KNOWN = 18
 
 # Absolute token-area indices for the kinds each harness actually prices, in
 # the order its `*_units` method sums them. `Weights.event_vector` pairs these
@@ -1677,14 +1746,140 @@ def record_tool(
 def event_context(event: Sequence[Any], harness: str) -> int:
     """Tokens the harness re-sent to the API for this one call."""
     if harness == "claude":
-        # input + cache_read + both cache-write TTLs
-        return int(event[3]) + int(event[4]) + int(event[5]) + int(event[6])
+        # input + cache_read + both known cache-write TTLs + unknown writes
+        return int(event[3]) + int(event[4]) + int(event[5]) + int(event[6]) + int(event[8])
     # Codex splits input into uncached and cached; together they are the context.
     return int(event[3]) + int(event[4])
 
 
 # --------------------------------------------------------------------------
 # Claude parsing
+
+
+def claude_cache_write_tokens(usage: Mapping[str, Any]) -> Tuple[int, int, int]:
+    """Split cache creation while retaining any unclassified aggregate.
+
+    Subdivisions are evidence only when the transcript actually carries them.
+    Any aggregate remainder stays in ``cache_write_unknown`` and is not
+    priced as though a TTL had been observed.
+    """
+    creation = usage.get("cache_creation")
+    aggregate_value = usage.get("cache_creation_input_tokens")
+    try:
+        aggregate = max(0, int(aggregate_value or 0))
+    except (TypeError, ValueError):
+        aggregate = 0
+    if not isinstance(creation, Mapping):
+        return 0, 0, aggregate
+
+    def bucket(key: str) -> Tuple[bool, int]:
+        value = creation.get(key)
+        if not isinstance(value, (int, float)) or isinstance(value, bool):
+            return False, 0
+        return True, max(0, int(value))
+
+    has_5m, write_5m = bucket("ephemeral_5m_input_tokens")
+    has_1h, write_1h = bucket("ephemeral_1h_input_tokens")
+    observed_total = write_5m + write_1h
+    if aggregate == 0:
+        # Older records sometimes omit the aggregate but carry TTL details.
+        return write_5m, write_1h, 0
+    if not has_5m and not has_1h:
+        return 0, 0, aggregate
+    if observed_total > aggregate:
+        # The fields disagree, so preserve the authoritative disjoint total
+        # and leave its TTL unknown instead of silently overstating a bucket.
+        return 0, 0, aggregate
+    return write_5m, write_1h, aggregate - observed_total
+
+
+def derived_payload_bytes(value: Any) -> Optional[int]:
+    """Measure a payload without retaining or printing its content."""
+    if isinstance(value, str):
+        return len(value.encode("utf-8"))
+    if isinstance(value, (Mapping, list, tuple)):
+        try:
+            encoded = json.dumps(
+                value, ensure_ascii=False, separators=(",", ":")
+            ).encode("utf-8")
+        except (TypeError, ValueError):
+            return None
+        return len(encoded)
+    return None
+
+
+def claude_tool_use_actions(content: Any) -> List[Dict[str, Any]]:
+    """Keep tool names, opaque IDs, safe sizes, and explicit wait semantics."""
+    if not isinstance(content, list):
+        return []
+    actions = []
+    for block in content:
+        if not isinstance(block, Mapping) or block.get("type") != "tool_use":
+            continue
+        raw_name = block.get("name")
+        name = (
+            raw_name if isinstance(raw_name, str)
+            and re.fullmatch(r"[A-Za-z0-9_.:-]{1,120}", raw_name)
+            else "unknown"
+        )
+        raw_id = block.get("id")
+        call_id = (
+            raw_id if isinstance(raw_id, str)
+            and re.fullmatch(r"[A-Za-z0-9_.:-]{1,160}", raw_id)
+            else ""
+        )
+        arguments = block.get("input")
+        action: Dict[str, Any] = {
+            "name": name,
+            "call_id": call_id,
+            "input_bytes": derived_payload_bytes(arguments),
+        }
+        if name == "TaskOutput" and isinstance(arguments, Mapping):
+            block_wait = arguments.get("block")
+            if isinstance(block_wait, bool):
+                action["blocking"] = block_wait
+        actions.append(action)
+    return actions
+
+
+def merge_claude_actions(
+    existing: Any, additions: Sequence[Mapping[str, Any]]
+) -> List[Dict[str, Any]]:
+    merged = [dict(item) for item in existing if isinstance(item, Mapping)] if isinstance(existing, list) else []
+    positions = {
+        item.get("call_id"): index
+        for index, item in enumerate(merged)
+        if item.get("call_id")
+    }
+    for action in additions:
+        item = dict(action)
+        call_id = item.get("call_id")
+        if call_id and call_id in positions:
+            previous = merged[positions[call_id]]
+            # Later streamed fragments may complete a size that was missing
+            # in the first copy. Preserve the original ID and tool name.
+            if isinstance(item.get("input_bytes"), int) and (
+                not isinstance(previous.get("input_bytes"), int)
+                or item["input_bytes"] > previous["input_bytes"]
+            ):
+                previous["input_bytes"] = item["input_bytes"]
+            if "blocking" in item:
+                previous["blocking"] = item["blocking"]
+            continue
+        merged.append(item)
+        if call_id:
+            positions[call_id] = len(merged) - 1
+    return merged
+
+
+def claude_file_thread(path: Path, session_id: str, sidechain: bool) -> Tuple[str, str]:
+    """Return a safe thread ID and its initial lineage class for one record."""
+    child_id = claude_agent_id(path)
+    if child_id:
+        return child_id, "unknown"
+    if sidechain:
+        return "unknown:" + path.stem, "unknown"
+    return session_id, "root"
 
 
 def is_claude_prompt(record: Mapping[str, Any], is_subagent_file: bool) -> bool:
@@ -1714,8 +1909,14 @@ def is_claude_prompt(record: Mapping[str, Any], is_subagent_file: bool) -> bool:
 def parse_claude_file(
     path: Path, index: FileIndex, cancellation: Cancellation = None
 ) -> FileIndex:
-    is_subagent_file = "/subagents/" in str(path)
+    agent_id = claude_agent_id(path)
+    is_subagent_file = bool(agent_id)
     seen_ids = set(index.carry_ids)
+    event_by_id = {
+        str(row[EVENT_ID]): row
+        for row in index.events
+        if len(row) > EVENT_ID and row[EVENT_ID]
+    }
     recent = list(index.carry_ids)
     offset = index.offset
     for position, raw in read_lines_from(path, index.offset, cancellation):
@@ -1771,6 +1972,16 @@ def parse_claude_file(
                 continue
             epoch = parse_timestamp(record.get("timestamp"))
             sidechain = bool(record.get("isSidechain")) or is_subagent_file
+            thread_id, classification = claude_file_thread(path, session_id, sidechain)
+            if thread_id:
+                index.thread_metadata.setdefault(thread_id, {
+                    "thread_id": thread_id,
+                    "session_id": session_id,
+                    "parent_thread_id": None,
+                    "parent_call_id": None,
+                    "depth": None,
+                    "classification": classification,
+                })
             for block in content:
                 if not isinstance(block, dict) or block.get("type") != "tool_result":
                     continue
@@ -1782,6 +1993,7 @@ def parse_claude_file(
                     call_id if isinstance(call_id, str) else "",
                     content_chars(block.get("content")),
                     sidechain,
+                    thread_id,
                 )
             continue
         if kind != "assistant":
@@ -1790,21 +2002,38 @@ def parse_claude_file(
         if not isinstance(message, dict):
             continue
         content = message.get("content")
+        sidechain = bool(record.get("isSidechain")) or is_subagent_file
+        thread_id, classification = claude_file_thread(path, session_id, sidechain)
+        actions = claude_tool_use_actions(content)
         if isinstance(content, list):
-            issued_sidechain = bool(record.get("isSidechain")) or is_subagent_file
-            for block in content:
-                if not isinstance(block, dict) or block.get("type") != "tool_use":
-                    continue
-                block_id = block.get("id")
-                block_name = block.get("name")
-                if isinstance(block_id, str) and isinstance(block_name, str):
-                    remember_tool(index, block_id, block_name, issued_sidechain)
+            for action in actions:
+                call_id = action.get("call_id")
+                name = action.get("name")
+                if call_id and name:
+                    remember_tool(index, str(call_id), str(name), sidechain, thread_id)
         usage = message.get("usage")
         if not isinstance(usage, dict):
             continue
         message_id = message.get("id") or record.get("requestId")
         if isinstance(message_id, str) and message_id:
             if message_id in seen_ids:
+                existing = event_by_id.get(message_id)
+                if existing is not None:
+                    existing[EVENT_ACTIONS] = merge_claude_actions(
+                        existing[EVENT_ACTIONS] if len(existing) > EVENT_ACTIONS else None,
+                        actions,
+                    )
+                    detail = usage.get("output_tokens_details")
+                    thinking = detail.get("thinking_tokens") if isinstance(detail, Mapping) else None
+                    if (
+                        len(existing) <= EVENT_REASONING_KNOWN
+                        or not existing[EVENT_REASONING_KNOWN]
+                    ) and isinstance(thinking, (int, float)) and not isinstance(thinking, bool):
+                        if len(existing) <= EVENT_REASONING_KNOWN:
+                            existing.extend([None] * (EVENT_REASONING_KNOWN + 1 - len(existing)))
+                        output_tokens = int(usage.get("output_tokens") or 0)
+                        existing[EVENT_REASONING] = min(max(0, int(thinking)), max(0, output_tokens))
+                        existing[EVENT_REASONING_KNOWN] = True
                 continue
             seen_ids.add(message_id)
             recent.append(message_id)
@@ -1818,43 +2047,59 @@ def parse_claude_file(
             summary.version = version
         summary.touch(epoch)
 
-        creation = usage.get("cache_creation")
-        write_5m = 0
-        write_1h = 0
-        if isinstance(creation, dict):
-            write_5m = int(creation.get("ephemeral_5m_input_tokens") or 0)
-            write_1h = int(creation.get("ephemeral_1h_input_tokens") or 0)
-        total_write = int(usage.get("cache_creation_input_tokens") or 0)
-        if write_5m + write_1h == 0:
-            write_5m = total_write
+        write_5m, write_1h, write_unknown = claude_cache_write_tokens(usage)
         tokens = {
             "input": int(usage.get("input_tokens") or 0),
             "cache_read": int(usage.get("cache_read_input_tokens") or 0),
             "cache_write_5m": write_5m,
             "cache_write_1h": write_1h,
             "output": int(usage.get("output_tokens") or 0),
+            "cache_write_unknown": write_unknown,
         }
-        sidechain = bool(record.get("isSidechain")) or is_subagent_file
-        context_size = tokens["input"] + tokens["cache_read"] + write_5m + write_1h
+        context_size = (
+            tokens["input"] + tokens["cache_read"] + write_5m + write_1h + write_unknown
+        )
         long_context = context_size > LONG_CONTEXT_THRESHOLD
         if epoch is not None:
-            index.events.append(
-                [
-                    session_id,
-                    model,
-                    epoch,
-                    tokens["input"],
-                    tokens["cache_read"],
-                    write_5m,
-                    write_1h,
-                    tokens["output"],
-                    1 if long_context else 0,
-                    1 if sidechain else 0,
-                    "",
-                    "",
-                    message_id if isinstance(message_id, str) else "",
-                ]
+            detail = usage.get("output_tokens_details")
+            thinking = detail.get("thinking_tokens") if isinstance(detail, Mapping) else None
+            reasoning_known = isinstance(thinking, (int, float)) and not isinstance(thinking, bool)
+            reasoning = (
+                min(max(0, int(thinking)), max(0, tokens["output"]))
+                if reasoning_known else 0
             )
+            event = [
+                session_id, model, epoch,
+                tokens["input"], tokens["cache_read"], write_5m, write_1h,
+                tokens["output"], write_unknown,
+                1 if long_context else 0, 1 if sidechain else 0,
+                "", thread_id, message_id if isinstance(message_id, str) else "",
+                None, reasoning, actions,
+                bool(len(actions) == 1 and actions[0].get("name") == "TaskOutput"
+                     and actions[0].get("blocking") is True),
+                bool(reasoning_known),
+            ]
+            index.events.append(event)
+            if isinstance(message_id, str) and message_id:
+                event_by_id[message_id] = event
+            info = {
+                "thread_id": thread_id,
+                "session_id": session_id,
+                "parent_thread_id": None,
+                "parent_call_id": None,
+                "depth": None,
+                "classification": classification,
+            }
+            if agent_id:
+                info["parent_call_id"] = index.claude_agent_metadata.get("tool_use_id")
+                info["depth"] = index.claude_agent_metadata.get("depth")
+                info["agent_type"] = index.claude_agent_metadata.get("agent_type")
+                info["model"] = index.claude_agent_metadata.get("model") or model
+                if info["parent_call_id"]:
+                    info["classification"] = "lineage_pending"
+                else:
+                    info["classification"] = "unknown"
+            index.thread_metadata[thread_id] = info
     index.offset = offset
     index.carry_ids = recent[-DEDUP_CARRY_IDS:]
     return index
@@ -2497,10 +2742,17 @@ class Cache:
         self.entries[key] = entry
         return entry
 
-    def entry_for(self, path: Path, harness: str, stat: os.stat_result) -> Tuple[FileIndex, bool]:
+    def entry_for(
+        self, path: Path, harness: str, stat: os.stat_result,
+        sidecar_signature: str = "",
+    ) -> Tuple[FileIndex, bool]:
         key = str(path)
         entry = self.stored(key, harness)
         if entry is None:
+            entry = FileIndex(harness)
+            self.entries[key] = entry
+            return entry, True
+        if harness == "claude" and entry.claude_sidecar_signature != sidecar_signature:
             entry = FileIndex(harness)
             self.entries[key] = entry
             return entry, True
@@ -2785,7 +3037,7 @@ def collect(
     run.files_seen = len(targets)
     run.emit("discovery", message="found %d transcript files" % len(targets))
 
-    stamped = []  # type: List[Tuple[float, str, Path, str, Path, os.stat_result]]
+    stamped = []  # type: List[Tuple[float, str, Path, str, Path, os.stat_result, str, Dict[str, Any]]]
     live = set()
     for path, kind, root in targets:
         run.check()
@@ -2794,11 +3046,15 @@ def collect(
         except OSError:
             continue
         live.add(str(path))
+        sidecar_signature, sidecar_metadata = (
+            claude_sidecar(path) if kind == "claude" else ("", {})
+        )
         if since is not None and stat.st_mtime < since:
             # A transcript last written before the window cannot hold events
             # inside it, so its shard is never opened.
             continue
-        stamped.append((stat.st_mtime, str(path), path, kind, root, stat))
+        stamped.append((stat.st_mtime, str(path), path, kind, root, stat,
+                        sidecar_signature, sidecar_metadata))
     # Oldest file first, so the session that recorded an API call originally
     # keeps it and a later fork that replays it is the one that loses.
     stamped.sort(key=lambda item: (item[0], item[1]))
@@ -2813,16 +3069,18 @@ def collect(
     # One (label, key) lookup per root, however many files it holds - a
     # session's account never opens a second `auth.json`/`.claude.json` read.
     account_cache = {}  # type: Dict[Tuple[str, Path], Tuple[str, str]]
-    for _, _, path, kind, root, stat in stamped:
+    for _, _, path, kind, root, stat, sidecar_signature, sidecar_metadata in stamped:
         run.check()
         progress.step()
         run.emit("scanning", current_file=path.name, message="waiting for cache")
         with serialized_cache(cache.root, run.cancellation):
-            entry, stale = cache.entry_for(path, kind, stat)
+            entry, stale = cache.entry_for(path, kind, stat, sidecar_signature)
             if stale:
                 previous_size = entry.size
                 try:
                     if kind == "claude":
+                        entry.claude_sidecar_signature = sidecar_signature
+                        entry.claude_agent_metadata = sidecar_metadata
                         parse_claude_file(path, entry, run.cancellation)
                     else:
                         parse_codex_file(path, entry, run.cancellation)
@@ -2854,8 +3112,36 @@ def collect(
         # `live` holds only what this run looked at, so a harness-scoped or
         # range-limited sweep would delete every shard it never visited.
         cache.prune(live, run.cancellation)
+    resolve_claude_thread_metadata(scan)
     run.emit("scanning", message="scanned %d files" % len(stamped))
     return scan
+
+
+def resolve_claude_thread_metadata(scan: Scan) -> None:
+    """Join Claude agent sidecars to the exact parent Agent/Task call ID."""
+    call_threads = {}  # type: Dict[Tuple[str, str], str]
+    for row in scan.events.get("claude", []):
+        if len(row) <= EVENT_ACTIONS or not isinstance(row[EVENT_ACTIONS], list):
+            continue
+        session_id = str(row[EVENT_SESSION])
+        thread_id = str(row[EVENT_THREAD] or "")
+        for action in row[EVENT_ACTIONS]:
+            if not isinstance(action, Mapping):
+                continue
+            name = str(action.get("name") or "")
+            call_id = str(action.get("call_id") or "")
+            if call_id and is_spawn_tool(name):
+                call_threads[(session_id, call_id)] = thread_id
+    for (harness, session_id, thread_id), info in scan.thread_metadata.items():
+        if harness != "claude" or not info.get("parent_call_id"):
+            continue
+        parent = call_threads.get((session_id, str(info["parent_call_id"])))
+        if parent:
+            info["parent_thread_id"] = parent
+            info["classification"] = "descendant"
+        else:
+            info["parent_thread_id"] = None
+            info["classification"] = "unknown"
 
 
 def absorb(
@@ -3786,13 +4072,17 @@ def attribute_tools(
         streams = {}  # type: Dict[Tuple[str, int], List[List[Any]]]
         for row in tools:
             stream_id = (
-                str(row[TOOL_THREAD]) if harness == "codex" and len(row) > TOOL_THREAD
+                str(row[TOOL_THREAD]) if len(row) > TOOL_THREAD and row[TOOL_THREAD]
                 else str(int(row[TOOL_SUB]))
             )
             streams.setdefault((row[TOOL_SESSION], stream_id), []).append(row)
         events = {}  # type: Dict[Tuple[str, int], List[List[Any]]]
         for row in scan.events.get(harness, []):
-            stream_id = str(row[EVENT_THREAD]) if harness == "codex" else str(int(row[EVENT_SUB]))
+            stream_id = (
+                str(row[EVENT_THREAD])
+                if len(row) > EVENT_THREAD and row[EVENT_THREAD]
+                else str(int(row[EVENT_SUB]))
+            )
             events.setdefault((row[EVENT_SESSION], stream_id), []).append(row)
         for key, rows in events.items():
             check_cancelled(cancellation)
@@ -3816,7 +4106,7 @@ def attribute_tools(
                 attribute_tool_stream(
                     harness, key[0], rows, events.get(key, []),
                     analysis.scan.tool_provenance,
-                    key[1] if harness == "codex" else "",
+                    key[1],
                 )
             )
     calls.sort(key=lambda call: call.ts)
@@ -4013,6 +4303,7 @@ def _drill_thread_classification(
     thread_id: str,
     memo: Dict[str, str],
     visiting: Optional[set] = None,
+    harness: str = "codex",
 ) -> str:
     if thread_id == session_id:
         return "root"
@@ -4023,7 +4314,7 @@ def _drill_thread_classification(
         memo[thread_id] = "unknown"
         return "unknown"
     visiting.add(thread_id)
-    info = metadata.get(("codex", session_id, thread_id))
+    info = metadata.get((harness, session_id, thread_id))
     if not info:
         classification = "unknown"
     else:
@@ -4032,7 +4323,7 @@ def _drill_thread_classification(
             classification = "root" if info.get("classification") == "root" else "unknown"
         else:
             parent_classification = _drill_thread_classification(
-                metadata, session_id, parent, memo, visiting
+                metadata, session_id, parent, memo, visiting, harness
             )
             classification = (
                 "descendant"
@@ -4166,7 +4457,371 @@ def drilldown_for_prompt(analysis: "Analysis", prompt: Prompt) -> Dict[str, Any]
             "attribution": "explicit_lineage_with_temporal_prompt_membership"}
 
 
+def _claude_drill_bucket(
+    thread_id: str, classification: str,
+    metadata: Optional[Mapping[str, Any]] = None,
+) -> Dict[str, Any]:
+    metadata = metadata or {}
+    return {
+        "thread_id": thread_id or None,
+        "parent_thread_id": metadata.get("parent_thread_id"),
+        "parent_tool_use_id": metadata.get("parent_call_id"),
+        "depth": metadata.get("depth"),
+        "agent_type": metadata.get("agent_type"),
+        "model": metadata.get("model"),
+        "classification": classification,
+        "api_calls": 0,
+        "tokens": empty_tokens(CLAUDE_KINDS),
+        "uncached_input_tokens": 0,
+        "cached_input_tokens": 0,
+        "input_context_tokens": 0,
+        "cache_write_input_tokens": 0,
+        "cache_write_5m_input_tokens": 0,
+        "cache_write_1h_input_tokens": 0,
+        "cache_write_unknown_input_tokens": 0,
+        "output_tokens": 0,
+        "reasoning_output_tokens": 0,
+        "reasoning_unknown_calls": 0,
+        "fallback_priced_cache_write_tokens": 0,
+        "weighted_units": 0.0,
+        "action_counts": {},
+        "tool_uses": {
+            "calls": 0,
+            "known_input_bytes": 0,
+            "unknown_input_sizes": 0,
+            "families": [],
+        },
+        "tool_family_rankings": [],
+        "wait_evidence": {
+            "task_output_calls": 0,
+            "blocking_task_output_calls": 0,
+            "unclassified_task_output_calls": 0,
+        },
+        "wait_streaks": [],
+    }
+
+
+def _claude_drill_wait_streaks(events: Sequence[Sequence[Any]]) -> List[Dict[str, Any]]:
+    streaks = []
+    current = []
+
+    def flush() -> None:
+        if not current:
+            return
+        first = event_context(current[0], "claude")
+        last = event_context(current[-1], "claude")
+        delta = last - first
+        streaks.append({
+            "kind": "TaskOutput(block=true)",
+            "length": len(current),
+            "first_context": first,
+            "last_context": last,
+            "context_delta": delta,
+            "mean_context_delta_per_transition": (
+                delta / (len(current) - 1) if len(current) > 1 else None
+            ),
+            "uncached_input_tokens": sum(int(row[3]) for row in current),
+            "cached_replay_tokens": sum(int(row[4]) for row in current),
+            "cache_write_tokens": sum(int(row[5]) + int(row[6]) + int(row[8]) for row in current),
+            "start": current[0][EVENT_TS],
+            "end": current[-1][EVENT_TS],
+        })
+        current.clear()
+
+    for row in sorted(events, key=lambda item: item[EVENT_TS]):
+        if len(row) > EVENT_WAIT and row[EVENT_WAIT] is True:
+            current.append(row)
+        else:
+            flush()
+    flush()
+    return streaks
+
+
+def _claude_drill_add_events(
+    bucket: Dict[str, Any], events: Sequence[Sequence[Any]],
+    weights: Weights, args: argparse.Namespace,
+    children_by_call: Mapping[Tuple[str, str], str],
+) -> None:
+    families = {}
+    for row in events:
+        tokens = event_tokens(row, CLAUDE_KINDS)
+        bucket["api_calls"] += 1
+        for kind, amount in tokens.items():
+            bucket["tokens"][kind] += amount
+        bucket["uncached_input_tokens"] += tokens["input"]
+        bucket["cached_input_tokens"] += tokens["cache_read"]
+        write_total = (
+            tokens["cache_write_5m"] + tokens["cache_write_1h"]
+            + tokens["cache_write_unknown"]
+        )
+        context = tokens["input"] + tokens["cache_read"] + write_total
+        bucket["input_context_tokens"] += context
+        bucket["cache_write_input_tokens"] += write_total
+        bucket["cache_write_5m_input_tokens"] += tokens["cache_write_5m"]
+        bucket["cache_write_1h_input_tokens"] += tokens["cache_write_1h"]
+        bucket["cache_write_unknown_input_tokens"] += tokens["cache_write_unknown"]
+        bucket["output_tokens"] += tokens["output"]
+        bucket["fallback_priced_cache_write_tokens"] += tokens["cache_write_unknown"]
+        known_reasoning = (
+            len(row) > EVENT_REASONING_KNOWN and row[EVENT_REASONING_KNOWN] is True
+        )
+        if known_reasoning:
+            bucket["reasoning_output_tokens"] += int(row[EVENT_REASONING])
+        else:
+            bucket["reasoning_unknown_calls"] += 1
+        unit = weights.claude_units(
+            row[EVENT_MODEL], tokens, args.claude_cache_read_weight
+        )
+        if row[EVENT_LONG]:
+            unit *= args.long_context_multiplier
+        bucket["weighted_units"] += unit
+
+        actions = row[EVENT_ACTIONS] if len(row) > EVENT_ACTIONS else None
+        if not isinstance(actions, list):
+            continue
+        for action in actions:
+            if not isinstance(action, Mapping):
+                continue
+            name = str(action.get("name") or "unknown")
+            counts = bucket["action_counts"]
+            counts[name] = counts.get(name, 0) + 1
+            item = families.setdefault(name, {
+                "tool": name, "calls": 0, "known_input_bytes": 0,
+                "unknown_input_sizes": 0, "targets": [],
+                "unknown_targets": 0,
+            })
+            item["calls"] += 1
+            payload_size = action.get("input_bytes")
+            if isinstance(payload_size, int):
+                item["known_input_bytes"] += payload_size
+                bucket["tool_uses"]["known_input_bytes"] += payload_size
+            else:
+                item["unknown_input_sizes"] += 1
+                bucket["tool_uses"]["unknown_input_sizes"] += 1
+            bucket["tool_uses"]["calls"] += 1
+            if name.lower() in SPAWN_TOOL_NAMES:
+                call_id = str(action.get("call_id") or "")
+                target = children_by_call.get((str(row[EVENT_SESSION]), call_id))
+                if target:
+                    if target not in item["targets"]:
+                        item["targets"].append(target)
+                else:
+                    item["unknown_targets"] += 1
+            if name == "TaskOutput":
+                evidence = bucket["wait_evidence"]
+                evidence["task_output_calls"] += 1
+                if action.get("blocking") is True:
+                    evidence["blocking_task_output_calls"] += 1
+                elif action.get("blocking") is not False:
+                    evidence["unclassified_task_output_calls"] += 1
+    bucket["tool_uses"]["families"] = sorted(
+        families.values(),
+        key=lambda item: (item["calls"], item["known_input_bytes"]),
+        reverse=True,
+    )
+    bucket["wait_streaks"] = _claude_drill_wait_streaks(events)
+
+
+def drilldown_for_claude_prompt(
+    analysis: "Analysis", prompt: Prompt
+) -> Dict[str, Any]:
+    scan = analysis.scan
+    events = [
+        row for row in scan.events.get("claude", [])
+        if row[EVENT_SESSION] == prompt.session_id
+        and len(row) > EVENT_PROMPT and row[EVENT_PROMPT] == prompt.index
+    ]
+    metadata = scan.thread_metadata
+    classifications = {}
+
+    def classify(thread: str) -> str:
+        return _drill_thread_classification(
+            metadata, prompt.session_id, thread, classifications, harness="claude"
+        )
+
+    def ensure_bucket(thread: str) -> Dict[str, Any]:
+        classification = classify(thread)
+        key = (classification, thread)
+        if key not in partitions:
+            info = metadata.get(("claude", prompt.session_id, thread))
+            if info is None and thread == prompt.session_id:
+                info = {"thread_id": thread, "depth": 0, "classification": "root"}
+            partitions[key] = _claude_drill_bucket(thread, classification, info)
+        return partitions[key]
+
+    partitions = {}
+    for row in events:
+        ensure_bucket(str(row[EVENT_THREAD] or ""))
+    calls = [
+        call for call in analysis.tool_calls
+        if call.harness == "claude" and call.session_id == prompt.session_id
+        and call.prompt == prompt.index
+    ]
+    for call in calls:
+        ensure_bucket(call.thread_id)
+
+    children_by_call = {}
+    for (harness, session_id, thread_id), info in metadata.items():
+        if harness != "claude" or session_id != prompt.session_id:
+            continue
+        call_id = info.get("parent_call_id")
+        if call_id and info.get("parent_thread_id"):
+            children_by_call[(session_id, str(call_id))] = thread_id
+
+    for (classification, thread), bucket in partitions.items():
+        thread_events = [row for row in events if str(row[EVENT_THREAD] or "") == thread]
+        thread_calls = [call for call in calls if call.thread_id == thread]
+        _claude_drill_add_events(
+            bucket, thread_events, analysis.weights, analysis.args, children_by_call
+        )
+        _drill_add_tools(bucket, thread_calls)
+
+    root = next(
+        (bucket for (kind, _), bucket in partitions.items() if kind == "root"),
+        _claude_drill_bucket(prompt.session_id, "root", {"depth": 0}),
+    )
+    descendants = [
+        bucket for (kind, _), bucket in sorted(partitions.items()) if kind == "descendant"
+    ]
+    unknown_threads = [
+        bucket for (kind, _), bucket in sorted(partitions.items()) if kind == "unknown"
+    ]
+    unknown = _claude_drill_bucket("", "unknown")
+    unknown_events = [row for row in events if classify(str(row[EVENT_THREAD] or "")) == "unknown"]
+    unknown_calls = [call for call in calls if classify(call.thread_id) == "unknown"]
+    _claude_drill_add_events(
+        unknown, unknown_events, analysis.weights, analysis.args, children_by_call
+    )
+    _drill_add_tools(unknown, unknown_calls)
+
+    combined = _claude_drill_bucket("combined", "combined")
+    _claude_drill_add_events(
+        combined, events, analysis.weights, analysis.args, children_by_call
+    )
+    _drill_add_tools(combined, calls)
+    prompt_tokens = dict(prompt.tokens)
+    combined_tokens = dict(combined["tokens"])
+    reconciliation = {
+        "matches_prompt": combined["api_calls"] == prompt.turns
+        and all(combined_tokens.get(kind, 0) == prompt_tokens.get(kind, 0)
+                for kind in CLAUDE_KINDS)
+        and abs(combined["weighted_units"] - prompt.units) < 1e-9,
+        "prompt_api_calls": prompt.turns,
+        "prompt_tokens": prompt_tokens,
+        "combined_tokens": combined_tokens,
+    }
+    ranking_sources = [root] + descendants
+    ranking_sources = [bucket for bucket in ranking_sources if bucket["api_calls"] or bucket["thread_id"]]
+    ranking_sources.sort(
+        key=lambda bucket: (bucket["weighted_units"], bucket["uncached_input_tokens"]),
+        reverse=True,
+    )
+    agent_rankings = [
+        {
+            "rank": rank,
+            "classification": bucket["classification"],
+            "thread_id": bucket["thread_id"],
+            "parent_thread_id": bucket["parent_thread_id"],
+            "agent_type": bucket["agent_type"],
+            "model": bucket["model"],
+            "weighted_units": bucket["weighted_units"],
+            "input_context_tokens": bucket["input_context_tokens"],
+            "api_calls": bucket["api_calls"],
+        }
+        for rank, bucket in enumerate(ranking_sources, 1)
+    ]
+    caveats = [
+        "agent lineage uses exact sidecar toolUseId matches; missing or unmatched lineage remains unknown",
+        "agent membership is temporal to this prompt; exact lineage does not establish prompt ownership for background calls",
+        "tool result context growth is an upper bound and size-based token counts are estimates",
+        "wait streaks include only explicit TaskOutput calls with block=true",
+    ]
+    if combined["cache_write_unknown_input_tokens"]:
+        caveats.append(
+            "cache creation without a complete TTL breakdown uses the historical 5-minute price as an estimate"
+        )
+    return {
+        "root": root,
+        "descendants": descendants,
+        "unknown": unknown,
+        "unknown_threads": unknown_threads,
+        "combined": combined,
+        "reconciliation": reconciliation,
+        "agent_rankings": agent_rankings,
+        "caveats": caveats,
+        "attribution": "explicit_toolUseId_lineage_with_temporal_prompt_membership",
+        "wait_semantics": "TaskOutput block=true only; missing block evidence is unclassified",
+    }
+
+
+def render_claude_drilldown(drilldown: Mapping[str, Any]) -> None:
+    print("prompt drilldown: exact sidecar toolUseId lineage with temporal prompt membership")
+    entries = [("root", drilldown["root"])]
+    entries += [("descendant", item) for item in drilldown["descendants"]]
+    entries += [("unknown thread", item) for item in drilldown.get("unknown_threads", [])]
+    entries.append(("unknown aggregate", drilldown["unknown"]))
+    for label, bucket in entries:
+        tokens = bucket["tokens"]
+        print("%s %s parent=%s depth=%s agent_type=%s model=%s" % (
+            label, bucket["thread_id"] or "-", bucket["parent_thread_id"] or "-",
+            bucket["depth"] if bucket["depth"] is not None else "unknown",
+            bucket["agent_type"] or "-", bucket["model"] or "-",
+        ))
+        print("  totals: calls=%d input=%d cache_read=%d write_5m=%d write_1h=%d write_unknown=%d output=%d thinking=%d thinking_unknown_calls=%d units=%.4f" % (
+            bucket["api_calls"], tokens["input"], tokens["cache_read"],
+            tokens["cache_write_5m"], tokens["cache_write_1h"],
+            tokens["cache_write_unknown"], tokens["output"],
+            bucket["reasoning_output_tokens"], bucket["reasoning_unknown_calls"],
+            bucket["weighted_units"],
+        ))
+        print("  actions: %s" % (
+            ", ".join("%s=%d" % item for item in sorted(bucket["action_counts"].items()))
+            or "none"
+        ))
+        uses = bucket["tool_uses"]
+        families = ", ".join(
+            "%s calls=%d input_bytes=%d unknown_input=%d targets=%s unknown_targets=%d" % (
+                item["tool"], item["calls"], item["known_input_bytes"],
+                item["unknown_input_sizes"], "/".join(item["targets"]) or "-",
+                item["unknown_targets"],
+            ) for item in uses["families"]
+        ) or "none"
+        print("  tool uses: calls=%d known_input_bytes=%d unknown_input_sizes=%d families=%s" % (
+            uses["calls"], uses["known_input_bytes"], uses["unknown_input_sizes"], families,
+        ))
+        print("  tool results: %s" % (
+            ", ".join("%s calls=%d measured=%.1f chars=%d" % (
+                item["tool"], item["calls"], item["measured_tokens"], item["result_chars"]
+            ) for item in bucket["tool_family_rankings"]) or "none"
+        ))
+        evidence = bucket["wait_evidence"]
+        print("  wait evidence: TaskOutput calls=%d blocking=%d unclassified=%d" % (
+            evidence["task_output_calls"], evidence["blocking_task_output_calls"],
+            evidence["unclassified_task_output_calls"],
+        ))
+        for streak in bucket["wait_streaks"]:
+            print("  wait streak: kind=%s length=%d first_context=%d last_context=%d context_delta=%d start=%s end=%s" % (
+                streak["kind"], streak["length"], streak["first_context"],
+                streak["last_context"], streak["context_delta"],
+                streak["start"], streak["end"],
+            ))
+    combined = drilldown["combined"]
+    tokens = combined["tokens"]
+    print("combined totals: calls=%d input=%d cache_read=%d write_5m=%d write_1h=%d write_unknown=%d output=%d thinking=%d units=%.4f" % (
+        combined["api_calls"], tokens["input"], tokens["cache_read"],
+        tokens["cache_write_5m"], tokens["cache_write_1h"],
+        tokens["cache_write_unknown"], tokens["output"],
+        combined["reasoning_output_tokens"], combined["weighted_units"],
+    ))
+    reconciliation = drilldown["reconciliation"]
+    print("reconciliation: %s" % ("ok" if reconciliation["matches_prompt"] else "mismatch"))
+    print("caveats: " + "; ".join(drilldown["caveats"]))
+
+
 def render_drilldown(drilldown: Mapping[str, Any]) -> None:
+    if str(drilldown.get("attribution", "")).startswith("explicit_toolUseId_"):
+        render_claude_drilldown(drilldown)
+        return
     print("prompt drilldown: explicit lineage with temporal prompt membership")
     print("agent rankings: weighted units (then uncached input)")
     rankings = drilldown.get("agent_rankings") or []
@@ -4329,7 +4984,7 @@ def build_prompt(
             vectors[model] = pair
         unit_vector, input_vector = pair
         if is_claude:
-            context = int(row[3]) + int(row[4]) + int(row[5]) + int(row[6])
+            context = int(row[3]) + int(row[4]) + int(row[5]) + int(row[6]) + int(row[8])
         else:
             context = int(row[3]) + int(row[4])
         resent = 0.0 if input_vector is None else vector_units(input_vector, row)
@@ -5163,6 +5818,14 @@ def header_lines(
                 "caveat: Claude cache reads forced to %.3fx input price"
                 % args.claude_cache_read_weight
             )
+        if any(
+            row.summary.harness == "claude"
+            and row.tokens.get("cache_write_unknown", 0) > 0
+            for row in rows
+        ):
+            lines.append(
+                "caveat: Claude cache writes without a full TTL split use the 5-minute rate as an estimate"
+            )
         if dollars_per_percent:
             lines.append(
                 "caveat: Claude percent is est, from %.4f $/%% of logged snapshots"
@@ -5264,7 +5927,11 @@ def render_sessions(rows: Sequence[Row], args: argparse.Namespace, paint: Painte
         harness_glyph = "C" if summary.harness == "claude" else "X"
         if summary.harness == "claude":
             cached = row.tokens.get("cache_read", 0)
-            write = row.tokens.get("cache_write_5m", 0) + row.tokens.get("cache_write_1h", 0)
+            write = (
+                row.tokens.get("cache_write_5m", 0)
+                + row.tokens.get("cache_write_1h", 0)
+                + row.tokens.get("cache_write_unknown", 0)
+            )
         else:
             cached = row.tokens.get("cached_input", 0)
             write = row.tokens.get("cache_write", 0)
@@ -6681,10 +7348,14 @@ def command_prompts(args: argparse.Namespace) -> int:
         shown = [prompts[prompt_index - 1]]
     drilldown = None
     if getattr(args, "drilldown", False):
-        if harness != "codex":
-            warn("--drilldown is supported only for Codex sessions")
+        selected_prompt = prompts[prompt_index - 1]
+        if harness == "codex":
+            drilldown = drilldown_for_prompt(analysis, selected_prompt)
+        elif harness == "claude":
+            drilldown = drilldown_for_claude_prompt(analysis, selected_prompt)
+        else:
+            warn("--drilldown requires a Claude or Codex session")
             return 2
-        drilldown = drilldown_for_prompt(analysis, prompts[prompt_index - 1])
     hints = prompts_session_hints(
         args, session_id, shown, analysis_session_ids(analysis))
     if args.json:
@@ -8035,7 +8706,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     prompts.add_argument(
         "--drilldown", action="store_true",
-        help="show Codex root, descendant, tool, message, and wait details for --prompt",
+        help="show thread lineage, tool, and wait details for the selected --prompt",
     )
     prompts.add_argument(
         "--first", action="store_true",
