@@ -1078,7 +1078,7 @@ class ResultParsing(Harness):
         self.assertEqual(sorted(call.models), ["claude-haiku-4-5"])
         self.assertEqual(call.tokens["input"], 10)
         self.assertEqual(call.tokens["cache_read"], 20)
-        self.assertEqual(call.tokens["cache_write_5m"], 30)
+        self.assertEqual(call.tokens["cache_write_unknown"], 30)
         self.assertEqual(call.tokens["output"], 40)
         self.assertEqual(call.cost, 0.5)
 

@@ -41,6 +41,7 @@ uv tool install 'nenpi[ui] @ git+https://github.com/epsalmond/nenpi'
 nenpi sessions --harness all --since 7d --top 25
 nenpi prompts --since 7d --sort turns --top 20
 nenpi prompts --session 0123abcd
+nenpi prompts --harness claude --session 0123abcd --prompt 1 --drilldown
 nenpi tools --since 7d --top 15
 ```
 
@@ -52,6 +53,12 @@ become a label — a turn that is only an injected block is named, not quoted.
 That short **label** is the only prompt text nenpi stores or prints;
 `--no-label` hides it. With `--session` it is the per-prompt breakdown of one
 session, unchanged.
+
+Add `--prompt N --drilldown` to inspect one prompt's root, child-agent, and
+unknown-thread totals for either harness. Claude child lineage uses exact
+`toolUseId` matches from agent sidecars; missing or unmatched lineage stays
+unknown. The report includes disjoint cache-read and cache-write token counts,
+tool-use sizes and result sizes, and only explicit Claude `TaskOutput` waits.
 
 `nenpi tools` ranks tool calls by the context their results add, estimated as
 result characters / 4 and, where a later API call measured the growth, split
