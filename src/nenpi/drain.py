@@ -78,7 +78,7 @@ except ImportError:  # bench can load drain.py as a standalone quota module.
         serialized_cache,
     )
 
-CACHE_SCHEMA = 7
+CACHE_SCHEMA = 8
 JSON_SCHEMA = 1
 LONG_CONTEXT_THRESHOLD = 200_000
 CONTEXT_REDUCTION_FRACTION = 0.30
@@ -1016,6 +1016,10 @@ class FileIndex:
         self.pending_label_rank = LABEL_RANK_NONE
         self.thread_id = ""
         self.is_subagent = False
+        self.thread_metadata = {}  # type: Dict[str, Dict[str, Any]]
+        self.message_rows = []  # type: List[List[Any]]
+        self.pending_actions = []  # type: List[str]
+        self.pending_response_seen = False
         self.head_hash = ""
         self.tail_hash = ""
 
@@ -1060,6 +1064,10 @@ class FileIndex:
             "pending_label_rank": self.pending_label_rank,
             "thread_id": self.thread_id,
             "is_subagent": self.is_subagent,
+            "thread_metadata": self.thread_metadata,
+            "message_rows": self.message_rows,
+            "pending_actions": self.pending_actions,
+            "pending_response_seen": self.pending_response_seen,
             "head_hash": self.head_hash,
             "tail_hash": self.tail_hash,
         }
@@ -1088,6 +1096,10 @@ class FileIndex:
         index.pending_label_rank = int(payload.get("pending_label_rank") or 0)
         index.thread_id = str(payload.get("thread_id", ""))
         index.is_subagent = bool(payload.get("is_subagent"))
+        index.thread_metadata = dict(payload.get("thread_metadata") or {})
+        index.message_rows = list(payload.get("message_rows") or [])
+        index.pending_actions = [str(item) for item in payload.get("pending_actions") or []]
+        index.pending_response_seen = bool(payload.get("pending_response_seen"))
         index.head_hash = str(payload.get("head_hash", ""))
         index.tail_hash = str(payload.get("tail_hash", ""))
         return index
@@ -1142,6 +1154,9 @@ EVENT_TURN = 10
 EVENT_THREAD = 11
 EVENT_ID = 12
 EVENT_PROMPT = 13
+EVENT_REASONING = 14
+EVENT_ACTIONS = 15
+EVENT_WAIT = 16
 
 # Absolute token-area indices for the kinds each harness actually prices, in
 # the order its `*_units` method sums them. `Weights.event_vector` pairs these
@@ -1172,7 +1187,7 @@ def vector_units(vector: Sequence[Tuple[int, float]], event: Sequence[Any]) -> f
 # parser, and the id is the harness' own opaque call id, used to count a
 # replayed call once.
 TOOL_SESSION, TOOL_TS, TOOL_NAME = 0, 1, 2
-TOOL_CHARS, TOOL_SUB, TOOL_SPAWN, TOOL_ID = 3, 4, 5, 6
+TOOL_CHARS, TOOL_SUB, TOOL_SPAWN, TOOL_ID, TOOL_THREAD = 3, 4, 5, 6, 7
 
 # Command text is deliberately not part of a cached tool row.  `tools
 # --explain` rereads the source transcript and uses this transient provenance
@@ -1651,6 +1666,7 @@ def record_tool(
             1 if (sidechain or was_sub) else 0,
             spawn,
             call_id,
+            index.thread_id,
         ]
     )
 
@@ -1866,6 +1882,10 @@ def codex_usage_tokens(usage: Mapping[str, Any]) -> Dict[str, int]:
         "cached_input": cached,
         "cache_write": int(usage.get("cache_write_input_tokens") or 0),
         "output": int(usage.get("output_tokens") or 0),
+        "reasoning_output": min(
+            int(usage.get("reasoning_output_tokens") or 0),
+            int(usage.get("output_tokens") or 0),
+        ),
     }
 
 
@@ -1930,6 +1950,30 @@ def parse_codex_file(
             if not session_id:
                 session_id = path.stem
             index.is_subagent = is_codex_subagent(payload)
+            parent = payload.get("parent_thread_id")
+            source = payload.get("source")
+            if isinstance(source, Mapping):
+                spawn = source.get("subagent")
+                if isinstance(spawn, Mapping):
+                    parent = spawn.get("thread_spawn", {}).get("parent_thread_id", parent)
+                    depth = spawn.get("thread_spawn", {}).get("depth")
+                else:
+                    depth = None
+            else:
+                depth = None
+            if not isinstance(depth, int):
+                depth = 1 if parent else 0
+            classification = "descendant" if isinstance(parent, str) and parent else (
+                "unknown" if index.is_subagent else "root"
+            )
+            if isinstance(thread, str) and thread:
+                index.thread_metadata[thread] = {
+                    "thread_id": thread,
+                    "session_id": session_id,
+                    "parent_thread_id": parent if isinstance(parent, str) else None,
+                    "depth": depth,
+                    "classification": classification,
+                }
             summary = index.sessions.setdefault(session_id, SessionSummary("codex", session_id))
             summary.set_cwd(payload.get("cwd"))
             originator = payload.get("originator")
@@ -1947,6 +1991,21 @@ def parse_codex_file(
 
         if kind == "response_item":
             item = payload.get("type")
+            action = codex_response_action(payload, item)
+            if action:
+                index.pending_response_seen = True
+                index.pending_actions.append(action)
+                if is_message_action(action):
+                    target, payload_size = codex_message_metadata(payload)
+                    index.message_rows.append([
+                        session_id,
+                        epoch,
+                        index.thread_id or path.stem,
+                        action,
+                        target,
+                        payload_size,
+                        str(payload.get("call_id") or payload.get("id") or ""),
+                    ])
             if item in CODEX_TOOL_CALL_ITEMS:
                 call_id = payload.get("call_id") or payload.get("id")
                 name = codex_tool_name(payload, item)
@@ -1995,6 +2054,12 @@ def parse_codex_file(
                 continue
             index.has_usage_records = True
             tokens = codex_usage_tokens(usage)
+            actions = list(index.pending_actions) if index.pending_response_seen else None
+            pure_wait = (
+                bool(actions)
+                and len(actions) == 1
+                and actions[0].split(".")[-1] == "wait_agent"
+            ) if actions is not None else None
             thread_usage = payload.get("thread_token_usage")
             if isinstance(thread_usage, dict):
                 summary.thread_usage = codex_usage_tokens(thread_usage)
@@ -2014,7 +2079,12 @@ def parse_codex_file(
                 thread=index.thread_id or path.stem,
                 sidechain=index.is_subagent,
                 call_id=response_id if isinstance(response_id, str) else "",
+                reasoning_output=tokens.get("reasoning_output", 0),
+                actions=actions,
+                pure_wait=pure_wait,
             )
+            index.pending_actions = []
+            index.pending_response_seen = False
             continue
 
         if kind == "event_msg" and payload.get("type") == "task_complete":
@@ -2118,6 +2188,53 @@ def is_codex_subagent(payload: Mapping[str, Any]) -> bool:
     return False
 
 
+def codex_response_action(payload: Mapping[str, Any], item: Any) -> str:
+    if item in CODEX_TOOL_CALL_ITEMS:
+        return codex_tool_name(payload, str(item))
+    if item == "message" and payload.get("role") == "assistant":
+        return "message"
+    return ""
+
+
+def is_message_action(action: str) -> bool:
+    return action.split(".")[-1] in {"send_message", "message", "spawn_agent"}
+
+
+def _decode_structural_payload(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return value
+    if isinstance(value, str):
+        try:
+            decoded = json.loads(value)
+        except (TypeError, ValueError):
+            return None
+        return decoded if isinstance(decoded, Mapping) else None
+    return None
+
+
+def codex_message_metadata(payload: Mapping[str, Any]) -> Tuple[str, Optional[int]]:
+    request = payload.get("arguments") or payload.get("input") or payload.get("action")
+    request_map = _decode_structural_payload(request)
+    if request_map is None:
+        request_map = {}
+    nested = request_map
+    for key in ("command", "input", "payload", "request"):
+        decoded = _decode_structural_payload(nested.get(key))
+        if decoded is not None:
+            nested = decoded
+    target = "unknown"
+    for key in ("target_thread_id", "recipient_thread_id", "thread_id", "agent_id", "target"):
+        value = nested.get(key)
+        if isinstance(value, str) and value and "@" not in value and " " not in value:
+            target = value[:128]
+            break
+    try:
+        payload_size = len(json.dumps(request, ensure_ascii=False, separators=(",", ":")))
+    except (TypeError, ValueError):
+        payload_size = None
+    return target, payload_size
+
+
 def add_boundary(
     boundaries: List[List[Any]], session_id: str, epoch: float, label: str = "",
     rank: int = LABEL_RANK_NONE,
@@ -2149,6 +2266,9 @@ def record_event(
     thread: str = "",
     sidechain: bool = False,
     call_id: str = "",
+    reasoning_output: int = 0,
+    actions: Optional[Sequence[str]] = None,
+    pure_wait: Optional[bool] = None,
 ) -> None:
     context_size = tokens.get("input", 0) + tokens.get("cached_input", 0)
     long_context = context_size > LONG_CONTEXT_THRESHOLD
@@ -2163,6 +2283,10 @@ def record_event(
     row.append(turn)
     row.append(thread)
     row.append(call_id)
+    row.append(None)
+    row.append(int(reasoning_output))
+    row.append(list(actions) if actions is not None else None)
+    row.append(pure_wait)
     events.append(row)
 
 
@@ -2520,6 +2644,9 @@ class Scan:
         self.compactions = {}  # type: Dict[Tuple[str, str], List[float]]
         self.claimed = {}  # type: Dict[Tuple[str, str], str]
         self.forks = {}  # type: Dict[Tuple[str, str], Dict[str, int]]
+        self.thread_metadata = {}  # type: Dict[Tuple[str, str, str], Dict[str, Any]]
+        self.messages = []  # type: List[List[Any]]
+        self.claimed_messages = set()  # type: set
         # (account key, account label) for every session seen, keyed the same
         # as `sessions`. Populated in `absorb` from the resolved root, never
         # from anything cached on disk - see the module docstring's note on
@@ -2742,6 +2869,19 @@ def absorb(
                 continue
             claimed[call_id] = row_session
         kept.append(row)
+    for thread_id, metadata in entry.thread_metadata.items():
+        metadata = dict(metadata)
+        scan.thread_metadata[
+            (harness, str(metadata.get("session_id") or entry.last_session or next(iter(entry.sessions), "")), str(thread_id))
+        ] = metadata
+    for row in entry.message_rows:
+        message_id = row[6] if len(row) > 6 and row[6] else None
+        key = (harness, message_id) if message_id else None
+        if key is not None and key in scan.claimed_messages:
+            continue
+        if key is not None:
+            scan.claimed_messages.add(key)
+        scan.messages.append([harness] + list(row))
     # Keep the path only in this process.  It is needed by the opt-in command
     # explanation to reread command arguments, but must never enter a cache
     # shard or make a default report touch transcript content.
@@ -3552,12 +3692,12 @@ class ToolCall:
 
     __slots__ = (
         "harness", "session_id", "prompt", "ts", "name", "chars",
-        "measured", "subagent", "spawn", "call_id", "source",
+        "measured", "subagent", "spawn", "call_id", "source", "thread_id",
     )
 
     def __init__(self, harness: str, session_id: str, prompt: int, ts: float,
                  name: str, chars: int, subagent: bool, spawn: bool,
-                 call_id: str = "", source: str = ""):
+                 call_id: str = "", source: str = "", thread_id: str = ""):
         self.harness = harness
         self.session_id = session_id
         self.prompt = prompt
@@ -3569,6 +3709,7 @@ class ToolCall:
         self.spawn = spawn
         self.call_id = call_id
         self.source = source
+        self.thread_id = thread_id
 
     @property
     def est_tokens(self) -> float:
@@ -3609,12 +3750,15 @@ def attribute_tools(
             continue
         streams = {}  # type: Dict[Tuple[str, int], List[List[Any]]]
         for row in tools:
-            streams.setdefault((row[TOOL_SESSION], int(row[TOOL_SUB])), []).append(row)
+            stream_id = (
+                str(row[TOOL_THREAD]) if harness == "codex" and len(row) > TOOL_THREAD
+                else str(int(row[TOOL_SUB]))
+            )
+            streams.setdefault((row[TOOL_SESSION], stream_id), []).append(row)
         events = {}  # type: Dict[Tuple[str, int], List[List[Any]]]
         for row in scan.events.get(harness, []):
-            events.setdefault(
-                (row[EVENT_SESSION], 1 if row[EVENT_SUB] else 0), []
-            ).append(row)
+            stream_id = str(row[EVENT_THREAD]) if harness == "codex" else str(int(row[EVENT_SUB]))
+            events.setdefault((row[EVENT_SESSION], stream_id), []).append(row)
         for key, rows in events.items():
             check_cancelled(cancellation)
             rows.sort(key=lambda item: item[EVENT_TS])
@@ -3637,6 +3781,7 @@ def attribute_tools(
                 attribute_tool_stream(
                     harness, key[0], rows, events.get(key, []),
                     analysis.scan.tool_provenance,
+                    key[1] if harness == "codex" else "",
                 )
             )
     calls.sort(key=lambda call: call.ts)
@@ -3648,6 +3793,7 @@ def attribute_tool_stream(
     harness: str, session_id: str, rows: Sequence[List[Any]],
     stream_events: Sequence[List[Any]],
     provenance: Optional[Mapping[int, str]] = None,
+    thread_id: str = "",
 ) -> List[ToolCall]:
     starts = [row[EVENT_TS] for row in stream_events]
     calls = []  # type: List[ToolCall]
@@ -3666,6 +3812,7 @@ def attribute_tool_stream(
             int(row[TOOL_CHARS]), bool(row[TOOL_SUB]), bool(row[TOOL_SPAWN]),
             str(row[TOOL_ID]) if len(row) > TOOL_ID and row[TOOL_ID] else "",
             (provenance or {}).get(id(row), ""),
+            thread_id or (str(row[TOOL_THREAD]) if len(row) > TOOL_THREAD else ""),
         )
         calls.append(call)
         if position < len(stream_events):
@@ -3686,6 +3833,257 @@ def attribute_tool_stream(
         for call in bucket:
             call.measured = growth * (call.chars / total)
     return calls
+
+
+def _drill_bucket(thread_id: str, classification: str, metadata: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:
+    metadata = metadata or {}
+    return {
+        "thread_id": thread_id or None,
+        "parent_thread_id": metadata.get("parent_thread_id"),
+        "depth": metadata.get("depth"),
+        "classification": classification,
+        "api_calls": 0,
+        "uncached_input_tokens": 0,
+        "cached_input_tokens": 0,
+        "output_tokens": 0,
+        "input_context_tokens": 0,
+        "reasoning_output_tokens": 0,
+        "cache_write_input_tokens": 0,
+        "weighted_units": 0.0,
+        "action_counts": {},
+        "tool_family_rankings": [],
+        "messages": {
+            "calls": 0,
+            "payload_bytes": 0,
+            "known_payload_bytes": 0,
+            "unknown_payload_calls": 0,
+            "unknown_target_calls": 0,
+            "routes": [],
+        },
+        "wait_streaks": [],
+    }
+
+
+def _drill_add_event(bucket: Dict[str, Any], row: Sequence[Any], weights: Weights) -> None:
+    uncached = int(row[EVENT_KINDS])
+    cached = int(row[EVENT_KINDS + 1])
+    output = int(row[EVENT_KINDS + 3])
+    bucket["api_calls"] += 1
+    bucket["uncached_input_tokens"] += uncached
+    bucket["cached_input_tokens"] += cached
+    bucket["input_context_tokens"] += uncached + cached
+    bucket["output_tokens"] += output
+    bucket["reasoning_output_tokens"] += int(row[EVENT_REASONING]) if len(row) > EVENT_REASONING else 0
+    bucket["cache_write_input_tokens"] += int(row[EVENT_KINDS + 2])
+    actions = row[EVENT_ACTIONS] if len(row) > EVENT_ACTIONS else None
+    if isinstance(actions, list):
+        for action in actions:
+            name = str(action)
+            counts = bucket["action_counts"]
+            counts[name] = counts.get(name, 0) + 1
+    bucket["weighted_units"] += weights.codex_units(row[EVENT_MODEL], {
+        "input": uncached, "cached_input": cached, "cache_write": int(row[EVENT_KINDS + 2]),
+        "output": output,
+    })
+
+
+def _drill_wait_streaks(events: Sequence[Sequence[Any]]) -> List[Dict[str, Any]]:
+    streaks = []
+    current = []
+
+    def flush() -> None:
+        if not current:
+            return
+        first = event_context(current[0], "codex")
+        last = event_context(current[-1], "codex")
+        delta = last - first
+        streaks.append({
+            "length": len(current),
+            "first_context": first,
+            "last_context": last,
+            "context_delta": delta,
+            "mean_context_delta_per_transition": delta / (len(current) - 1) if len(current) > 1 else None,
+            "uncached_input_tokens": sum(int(row[EVENT_KINDS]) for row in current),
+            "cached_replay_tokens": sum(int(row[EVENT_KINDS + 1]) for row in current),
+            "start": current[0][EVENT_TS],
+            "end": current[-1][EVENT_TS],
+        })
+        del current[:]
+
+    for row in sorted(events, key=lambda item: item[EVENT_TS]):
+        if len(row) > EVENT_WAIT and row[EVENT_WAIT] is True:
+            current.append(row)
+        else:
+            flush()
+    flush()
+    return streaks
+
+
+def _drill_add_tools(bucket: Dict[str, Any], calls: Sequence[ToolCall]) -> None:
+    grouped = {}
+    for call in calls:
+        key = call.name
+        item = grouped.setdefault(key, {"tool": key, "calls": 0, "result_chars": 0, "measured_tokens": 0.0})
+        item["calls"] += 1
+        item["result_chars"] += call.chars
+        item["measured_tokens"] += call.measured
+    bucket["tool_family_rankings"] = sorted(
+        grouped.values(), key=lambda item: (item["measured_tokens"], item["result_chars"], item["calls"]), reverse=True
+    )
+
+
+def _drill_add_messages(bucket: Dict[str, Any], rows: Sequence[Sequence[Any]]) -> None:
+    routes = {}
+    for row in rows:
+        target = row[5] if len(row) > 5 else "unknown"
+        size = row[6] if len(row) > 6 else None
+        bucket["messages"]["calls"] += 1
+        if target == "unknown":
+            bucket["messages"]["unknown_target_calls"] += 1
+        if isinstance(size, int):
+            bucket["messages"]["payload_bytes"] += size
+            bucket["messages"]["known_payload_bytes"] += size
+        else:
+            bucket["messages"]["unknown_payload_calls"] += 1
+        key = str(target)
+        route = routes.setdefault(key, {"target": target, "calls": 0, "payload_bytes": 0})
+        route["calls"] += 1
+        if isinstance(size, int):
+            route["payload_bytes"] += size
+    bucket["messages"]["routes"] = sorted(routes.values(), key=lambda item: (item["calls"], item["payload_bytes"]), reverse=True)
+
+
+def drilldown_for_prompt(analysis: "Analysis", prompt: Prompt) -> Dict[str, Any]:
+    scan = analysis.scan
+    rows = [
+        row for row in scan.events.get("codex", [])
+        if row[EVENT_SESSION] == prompt.session_id
+        and len(row) > EVENT_PROMPT and row[EVENT_PROMPT] == prompt.index
+    ]
+    metadata = scan.thread_metadata
+    partitions = {}
+    unknown_events = []
+    for row in rows:
+        thread = str(row[EVENT_THREAD] or "")
+        info = metadata.get(("codex", prompt.session_id, thread))
+        if info is None and thread == prompt.session_id:
+            classification = "root"
+            info = {"thread_id": thread, "depth": 0}
+        else:
+            classification = str((info or {}).get("classification") or "unknown")
+        if classification == "root":
+            key = ("root", thread)
+        elif classification == "descendant":
+            key = ("descendant", thread)
+        else:
+            key = ("unknown", "")
+            unknown_events.append(row)
+        if key not in partitions:
+            partitions[key] = _drill_bucket(thread if key[0] != "unknown" else "", classification, info)
+        _drill_add_event(partitions[key], row, analysis.weights)
+
+    calls = [
+        call for call in analysis.tool_calls
+        if call.harness == "codex" and call.session_id == prompt.session_id and call.prompt == prompt.index
+    ]
+    for call in calls:
+        key = ("root", call.thread_id) if ("codex", prompt.session_id, call.thread_id) in metadata and metadata[("codex", prompt.session_id, call.thread_id)].get("classification") == "root" else (
+            ("descendant", call.thread_id) if ("codex", prompt.session_id, call.thread_id) in metadata and metadata[("codex", prompt.session_id, call.thread_id)].get("classification") == "descendant" else ("unknown", "")
+        )
+        bucket = partitions.setdefault(key, _drill_bucket(key[1], key[0], metadata.get(("codex", prompt.session_id, key[1]))))
+        _drill_add_tools(bucket, [call])
+
+    for key, bucket in partitions.items():
+        thread = key[1]
+        bucket["wait_streaks"] = _drill_wait_streaks([row for row in rows if str(row[EVENT_THREAD] or "") == thread]) if thread else []
+        _drill_add_tools(bucket, [call for call in calls if (call.thread_id == thread and thread) or (not thread and not call.thread_id)])
+        message_rows = [
+            row for row in scan.messages
+            if row[0] == "codex" and row[1] == prompt.session_id and str(row[3] or "") == thread
+            and prompt.start is not None and prompt.end is not None and prompt.start <= float(row[2]) <= prompt.end
+        ]
+        _drill_add_messages(bucket, message_rows)
+
+    root = next((bucket for (kind, _), bucket in partitions.items() if kind == "root"), _drill_bucket("", "root"))
+    descendants = [bucket for (kind, _), bucket in sorted(partitions.items()) if kind == "descendant"]
+    unknown = next((bucket for (kind, _), bucket in partitions.items() if kind == "unknown"), _drill_bucket("", "unknown"))
+    all_buckets = [root] + descendants + [unknown]
+    combined = _drill_bucket("combined", "combined")
+    for bucket in all_buckets:
+        for field in ("api_calls", "uncached_input_tokens", "cached_input_tokens", "input_context_tokens", "output_tokens", "reasoning_output_tokens", "cache_write_input_tokens"):
+            combined[field] += bucket[field]
+        combined["weighted_units"] += bucket["weighted_units"]
+        for action, count in bucket["action_counts"].items():
+            combined["action_counts"][action] = combined["action_counts"].get(action, 0) + count
+    prompt_tokens = prompt.tokens
+    reconciliation = {
+        "matches_prompt": combined["api_calls"] == prompt.turns
+        and combined["uncached_input_tokens"] == prompt_tokens.get("input", 0)
+        and combined["cached_input_tokens"] == prompt_tokens.get("cached_input", 0)
+        and combined["output_tokens"] == prompt_tokens.get("output", 0)
+        and abs(combined["weighted_units"] - prompt.units) < 1e-9,
+        "prompt_api_calls": prompt.turns,
+        "prompt_tokens": dict(prompt_tokens),
+        "combined_tokens": {key: combined[key] for key in ("uncached_input_tokens", "cached_input_tokens", "output_tokens")},
+    }
+    ranking_sources = [root] + descendants
+    ranking_sources = [bucket for bucket in ranking_sources if bucket["api_calls"] or bucket["thread_id"]]
+    ranking_sources.sort(key=lambda bucket: (bucket["weighted_units"], bucket["uncached_input_tokens"]), reverse=True)
+    agent_rankings = []
+    for rank, bucket in enumerate(ranking_sources, 1):
+        agent_rankings.append({
+            "rank": rank,
+            "classification": bucket["classification"],
+            "thread_id": bucket["thread_id"],
+            "weighted_units": bucket["weighted_units"],
+            "uncached_input_tokens": bucket["uncached_input_tokens"],
+            "api_calls": bucket["api_calls"],
+        })
+    return {"root": root, "descendants": descendants, "unknown": unknown,
+            "combined": combined, "reconciliation": reconciliation,
+            "agent_rankings": agent_rankings,
+            "caveats": ["descendant membership is temporal", "measured tool growth is an upper bound", "unknown lineage is not inferred"],
+            "attribution": "explicit_lineage_with_temporal_prompt_membership"}
+
+
+def render_drilldown(drilldown: Mapping[str, Any]) -> None:
+    print("prompt drilldown: explicit lineage with temporal prompt membership")
+    print("agent rankings: weighted units (then uncached input)")
+    rankings = drilldown.get("agent_rankings") or []
+    for item in rankings:
+        print("  #%d %-10s thread=%s units=%.4f input=%d calls=%d" % (
+            item["rank"], item["classification"], item["thread_id"] or "unknown",
+            item["weighted_units"], item["uncached_input_tokens"], item["api_calls"],
+        ))
+    for label, bucket in [("root", drilldown["root"])] + [("descendant", item) for item in drilldown["descendants"]] + [("unknown", drilldown["unknown"])]:
+        print("%s agent/thread=%s parent=%s depth=%s" % (
+            label, bucket.get("thread_id") or "unknown", bucket.get("parent_thread_id") or "unknown", bucket.get("depth", "unknown")
+        ))
+        print("  totals: calls=%d uncached_input=%d cached_replay=%d context=%d output=%d reasoning_output=%d cache_write=%d units=%.4f" % (
+            bucket["api_calls"], bucket["uncached_input_tokens"], bucket["cached_input_tokens"], bucket["input_context_tokens"],
+            bucket["output_tokens"], bucket["reasoning_output_tokens"], bucket["cache_write_input_tokens"], bucket["weighted_units"],
+        ))
+        print("  actions: %s" % (", ".join("%s=%d" % item for item in sorted(bucket["action_counts"].items())) or "none"))
+        print("  tools: %s" % (", ".join("%s calls=%d measured=%.1f chars=%d" % (
+            item["tool"], item["calls"], item["measured_tokens"], item["result_chars"]
+        ) for item in bucket["tool_family_rankings"]) or "none"))
+        messages = bucket["messages"]
+        print("  messages: calls=%d payload_bytes=%d unknown_targets=%d unknown_payloads=%d routes=%s" % (
+            messages["calls"], messages["payload_bytes"], messages["unknown_target_calls"], messages["unknown_payload_calls"],
+            ", ".join("%s=%d" % (route["target"], route["calls"]) for route in messages["routes"]) or "none",
+        ))
+        for streak in bucket["wait_streaks"]:
+            print("  wait streak: length=%d context_delta=%d mean_delta=%s uncached_input=%d cached_replay=%d" % (
+                streak["length"], streak["context_delta"], streak["mean_context_delta_per_transition"] if streak["mean_context_delta_per_transition"] is not None else "n/a",
+                streak["uncached_input_tokens"], streak["cached_replay_tokens"],
+            ))
+    reconciliation = drilldown["reconciliation"]
+    print("combined totals: calls=%d uncached_input=%d cached_replay=%d output=%d reasoning_output=%d units=%.4f" % (
+        drilldown["combined"]["api_calls"], drilldown["combined"]["uncached_input_tokens"], drilldown["combined"]["cached_input_tokens"],
+        drilldown["combined"]["output_tokens"], drilldown["combined"]["reasoning_output_tokens"], drilldown["combined"]["weighted_units"],
+    ))
+    print("reconciliation: %s" % ("ok" if reconciliation["matches_prompt"] else "mismatch"))
+    print("caveats: descendant membership is temporal; measured tool growth is an upper bound; unknown lineage is not inferred")
 
 
 def attach_prompt_tools(analysis: "Analysis", calls: Sequence[ToolCall]) -> None:
@@ -6113,6 +6511,16 @@ def command_prompts_ranked(args: argparse.Namespace, analysis: "Analysis") -> in
 
 
 def command_prompts(args: argparse.Namespace) -> int:
+    prompt_index = getattr(args, "prompt", None)
+    if prompt_index is not None and not getattr(args, "session", None):
+        warn("--prompt requires --session")
+        return 2
+    if getattr(args, "drilldown", False) and prompt_index is None:
+        warn("--drilldown requires --prompt")
+        return 2
+    if getattr(args, "drilldown", False) and not getattr(args, "session", None):
+        warn("--drilldown requires --session")
+        return 2
     analysis = prepare(args)
     # Every prompt row this command prints or serializes carries its tool
     # counts, which `attribute_tools` writes onto the prompts as a side
@@ -6133,6 +6541,17 @@ def command_prompts(args: argparse.Namespace) -> int:
     growth = fit_growth(prompts)
     top = args.top if args.top is not None else PROMPTS_SESSION_TOP
     shown = prompts[-top:] if top and len(prompts) > top else prompts
+    if prompt_index is not None:
+        if prompt_index < 1 or prompt_index > len(prompts):
+            warn("prompt index %d is out of range (1..%d)" % (prompt_index, len(prompts)))
+            return 2
+        shown = [prompts[prompt_index - 1]]
+    drilldown = None
+    if getattr(args, "drilldown", False):
+        if harness != "codex":
+            warn("--drilldown is supported only for Codex sessions")
+            return 2
+        drilldown = drilldown_for_prompt(analysis, prompts[prompt_index - 1])
     hints = prompts_session_hints(
         args, session_id, shown, analysis_session_ids(analysis))
     if args.json:
@@ -6147,6 +6566,7 @@ def command_prompts(args: argparse.Namespace) -> int:
                     "short_id": short_id(session_id),
                     "growth": growth,
                     "prompts": [prompt.to_json() for prompt in shown],
+                    **({"drilldown": drilldown} if drilldown is not None else {}),
                 },
                 indent=2,
                 sort_keys=True,
@@ -6154,6 +6574,10 @@ def command_prompts(args: argparse.Namespace) -> int:
         )
         return 0
     paint = make_painter(args)
+    if drilldown is not None:
+        render_drilldown(drilldown)
+        footer(args, hints)
+        return 0
     width = terminal_width(args)
     print(
         paint(
@@ -7471,6 +7895,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--session", default=None, metavar="ID_PREFIX",
         help="break down one session by ID prefix; an ambiguous prefix is an error. "
              "Without it, prompts from every session in range are ranked together",
+    )
+    prompts.add_argument(
+        "--prompt", type=int, default=None, metavar="N",
+        help="select one prompt within --session; requires --session",
+    )
+    prompts.add_argument(
+        "--drilldown", action="store_true",
+        help="show Codex root, descendant, tool, message, and wait details for --prompt",
     )
     prompts.add_argument(
         "--first", action="store_true",

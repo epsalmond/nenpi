@@ -5304,11 +5304,9 @@ class PromptRanking(Harness):
         )
         self.assertEqual(second["prompts"][0]["label"], "rank me first please")
 
-    def test_cache_schema_is_seven(self) -> None:
-        # 6 split the tool rows into a sibling shard; 7 added the row count
-        # and size that make the sibling checkable. Either older shard
-        # would read back as a transcript that called no tools.
-        self.assertEqual(QD.CACHE_SCHEMA, 7)
+    def test_cache_schema_includes_drilldown_metadata(self) -> None:
+        # 8 adds lineage, action, reasoning, and safe message metadata.
+        self.assertEqual(QD.CACHE_SCHEMA, 8)
 
     def test_codex_label_comes_from_the_user_message(self) -> None:
         now = time.time() - 3600
