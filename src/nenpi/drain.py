@@ -1608,7 +1608,7 @@ def is_spawn_tool(name: str) -> bool:
     return name.lower() in SPAWN_TOOL_NAMES
 
 
-def remember_tool(index: "FileIndex", call_id: str, name: str, sidechain: bool) -> None:
+def remember_tool(index: "FileIndex", call_id: str, name: str, sidechain: bool, thread_id: str = "") -> None:
     """Note an issued tool call so its result can be named when it arrives."""
     if not call_id or not name:
         return
@@ -1616,7 +1616,7 @@ def remember_tool(index: "FileIndex", call_id: str, name: str, sidechain: bool) 
         if row[0] == call_id:
             return
     index.pending_tools.append(
-        [call_id, name, 1 if sidechain else 0, 1 if is_spawn_tool(name) else 0]
+        [call_id, name, 1 if sidechain else 0, 1 if is_spawn_tool(name) else 0, thread_id]
     )
     if len(index.pending_tools) > MAX_PENDING_TOOLS:
         del index.pending_tools[: len(index.pending_tools) - MAX_PENDING_TOOLS]
@@ -1636,14 +1636,14 @@ def expire_pending_tools(index: "FileIndex") -> None:
         del index.pending_tools[:]
 
 
-def resolve_tool(index: "FileIndex", call_id: str) -> Tuple[str, int, int]:
+def resolve_tool(index: "FileIndex", call_id: str) -> Tuple[str, int, int, str]:
     """Name the call a result answers, or report it as unmatched."""
     for position in range(len(index.pending_tools) - 1, -1, -1):
         row = index.pending_tools[position]
         if row[0] == call_id:
             del index.pending_tools[position]
-            return str(row[1]), int(row[2]), int(row[3])
-    return "unknown", 0, 0
+            return str(row[1]), int(row[2]), int(row[3]), str(row[4]) if len(row) > 4 else ""
+    return "unknown", 0, 0, ""
 
 
 def record_tool(
@@ -1653,10 +1653,11 @@ def record_tool(
     call_id: str,
     chars: int,
     sidechain: bool,
+    thread_id: str = "",
 ) -> None:
     if epoch is None or not session_id:
         return
-    name, was_sub, spawn = resolve_tool(index, call_id)
+    name, was_sub, spawn, pending_thread = resolve_tool(index, call_id)
     index.tools.append(
         [
             session_id,
@@ -1666,7 +1667,7 @@ def record_tool(
             1 if (sidechain or was_sub) else 0,
             spawn,
             call_id,
-            index.thread_id,
+            pending_thread or thread_id or index.thread_id,
         ]
     )
 
@@ -1940,7 +1941,8 @@ def parse_codex_file(
             # A Codex session spans several rollouts: the root thread plus one
             # file per spawned subagent, all sharing `session_id`.
             thread = payload.get("id")
-            if isinstance(thread, str) and thread:
+            first_thread_metadata = not index.thread_id
+            if first_thread_metadata and isinstance(thread, str) and thread:
                 index.thread_id = thread
             umbrella = payload.get("session_id")
             if isinstance(umbrella, str) and umbrella:
@@ -1949,7 +1951,8 @@ def parse_codex_file(
                 session_id = thread
             if not session_id:
                 session_id = path.stem
-            index.is_subagent = is_codex_subagent(payload)
+            if first_thread_metadata:
+                index.is_subagent = is_codex_subagent(payload)
             parent = payload.get("parent_thread_id")
             source = payload.get("source")
             if isinstance(source, Mapping):
@@ -1963,8 +1966,14 @@ def parse_codex_file(
                 depth = None
             if not isinstance(depth, int):
                 depth = 1 if parent else 0
+            metadata_is_subagent = is_codex_subagent(payload)
+            if isinstance(thread, str) and thread and (
+                first_thread_metadata or (metadata_is_subagent and not index.is_subagent)
+            ):
+                index.thread_id = thread
+                index.is_subagent = metadata_is_subagent
             classification = "descendant" if isinstance(parent, str) and parent else (
-                "unknown" if index.is_subagent else "root"
+                "unknown" if metadata_is_subagent else "root"
             )
             if isinstance(thread, str) and thread:
                 index.thread_metadata[thread] = {
@@ -1991,6 +2000,12 @@ def parse_codex_file(
 
         if kind == "response_item":
             item = payload.get("type")
+            payload_thread = payload.get("thread_id")
+            event_thread = (
+                payload_thread
+                if isinstance(payload_thread, str) and (not index.is_subagent or payload_thread != session_id)
+                else (index.thread_id or path.stem)
+            )
             action = codex_response_action(payload, item)
             if action:
                 index.pending_response_seen = True
@@ -2000,7 +2015,7 @@ def parse_codex_file(
                     index.message_rows.append([
                         session_id,
                         epoch,
-                        index.thread_id or path.stem,
+                        event_thread,
                         action,
                         target,
                         payload_size,
@@ -2010,7 +2025,7 @@ def parse_codex_file(
                 call_id = payload.get("call_id") or payload.get("id")
                 name = codex_tool_name(payload, item)
                 if isinstance(call_id, str):
-                    remember_tool(index, call_id, name, index.is_subagent)
+                    remember_tool(index, call_id, name, index.is_subagent, event_thread)
             elif item == "message" and payload.get("role") == "user":
                 # Only the label is taken; the message body is never kept.
                 if not index.is_subagent:
@@ -2027,6 +2042,7 @@ def parse_codex_file(
                     call_id if isinstance(call_id, str) else "",
                     content_chars(payload.get("output")),
                     index.is_subagent,
+                    event_thread,
                 )
             continue
 
@@ -2061,10 +2077,17 @@ def parse_codex_file(
                 and actions[0].split(".")[-1] == "wait_agent"
             ) if actions is not None else None
             thread_usage = payload.get("thread_token_usage")
+            payload_thread = payload.get("thread_id")
+            event_thread = (
+                payload_thread
+                if isinstance(payload_thread, str) and (not index.is_subagent or payload_thread != session_id)
+                else (index.thread_id or path.stem)
+            )
+            event_metadata = index.thread_metadata.get(event_thread) or {}
+            event_sidechain = event_metadata.get("classification") != "root" if event_metadata else index.is_subagent
             if isinstance(thread_usage, dict):
                 summary.thread_usage = codex_usage_tokens(thread_usage)
-                thread_id = index.thread_id or path.stem
-                summary.thread_usages[thread_id] = codex_usage_tokens(thread_usage)
+                summary.thread_usages[event_thread] = codex_usage_tokens(thread_usage)
             turn_id = payload.get("turn_id")
             response_id = payload.get("response_id")
             record_event(
@@ -2076,8 +2099,8 @@ def parse_codex_file(
                 tokens,
                 CODEX_KINDS,
                 turn=turn_id if isinstance(turn_id, str) else "",
-                thread=index.thread_id or path.stem,
-                sidechain=index.is_subagent,
+                thread=event_thread,
+                sidechain=event_sidechain,
                 call_id=response_id if isinstance(response_id, str) else "",
                 reasoning_output=tokens.get("reasoning_output", 0),
                 actions=actions,

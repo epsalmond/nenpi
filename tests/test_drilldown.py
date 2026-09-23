@@ -75,6 +75,34 @@ def unknown_meta_line(epoch: float, thread_id: str, session_id: str) -> str:
 
 
 class TestCodexPromptDrilldown(Harness):
+    def test_inherited_root_metadata_does_not_reparent_child_usage(self) -> None:
+        base = time.time() - 900
+        session = "inherited-session-0001"
+        child = "inherited-child-0001"
+        self.write_codex("rollout-root.jsonl", [
+            codex_session_meta_line(base, session, "/home/agent/project"),
+            codex_task_started_line(base + 1),
+            codex_turn_context_line(base + 1.1, "gpt-5.5"),
+            codex_usage_line(base + 2, session, session, input_tokens=10, cached_input_tokens=1, output_tokens=2, turn_id="turn-1"),
+        ], day=base)
+        self.write_codex("rollout-child.jsonl", [
+            codex_subagent_meta_line(base + 1.5, child, session, "/home/agent/project"),
+            codex_usage_line(base + 2.5, session, child, input_tokens=20, cached_input_tokens=2, output_tokens=3),
+            codex_session_meta_line(base + 3, session, "/home/agent/project"),
+            codex_usage_line(base + 3.5, session, child, input_tokens=30, cached_input_tokens=3, output_tokens=4),
+        ], day=base)
+
+        result = self.run_tool(
+            "prompts", "--harness", "codex", "--codex-root", str(self.home / ".codex"),
+            "--session", session, "--prompt", "1", "--drilldown", "--json",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr.decode("utf-8", "replace"))
+        drilldown = json.loads(result.stdout.decode("utf-8"))["drilldown"]
+        self.assertEqual(drilldown["root"]["api_calls"], 1)
+        self.assertEqual(len(drilldown["descendants"]), 1)
+        self.assertEqual(drilldown["descendants"][0]["thread_id"], child)
+        self.assertEqual(drilldown["descendants"][0]["api_calls"], 2)
+
     def test_drilldown_reconciles_lineage_tools_messages_and_waits(self) -> None:
         base = time.time() - 900
         session = "drill-session-0001"
