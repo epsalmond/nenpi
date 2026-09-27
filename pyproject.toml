@@ -13,9 +13,9 @@ authors = [{ name = "Eric Psalmond" }]
 dependencies = []
 
 [project.optional-dependencies]
-ui = ["textual>=0.50; python_version >= '3.11'"]
+ui = ["textual>=8.2.8; python_version >= '3.11'"]
 browser = [
-    "textual>=0.50; python_version >= '3.11'",
+    "textual>=8.2.8; python_version >= '3.11'",
     "textual-serve>=1.1; python_version >= '3.11'",
 ]
 

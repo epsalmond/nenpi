@@ -3148,6 +3148,8 @@ class PromptsBarLegendColor(Harness):
         sys.stdout = TtyStringIO()
         try:
             with self.env_applied():
+                os.environ.pop("NO_COLOR", None)
+                os.environ.pop("NENPI_THEME", None)
                 QD.main(["prompts", "--width", "120"] + list(arguments))
             return sys.stdout.getvalue()
         finally:

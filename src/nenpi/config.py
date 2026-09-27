@@ -157,6 +157,7 @@ class Config:
         ignore_unconfigured: bool = False,
         tables_present: Optional[Sequence[str]] = None,
         extras: Optional[Dict[str, Any]] = None,
+        theme: Optional[Dict[str, Any]] = None,
     ):
         self.claude_roots = list(claude_roots or [])
         self.codex_roots = list(codex_roots or [])
@@ -168,6 +169,7 @@ class Config:
         self.claude_ignored = list(claude_ignored or [])
         self.codex_ignored = list(codex_ignored or [])
         self.ignore_unconfigured = bool(ignore_unconfigured)
+        self.theme = dict(theme or {})
         # Which harness tables the file actually had: an empty ``roots`` in a
         # table the user wrote is a choice ("scan nothing"), while an absent
         # table means "no opinion" and falls back to the defaults.
@@ -189,7 +191,7 @@ class Config:
         return name in self.tables_present
 
 
-_KNOWN_TOP_KEYS = ("claude", "codex", "plan", "general")
+_KNOWN_TOP_KEYS = ("claude", "codex", "plan", "general", "theme")
 _KNOWN_SUBKEYS = {
     "claude": ("roots", "disabled", "ignored"),
     "codex": ("roots", "disabled", "ignored"),
@@ -235,6 +237,8 @@ def load_config(path: Optional[Path] = None) -> Config:
         if not isinstance(block, dict):
             continue
         tables_present.append(key)
+        if key == "theme":
+            continue
         for subkey in block:
             if subkey not in _KNOWN_SUBKEYS[key]:
                 warn_once("config %s: unknown key %s.%s" % (path, key, subkey))
@@ -259,6 +263,7 @@ def load_config(path: Optional[Path] = None) -> Config:
         claude_ignored=_string_list(claude_block.get("ignored")),
         codex_ignored=_string_list(codex_block.get("ignored")),
         ignore_unconfigured=general_block.get("ignore_unconfigured") is True,
+        theme=data.get("theme") if isinstance(data.get("theme"), dict) else {},
         tables_present=tables_present,
         extras=extras,
     )
@@ -411,6 +416,8 @@ def dump_config(
         lines.append("# [general]")
         lines.append("# ignore_unconfigured = true  # silence the unconfigured-dir note")
         lines.append("")
+    if config.theme:
+        lines.extend(_extra_lines("theme", config.theme))
     for key, value in config.extras.items():
         if key in _KNOWN_TOP_KEYS:
             continue

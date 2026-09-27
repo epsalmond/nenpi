@@ -253,6 +253,11 @@ def build_app(settings: Optional[SourceSettings] = None, scanner: Callable[..., 
         def __init__(self, source_settings: Optional[SourceSettings] = None, **kwargs: Any) -> None:
             super().__init__(**kwargs)
             self.source_settings = source_settings or SourceSettings.load()
+            from .theme import load_theme, textual_theme
+
+            theme_name, colors = load_theme(self.source_settings.path)
+            self.register_theme(textual_theme(theme_name, colors))
+            self.theme = theme_name
             self.scanner = scanner
             self.result = ScanResult()
             self._scan_generation = 0
