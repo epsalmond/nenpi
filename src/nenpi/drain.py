@@ -34,6 +34,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, Iterator, List, Mapping, Optional, Sequence, Tuple
 
+from nenpi.theme import DEFAULT_COLORS, ansi_styles, load_theme
+
 from nenpi.config import (
     Config,
     account_for_root,
@@ -247,14 +249,7 @@ SPAWN_TOOL_NAMES = frozenset(
 )
 MAX_PENDING_TOOLS = 512
 
-ANSI = {
-    "reset": "\033[0m",
-    "dim": "\033[2m",
-    "bold": "\033[1m",
-    "claude": "\033[36m",
-    "codex": "\033[35m",
-    "warn": "\033[33m",
-}
+ANSI = ansi_styles(DEFAULT_COLORS)
 
 BAR_GLYPHS = "▏▎▍▌▋▊▉█"
 ASCII_GLYPHS = {
@@ -5783,14 +5778,15 @@ def apply_claude_estimate(rows: Sequence[Row], dollars_per_percent: Optional[flo
 
 class Painter:
     def __init__(self, enabled: bool, ascii_only: bool = False):
-        self.enabled = enabled
+        self.enabled = enabled and not os.environ.get("NO_COLOR")
         self.ascii_only = ascii_only
+        self.styles = ansi_styles(load_theme()[1]) if self.enabled else ANSI
 
     def __call__(self, text: str, *styles: str) -> str:
         text = self.glyphs(text)
         if not self.enabled or not styles:
             return text
-        prefix = "".join(ANSI.get(style, "") for style in styles)
+        prefix = "".join(self.styles.get(style, "") for style in styles)
         return prefix + text + ANSI["reset"]
 
     def glyphs(self, text: str) -> str:

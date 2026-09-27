@@ -42,6 +42,32 @@ class SessionRecordTests(unittest.TestCase):
 
 @unittest.skipUnless(textual is not None, "nenpi[ui] is optional")
 class BrowserPilotTests(unittest.IsolatedAsyncioTestCase):
+    async def test_configured_theme_applies_and_survives_source_save(self):
+        import tempfile
+        from pathlib import Path
+        from nenpi.config import load_config
+        from nenpi.settings import SourceSettings
+
+        for name in ("codex", "codex-light"):
+            with self.subTest(theme=name), tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "config.toml"
+                path.write_text('[theme]\nname = "%s"\n'
+                                '[theme.colors]\naccent = "#123456"\n'
+                                'foreground = "#eeeeee"\nsurface = "#181818"\n' % name)
+                settings = SourceSettings(path=path)
+                with patch.dict("os.environ", {"NENPI_THEME": name}):
+                    app = build_app(settings=settings, scanner=lambda *args: ScanResult())
+                async with app.run_test() as pilot:
+                    await pilot.pause()
+                    self.assertEqual(app.theme, name)
+                    self.assertEqual(app.current_theme.accent, "#123456")
+                    self.assertEqual(app.query_one("#sessions").styles.border_left[1].hex,
+                                     "#123456")
+                    self.assertEqual(app.get_css_variables()["text"], "#eeeeee")
+                    self.assertEqual(app.get_css_variables()["surface"], "#181818")
+                    settings.save()
+                    self.assertEqual(load_config(path).theme["colors"]["accent"], "#123456")
+
     async def test_worker_progress_result_and_filter_keep_ui_responsive(self):
         def scanner(settings, progress, cancelled):
             for done in range(1, 4):

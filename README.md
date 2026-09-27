@@ -126,6 +126,35 @@ The browser uses the same `config.toml` root and account resolution as the
 terminal reports. Account labels remain attached to the session payloads used
 by the browser.
 
+## Themes
+
+Nenpi defaults to Codex-style colors: terminal foreground/background, cyan
+accents, and subdued labels. The terminal and browser UI use the same theme.
+For a light terminal, select `codex-light` (Codex's `#005f87` accent).
+Set the theme in `~/.config/nenpi/config.toml`:
+
+```toml
+[theme]
+name = "codex" # or "codex-light"
+
+[theme.colors] # optional overrides
+accent = "cyan"
+primary = "cyan"
+codex = "cyan" # CLI Codex bars
+claude = "default" # CLI Claude bars
+# background = "#181818"
+# foreground = "#eeeeee"
+```
+
+Colors accept `default`, `black`, `red`, `green`, `yellow`, `blue`, `magenta`,
+`cyan`, `white`, or `#RRGGBB`. UI roles are `primary`, `accent`, `foreground`,
+`background`, `surface`, `panel`, `success`, `warning`, and `error`; CLI roles
+are `claude`, `codex`, and `warning`. `NENPI_THEME=codex-light` overrides the
+configured name for a run, including `nenpi-web`. Restart the UI after editing
+colors. Source changes preserve theme settings. CLI `--no-color` and `NO_COLOR`
+suppress report colors; redirected reports stay plain text. Browser colors use
+the browser terminal palette, so they may differ from your terminal's palette.
+
 ## Configuration
 
 With no flags and no config file, nenpi looks at one root per harness:
