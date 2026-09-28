@@ -4,6 +4,8 @@ nenpi (燃費, fuel economy) shows where Claude Code and Codex CLI usage goes,
 including repeated checks that keep sending a large context to the model.
 It reads local transcripts. Requires Python 3.11+.
 
+![Default nenpi report from NAS](docs/images/nenpi-default.png)
+
 ## Install
 
 ```sh
