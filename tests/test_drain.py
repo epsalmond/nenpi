@@ -1313,7 +1313,8 @@ class Calibration(Harness):
     }
 
     def build_rollouts(self) -> None:
-        now = time.time() - 6 * 3600
+        # Keep the short fixture within one UTC day at every wall-clock time.
+        now = (int(time.time()) // 86400 - 1) * 86400 + 12 * 3600
         resets_at = int(time.time()) + 7200
         used = 0.0
         lines_by_model = {"gpt-5.6-sol": [], "gpt-5.6-terra": []}  # type: Dict[str, List[str]]
@@ -4602,6 +4603,22 @@ class ToolAttribution(Harness):
         self.assertEqual(payload["explain"]["shell_calls"], 1)
         self.assertEqual(payload["explain"]["command_shapes"][0]["shape"], "rg -n <arg> <arg>")
         self.assertIn("rg --line-number needle src", payload["explain"]["top_commands"][0]["command"])
+
+    def test_explain_legacy_shell_examples_redact_authorization(self) -> None:
+        session = "22000001-1111-2222-3333-444444444444"
+        now = time.time() - 3600
+        self.write_codex("rollout-shell-secret.jsonl", [
+            codex_session_meta_line(now, session, "/project"),
+            codex_turn_context_line(now + 1, "gpt-6-astra"),
+            codex_task_started_line(now + 1),
+            codex_tool_call_line(now + 2, "shell", "exec", item="local_shell_call",
+                                 command=["curl", "-H", "Authorization: Bearer SYNTHETIC_SECRET", "https://example.invalid"]),
+            codex_tool_output_line(now + 3, "shell", "ok", item="local_shell_call_output"),
+            codex_usage_record_line(now + 4, session, input_tokens=1000, cached_input_tokens=500, output_tokens=10),
+        ], day=now)
+        result = self.run_json("tools", "--session", session, "--explain", "--json")
+        self.assertNotIn("SYNTHETIC_SECRET", json.dumps(result))
+        self.assertEqual(result["explain"]["shell_calls"], 1)
 
     def test_session_prefix_scopes_the_report(self) -> None:
         first = "30000000-1111-2222-3333-444444444444"

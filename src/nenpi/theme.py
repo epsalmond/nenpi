@@ -15,11 +15,35 @@ COLORS = {
     "default": 39, "black": 30, "red": 31, "green": 32, "yellow": 33,
     "blue": 34, "magenta": 35, "cyan": 36, "white": 37,
 }
+# Report text is classified by purpose, independently of its theme color.
+# Attributes live here too; renderers never choose ANSI colors or emphasis.
+TEXT_ROLES = {
+    "heading": ("default", "bold"),       # report/section titles
+    "label": ("default", ""),             # field names and row identities
+    "data": ("default", ""),              # individual measurements
+    "summary": ("default", "bold"),       # interpretation of several facts
+    "total": ("default", "bold"),         # combined quantities and shares
+    "instruction": ("cyan", ""),          # commands and recommended actions
+    "detail": ("default", "dim"),         # scope, provenance and caveats
+    "warning": ("yellow", ""),            # patterns or limitations to inspect
+    "table_header": ("#f9e2af", "bold"),
+    "command": ("#89b4fa", ""),
+    "command_argument": ("#cdd6f4", ""),
+    "command_option": ("#eba0ac", ""),
+    "command_punctuation": ("#9399b2", ""),
+    "command_string": ("#a6e3a1", ""),
+    "cost": ("red", ""),
+    "improvement": ("green", ""),         # a specifically observed reduction
+}
+
 DEFAULT_COLORS = {
     "primary": "cyan", "accent": "cyan", "foreground": "default",
     "background": "default", "surface": "default", "panel": "default",
-    "success": "green", "warning": "default", "error": "red",
+    "success": "green", "warning": "yellow", "error": "red",
     "claude": "default", "codex": "cyan",
+    # Semantic CLI colors used by the quota diagnosis reports.
+    "replay": "cyan", "repeat": "yellow", "output": "magenta", "next": "green",
+    **{role: color for role, (color, _) in TEXT_ROLES.items()},
 }
 
 
@@ -31,7 +55,10 @@ def load_theme(path: Path | None = None) -> tuple[str, dict[str, str]]:
         name = "codex"
     colors = dict(DEFAULT_COLORS)
     if name == "codex-light":
-        colors.update(primary="#005f87", accent="#005f87", codex="#005f87")
+        colors.update(primary="#005f87", accent="#005f87", codex="#005f87",
+                      table_header="#df8e1d", command="#1e66f5",
+                      command_argument="#4c4f69", command_option="#e64553",
+                      command_punctuation="#7c7f93", command_string="#40a02b")
     overrides = settings.get("colors", {})
     if not isinstance(overrides, dict):
         warn_once("theme.colors must be a table; using theme defaults")
@@ -57,6 +84,11 @@ def ansi_styles(colors: dict[str, str]) -> dict[str, str]:
         "reset": "\033[0m", "dim": "\033[2m", "bold": "\033[1m",
         "claude": ansi_color(colors["claude"]), "codex": ansi_color(colors["codex"]),
         "warn": ansi_color(colors["warning"]),
+        "replay": ansi_color(colors["replay"]), "repeat": ansi_color(colors["repeat"]),
+        "output": ansi_color(colors["output"]), "next": ansi_color(colors["next"]),
+        **{role: ({"bold": "\033[1m", "dim": "\033[2m", "": ""}[attribute]
+                  + ansi_color(colors[role]))
+           for role, (_, attribute) in TEXT_ROLES.items()},
     }
 
 
@@ -71,7 +103,9 @@ def textual_theme(name: str, colors: dict[str, str]):
     accent = color("accent")
     return Theme(
         name=name, ansi=True, dark=name != "codex-light",
-        **{key: color(key) for key in DEFAULT_COLORS if key not in ("claude", "codex")},
+        **{key: color(key) for key in DEFAULT_COLORS
+           if key not in ({"claude", "codex", "replay", "repeat", "output", "next"}
+                          | (TEXT_ROLES.keys() - {"warning"}))},
         secondary=accent,
         variables={
             **BUILTIN_THEMES["ansi-dark" if name == "codex" else "ansi-light"].variables,
