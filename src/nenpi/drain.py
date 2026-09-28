@@ -1506,7 +1506,9 @@ def _simple_command_shape(tokens: Sequence[str]) -> str:
     # The development wrapper is also commonly present in captured prompts;
     # grouping the underlying command makes `rtk rg` comparable with `rg`.
     while tokens and tokens[0] in ("rtk", "command"):
-        tokens.pop(0)
+        wrapper = tokens.pop(0)
+        if wrapper == "rtk" and tokens and tokens[0] == "proxy":
+            tokens.pop(0)
     if tokens and tokens[0] == "env":
         tokens.pop(0)
         while tokens and ("=" in tokens[0] or tokens[0].startswith("-")):
@@ -1565,6 +1567,14 @@ def command_shape(command: str) -> str:
     if not tokens:
         # Keep a stable fallback for malformed/unterminated shell syntax.
         return "compound: " + escaped_command(command, EXPLAIN_SHAPE_CHARS - 10)
+    inner = list(tokens)
+    while inner and inner[0] in ("rtk", "command"):
+        wrapper = inner.pop(0)
+        if wrapper == "rtk" and inner and inner[0] == "proxy":
+            inner.pop(0)
+    if (len(inner) == 3 and os.path.basename(inner[0]) in ("sh", "bash", "zsh")
+            and re.fullmatch(r"-[a-z]*c[a-z]*", inner[1])):
+        return command_shape(inner[2])
     if "\n" in normalized:
         # shlex treats newlines as whitespace. Split them before tokenizing so
         # `rg foo\nsed bar` cannot silently turn into one `rg` shape.
@@ -1591,6 +1601,8 @@ def explain_command_calls(
     scan: Scan, calls: Sequence[ToolCall]
 ) -> Tuple[List[Dict[str, Any]], List[ToolCall]]:
     """Attach live command text to already-scoped calls, without persistence."""
+    from .tool_activity import _safe_example
+
     wanted = {
         (call.harness, call.call_id, call.session_id, call.source)
         for call in calls
@@ -1613,7 +1625,7 @@ def explain_command_calls(
     for call in calls:
         command = found.get((call.harness, call.call_id, call.session_id, call.source))
         if command:
-            records.append((call, command, command_shape(command)))
+            records.append((call, command, _safe_example(command_shape(command), EXPLAIN_SHAPE_CHARS)))
     grouped = {}  # type: Dict[str, Dict[str, Any]]
     for call, command, shape in records:
         row = grouped.get(shape)
@@ -1638,7 +1650,7 @@ def explain_command_calls(
         row["max_result_chars"] = max(row["max_result_chars"], call.chars)
         row["max_est_tokens"] = max(row["max_est_tokens"], call.est_tokens)
         if len(row["examples"]) < EXPLAIN_MAX_EXAMPLES:
-            example = escaped_command(command)
+            example = _safe_example(command, EXPLAIN_EXAMPLE_CHARS)
             if example not in row["examples"]:
                 row["examples"].append(example)
     for row in grouped.values():
@@ -1656,7 +1668,7 @@ def explain_command_calls(
     for call, command, shape in top_calls:
         top.append(
             {
-                "command": escaped_command(command),
+                "command": _safe_example(command, EXPLAIN_EXAMPLE_CHARS),
                 "shape": shape,
                 "harness": call.harness,
                 "session_id": call.session_id,
@@ -5777,8 +5789,8 @@ def apply_claude_estimate(rows: Sequence[Row], dollars_per_percent: Optional[flo
 
 
 class Painter:
-    def __init__(self, enabled: bool, ascii_only: bool = False):
-        self.enabled = enabled and not os.environ.get("NO_COLOR")
+    def __init__(self, enabled: bool, ascii_only: bool = False, force_color: bool = False):
+        self.enabled = enabled and (force_color or not os.environ.get("NO_COLOR"))
         self.ascii_only = ascii_only
         self.styles = ansi_styles(load_theme()[1]) if self.enabled else ANSI
 
@@ -5805,7 +5817,9 @@ def ascii_output(args: argparse.Namespace) -> bool:
 
 
 def make_painter(args: argparse.Namespace) -> Painter:
-    return Painter(sys.stdout.isatty() and not args.no_color, ascii_output(args))
+    color = getattr(args, "color", "auto")
+    enabled = color == "always" or (color == "auto" and sys.stdout.isatty())
+    return Painter(enabled and not args.no_color, ascii_output(args), force_color=color == "always")
 
 
 def terminal_width(args: argparse.Namespace) -> int:
@@ -6161,6 +6175,9 @@ def scope_flags(args: argparse.Namespace) -> List[str]:
     account = getattr(args, "account", None)
     if account:
         flags += ["--account", str(account)]
+    for attr, flag in (("project", "--project"), ("exclude_project", "--exclude-project")):
+        for value in getattr(args, attr, []) or []:
+            flags += [flag, value]
     return flags
 
 
@@ -6208,9 +6225,9 @@ def pick_id(session_id: str, known: Sequence[str]) -> str:
 
 def footer_painter(args: argparse.Namespace) -> Painter:
     """Color the footer only when stderr is a tty of its own."""
-    if os.environ.get("NO_COLOR"):
-        return Painter(False)
-    return Painter(sys.stderr.isatty() and not getattr(args, "no_color", False))
+    color = getattr(args, "color", "auto")
+    enabled = color == "always" or (color == "auto" and sys.stderr.isatty())
+    return Painter(enabled and not getattr(args, "no_color", False), force_color=color == "always")
 
 
 def footer(args: argparse.Namespace, hints: Sequence[Mapping[str, str]]) -> None:
@@ -6370,11 +6387,20 @@ def tools_hints(
     if not calls or not shown:
         return widen_hints(args, "tool calls")
     top = shown[0]
-    note = hint("", "top tool by measured context: %s (%s over %d calls)"
-                % (top["tool"], format_tokens(top["measured_tokens"]), top["calls"]))
+    ranking = {"calls": "call count", "mean": "mean result size"}.get(getattr(args, "sort", "context"), "total result size")
+    note = hint("", "top tool by %s: %s (%s estimated result tokens over %d calls)"
+                % (ranking, top["tool"], format_tokens(top["est_tokens"]), top["calls"]))
     if session_id:
         session = pick_id(session_id, known)
         busiest = max(calls, key=lambda call: (call.measured, call.prompt)).prompt
+        if getattr(args, "prompt", None) and not getattr(args, "explain", False):
+            return [
+                note,
+                hint(suggest(args, "tools", "--session", session, "--prompt", args.prompt, "--explain"),
+                     "unpack exec activity and rank its associated model usage"),
+                hint(suggest(args, "prompts", "--session", session, "--prompt", args.prompt, "--drilldown"),
+                     "compare root and subagent usage for this prompt"),
+            ]
         return [
             note,
             hint(suggest(args, "tools", "--session", session, "--prompt", busiest),
@@ -6648,6 +6674,8 @@ def prepare(
         with profile_phase("attribute"):
             attribute(analysis.intervals, scan.events["codex"], weights, args, cancellation)
             apply_prompt_drain(analysis, cancellation)
+        from .project_filter import filter_analysis
+        filter_analysis(analysis)
         run.emit("done", message="analysis ready")
         return analysis
     except (ScanCancelled, KeyboardInterrupt):
@@ -7645,9 +7673,13 @@ def command_tools(args: argparse.Namespace) -> int:
     command_shapes = []  # type: List[Dict[str, Any]]
     top_commands = []  # type: List[Dict[str, Any]]
     explained_calls = 0
+    activity = None
     if getattr(args, "explain", False):
+        from .tool_activity import explain_activity
+
         command_shapes, top_commands = explain_command_calls(analysis.scan, calls)
         explained_calls = sum(int(row["calls"]) for row in command_shapes)
+        activity = explain_activity(analysis, calls)
     explain_scope = (
         "selected prompt calls; context_growth_tokens remains session-wide"
         if getattr(args, "prompt", None) is not None
@@ -7690,6 +7722,7 @@ def command_tools(args: argparse.Namespace) -> int:
                         # fields; the nested object carries the scope note.
                         "command_shapes": command_shapes[: args.top] if args.top else command_shapes,
                         "top_commands": top_commands,
+                        "activity": activity,
                     } if getattr(args, "explain", False) else {}),
                     **({
                         "explain": {
@@ -7710,6 +7743,17 @@ def command_tools(args: argparse.Namespace) -> int:
     paint = make_painter(args)
     width = terminal_width(args)
     scope = "session %s" % short_id(session_id) if session_id else "all sessions"
+    if activity and activity["tool_calls"]:
+        from .report_render import render_activity
+
+        print(paint("tool usage - " + scope, "bold", "codex"))
+        print(render_activity(activity, args))
+        if all(call.harness == "codex" for call in calls):
+            flags = ["--session", pick_id(session_id, analysis_session_ids(analysis))] if session_id else []
+            if getattr(args, "prompt", None):
+                flags += ["--prompt", args.prompt]
+            footer(args, [hint(suggest(args, "auto", *flags), "find repeated large-context responses and Shake opportunities")])
+            return 0
     print(paint(
         "tool calls - %s, %d calls, %s est tokens added (estimate: result chars / %d)"
         % (scope, len(calls), format_tokens(sum(call.est_tokens for call in calls)),
@@ -7769,7 +7813,8 @@ def command_tools(args: argparse.Namespace) -> int:
             )
         )
         if not command_shapes:
-            print("no shell command text found in the selected calls")
+            print("no direct shell calls found; commands inside exec are included in the activity report above"
+                  if activity and activity["explained_calls"] else "no shell command text found in the selected calls")
         else:
             print(
                 paint(
@@ -8624,6 +8669,10 @@ def add_common(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--codex-root", action="append", default=[], metavar="PATH",
                         help="a Codex home dir (holds auth.json and sessions/); "
                              "repeatable, replaces config.toml and the defaults")
+    parser.add_argument("--project", action="append", default=[], metavar="PATH",
+                        help="include a project directory and its descendants; repeat for alternatives; quoted globs allowed")
+    parser.add_argument("--exclude-project", action="append", default=[], metavar="PATH",
+                        help="exclude a project directory and its descendants; repeatable; exclusions win")
     parser.add_argument("--account", default=None, metavar="LABEL",
                         help="limit to one account's pool, by root basename "
                              "(e.g. .codex-arcade); see `nenpi config`")
@@ -8647,6 +8696,10 @@ def add_common(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--no-color", action="store_true",
         help="disable ANSI colors, including the scan progress display",
+    )
+    parser.add_argument(
+        "--color", choices=("auto", "always", "never"), default="auto",
+        help="use semantic report colors on a terminal, always (overrides NO_COLOR), or never; --no-color takes precedence",
     )
     parser.add_argument("--ascii", action="store_true",
                         help="draw bars with ASCII; automatic on non-UTF-8 stdout")
@@ -8710,6 +8763,43 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     sub = parser.add_subparsers(dest="command", metavar="COMMAND")
+
+    from .activity_report import command_activities
+
+    activities = sub.add_parser(
+        "activities", help="rank activities and repeated checks across projects (default)",
+        description="Most expensive activities in the last 72 hours, ranked by input processed across harnesses.",
+    )
+    add_common(activities)
+    activities.add_argument("--activity", metavar="NAME", help="inspect an activity by name")
+    activities.add_argument("--session", default=None, metavar="ID_PREFIX")
+    activities.add_argument("--prompt", type=int, default=None, metavar="N")
+    activities.add_argument("--first", action="store_true")
+    activities.set_defaults(handler=command_activities, since="72h", harness="all", top=5)
+    for action in activities._actions:
+        if action.dest == "since":
+            action.help = "include events since this lower bound (default: 72h)"
+        elif action.dest == "top":
+            action.help = "number of activities; 0 shows all (default: 5)"
+
+    from .auto_report import command_auto
+
+    auto = sub.add_parser(
+        "auto", help="find repeated model work and opportunities to reduce usage",
+        description="Rank recent prompts by cumulative input processed, exposing repeated large-context responses even when tool results are tiny.",
+    )
+    add_common(auto)
+    auto.add_argument("--session", default=None, metavar="ID_PREFIX", help="inspect one session")
+    auto.add_argument("--first", action="store_true", help="use the busiest match for an ambiguous session prefix")
+    auto.add_argument("--prompt", type=int, default=None, metavar="N", help="inspect one prompt within --session")
+    auto.set_defaults(handler=command_auto, since="7d", harness="codex", top=5)
+    for action in auto._actions:
+        if action.dest == "since":
+            action.help = "include events since this lower bound (default: 7d)"
+        elif action.dest == "harness":
+            action.help = "transcript source to scan (default: codex)"
+        elif action.dest == "top":
+            action.help = "number of findings to show; 0 shows all (default: 5)"
 
     sessions = sub.add_parser(
         "sessions", help="rank sessions by quota drain",
@@ -8820,7 +8910,8 @@ def build_parser() -> argparse.ArgumentParser:
         description=(
             "Rank tool names by estimated context added. Only tool names and "
             "result sizes are used by default. With --explain, reread live "
-            "transcripts to group Claude Bash and Codex shell command shapes."
+            "transcripts to group shell commands and unpack Codex exec activity, "
+            "ranked by associated model usage."
         ),
         epilog="Example:\n  nenpi tools --since 7d --sort context --top 15",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -8840,7 +8931,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     tools.add_argument(
         "--explain", action="store_true",
-        help="opt in to transient shell command-shape grouping and bounded examples",
+        help="reread live commands and exec code; show activities, model usage, and bounded examples without caching inputs",
     )
     tools.add_argument(
         "--sort", choices=("context", "calls", "mean"), default="context",
@@ -9077,6 +9168,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         from nenpi.settings import migrate_json_store  # type: ignore
     migrate_json_store()
     parser = build_parser()
+    if not arguments or (arguments[0].startswith("-") and arguments[0] not in {"-h", "--help"}):
+        arguments.insert(0, "activities")
     args = parser.parse_args(arguments)
     # Advisory notes belong on a human's stderr, not in a --json run.
     set_notices_enabled(not getattr(args, "json", False))
