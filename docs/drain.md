@@ -94,7 +94,10 @@ so `--json --profile` still pipes cleanly.
 
 `--since` and `--until` window the **events**, not just the session list. A
 session that started weeks ago and ran again this morning reports only this
-morning's tokens; `--whole-session` opts back into its lifetime totals.
+morning's tokens; `--whole-session` opts back into its lifetime totals. Codex
+rollout folders record when a session opened, so Nenpi does not use that date
+to prune range scans: resumed sessions can write recent events into older
+folders.
 
 ### sessions
 
@@ -358,6 +361,13 @@ attributed to the same window instance - the denominator is the interval's
 shares do not have to sum to 100%. A rolled-over window's interval starts
 no earlier than the moment that window opened (`resets_at` minus its length),
 so its drain is never charged to sessions that had already finished.
+
+`windows` reports two different measurements: `peak_used_percent` is the
+highest observed usage snapshot, while `attributed_drain_percent` and each
+`top_sessions[].drain_percent` sum positive usage changes over the requested
+range. A rolling usage counter can fall as older requests expire and rise
+again, so cumulative drain can exceed the observed peak or 100%. These values
+are percentage points of measured drain, not normalized shares of peak usage.
 
 **The attribution cap.** Sparse readings can still make a proportional split
 implausible: the whole jump between two readings is split only across the

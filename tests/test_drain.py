@@ -853,6 +853,7 @@ class MeasuredAttribution(Harness):
         window = payload["windows"][0]
         self.assertEqual(window["window_minutes"], 300)
         self.assertAlmostEqual(window["peak_used_percent"], 14.0, places=6)
+        self.assertAlmostEqual(window["attributed_drain_percent"], 4.0, places=6)
         self.assertEqual(len(window["top_sessions"]), 2)
         self.assertGreater(
             window["top_sessions"][0]["drain_percent"],
@@ -872,6 +873,47 @@ class MeasuredAttribution(Harness):
 
 class DrainIntervalRules(Harness):
     """Unit-level coverage of build_intervals rules (a)/(b)/(c), #16/#17."""
+
+    def write_recent_codex_rollout(
+        self, folder_day: str, session: str, request: float, mtime: float
+    ) -> None:
+        path = self.codex_sessions.joinpath(
+            *folder_day.split("/"), "rollout-%s.jsonl" % session
+        )
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            "\n".join(
+                [
+                    codex_session_meta_line(request - 3600, session, "/home/agent/span"),
+                    codex_task_started_line(request),
+                    codex_turn_context_line(request, "gpt-5.6-sol"),
+                    codex_usage_record_line(
+                        request + 30, session, input_tokens=100_000,
+                        cached_input_tokens=0, output_tokens=10,
+                    ),
+                ]
+            ) + "\n",
+            encoding="utf-8",
+        )
+        os.utime(path, (mtime, mtime))
+
+    def assert_absolute_range_reports_codex_activity(
+        self, since: float, until: float
+    ) -> None:
+        args = [
+            "--harness", "codex", "--json", "--quiet",
+            "--since", iso(since), "--until", iso(until),
+        ]
+        for command in ("sessions", "prompts"):
+            with self.subTest(command=command):
+                result = self.run_tool(
+                    command, *args, extra_env={"TZ": "America/Los_Angeles"}
+                )
+                self.assertEqual(
+                    result.returncode, 0,
+                    result.stderr.decode("utf-8", "replace"),
+                )
+                self.assertEqual(len(json.loads(result.stdout)[command]), 1)
 
     def make_row(self, ts: float, used: float, resets_at: Any,
                 window_minutes: int = 300) -> Dict[str, Any]:
@@ -929,6 +971,47 @@ class DrainIntervalRules(Harness):
         ]
         intervals = QD.build_intervals(rows, 300)
         self.assertEqual(len(intervals), 0)
+
+    def test_cumulative_drain_can_exceed_peak_after_usage_falls_and_rises(self) -> None:
+        now = datetime.fromisoformat("2026-09-30T05:00:00+00:00").timestamp()
+        resets = int(now) + 7 * 86400
+        snapshots = [
+            self.make_row(now, 80.0, resets, window_minutes=10080),
+            self.make_row(now + 60, 20.0, resets, window_minutes=10080),
+            self.make_row(now + 120, 90.0, resets, window_minutes=10080),
+            self.make_row(now + 180, 10.0, resets, window_minutes=10080),
+            self.make_row(now + 240, 90.0, resets, window_minutes=10080),
+        ]
+        intervals = QD.build_intervals(snapshots, 10080)
+        self.assertEqual([interval.drain for interval in intervals], [70.0, 80.0])
+        intervals[0].sessions["older-usage"] = 70.0
+        intervals[1].sessions["newer-usage"] = 80.0
+        scan = QD.Scan()
+        scan.snapshots = snapshots
+
+        windows = QD.codex_window_entries(scan, intervals, None, 10080)
+
+        self.assertEqual(len(windows), 1)
+        self.assertAlmostEqual(windows[0]["peak_used_percent"], 90.0, places=6)
+        self.assertAlmostEqual(windows[0]["attributed_percent"], 150.0, places=6)
+
+    def test_previous_local_day_rollout_is_included_in_absolute_range(self) -> None:
+        since = datetime.fromisoformat("2026-09-30T05:01:46+00:00").timestamp()
+        until = datetime.fromisoformat("2026-09-30T06:01:46+00:00").timestamp()
+        request = since + 4 * 60
+        session = "local-day-rollover-0000-0000-000000000000"
+        self.write_recent_codex_rollout("2026/09/29", session, request, until + 60)
+        self.assert_absolute_range_reports_codex_activity(since, until)
+
+    def test_recent_activity_in_several_days_old_rollout_directory(self) -> None:
+        since = datetime.fromisoformat("2026-09-30T05:01:46+00:00").timestamp()
+        until = datetime.fromisoformat("2026-09-30T06:01:46+00:00").timestamp()
+        request = since + 4 * 60
+        session = "resumed-days-later-0000-000000000000"
+        self.write_recent_codex_rollout(
+            "2026/09/25", session, request, until + 60
+        )
+        self.assert_absolute_range_reports_codex_activity(since, until)
 
     def test_slide_with_unchanged_used_is_not_a_rollover(self) -> None:
         # resets_at drifts (an idle pool re-stamping resets_at = now + 7d)
