@@ -156,7 +156,6 @@ CODEX_MODEL_ALIASES = {
 
 CLAUDE_DATE_SUFFIX = re.compile(r"-20\d{6}$")
 DURATION_ARG = re.compile(r"^(\d+(?:\.\d+)?)([hdwm])$")
-CODEX_DAY_DIR = re.compile(r"/(\d{4})/(\d{2})/(\d{2})/[^/]+$")
 
 CODEX_LINE_MARKERS = (
     b'"session_meta"',
@@ -847,23 +846,17 @@ def claude_transcripts(
             yield path, account_root
 
 
-def codex_day_epoch(path: Path) -> Optional[float]:
-    match = CODEX_DAY_DIR.search(str(path))
-    if not match:
-        return None
-    try:
-        day = datetime(
-            int(match.group(1)), int(match.group(2)), int(match.group(3)), tzinfo=timezone.utc
-        )
-    except ValueError:
-        return None
-    return day.timestamp()
-
-
 def codex_transcripts(
-    roots: Sequence[Path], since: Optional[float], cancellation: Cancellation = None
+    roots: Sequence[Path], cancellation: Cancellation = None
 ) -> Iterator[Tuple[Path, Path]]:
-    """Yield (transcript path, resolved root) for every root's ``sessions`` dir."""
+    """Yield every rollout file under resolved roots.
+
+    The date directory records when a rollout opened, not when its latest
+    event occurred. A session may be resumed days later, and imported roots
+    may use another timezone, so the directory date cannot safely filter a
+    `--since` query. `collect()` applies the file-mtime fast path before it
+    opens or loads a transcript shard.
+    """
     for root in roots:
         leaf = root / "sessions"
         account_root = root
@@ -887,12 +880,6 @@ def codex_transcripts(
                 path = Path(directory) / name
                 if not path.is_file():
                     continue
-                if since is not None:
-                    day = codex_day_epoch(path)
-                    # A rollout directory is named for the day it opened; allow one
-                    # day of slack so a session that spans midnight is not pruned.
-                    if day is not None and day < since - 86400:
-                        continue
                 found.append(path)
         for path in sorted(found):
             check_cancelled(cancellation)
@@ -3089,7 +3076,7 @@ def collect(
             if not getattr(args, "discover", True)
             else resolve_roots("codex", args.codex_root, config)
         )
-        for path, root in codex_transcripts(roots, since, run.cancellation):
+        for path, root in codex_transcripts(roots, run.cancellation):
             add_target(path, "codex", root)
     run.files_seen = len(targets)
     run.emit("discovery", message="found %d transcript files" % len(targets))
@@ -6927,6 +6914,7 @@ def command_windows(args: argparse.Namespace) -> int:
                     "resets_at": entry["resets_at"],
                     "start": entry["start"],
                     "peak_used_percent": entry["peak_used_percent"],
+                    "attributed_drain_percent": entry["attributed_percent"],
                     "unattributed_percent": entry["unattributed_percent"],
                     "top_sessions": top_session_list(entry["sessions"], args.top),
                 }
@@ -6946,7 +6934,7 @@ def command_windows(args: argparse.Namespace) -> int:
         resets_text = local_label(float(resets)) if isinstance(resets, (int, float)) else "-"
         print(
             paint(
-                "window %s min  account %-*s  start %s  resets %s  peak %.1f%%"
+                "window %s min  account %-*s  start %s  resets %s  peak %.1f%%  attributed drain %.1f%%"
                 % (
                     entry["window_minutes"],
                     label_width,
@@ -6954,6 +6942,7 @@ def command_windows(args: argparse.Namespace) -> int:
                     local_label(entry["start"]),
                     resets_text,
                     entry["peak_used_percent"],
+                    entry["attributed_percent"],
                 ),
                 "bold",
             )
@@ -8830,7 +8819,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     windows = sub.add_parser(
         "windows", help="show observed Codex quota windows",
-        description="List observed Codex windows, reset times, peak usage, and attributed sessions.",
+        description=(
+            "List observed Codex windows, reset times, peak usage, and cumulative "
+            "attributed drain. Drain can exceed peak usage when reported usage "
+            "falls and later rises within the selected range."
+        ),
         epilog="Example:\n  nenpi windows --since 30d --window weekly",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
