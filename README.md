@@ -39,6 +39,7 @@ or `nenpi-web` for the browser UI. Add `--json` for structured reports.
 
 - [Usage and configuration](docs/usage.md): installation options, transcript roots, and UI.
 - [Diagnostics](docs/diagnostics.md): activity breakdowns, filters, tools, and Shake savings.
+- [Polling and recipes](docs/polling.md): the shared classification fixture and `nenpi polling` hook calibration.
 - [Themes](docs/themes.md): colors and terminal output.
 - [Quota measurement](docs/drain.md): commands and accounting details.
 - [Benchmarks](docs/bench.md): measure and fit usage weights.

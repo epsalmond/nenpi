@@ -5,7 +5,7 @@ literal targets, scoped by source/thread by the shared repetition detector.
 """
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 import hashlib
 import json
 import os
@@ -14,6 +14,8 @@ from pathlib import Path
 import re
 import shlex
 
+from .command_classification import (LABEL_EXECUTABLES, SHELL_TOOLS, WRITE_TOOLS, Step, merge_steps, result_key,
+                                     tool_leaf, tool_step)
 from .tool_activity import _JS_TOKEN, _object_properties, _source_activity
 
 
@@ -23,6 +25,8 @@ class Operation:
     target: str = ""
     polling: bool = False
     detail: str = ""
+    # Polling/recipe features (opaque hashes and a command-family label only).
+    step: Step | None = field(default=None, compare=False)
 
 
 @dataclass
@@ -157,10 +161,23 @@ def shell_operation(command):
                 identity.append(word)
         if len(identity) > 2 and identity[1] == "run" and identity[2] in {"view", "watch"}:
             identity[2] = "status"
-    return Operation(activity, fingerprint(identity) if polling or (activity == "Reading/searching code" and executable not in {"sed", "awk"}) else "", polling, "shell: " + executable if re.fullmatch(r"[A-Za-z][A-Za-z0-9_.-]{0,63}", executable) else "Shell command")
+    return Operation(activity, fingerprint(identity) if polling or (activity == "Reading/searching code" and executable not in {"sed", "awk"}) else "", polling, "shell: " + executable if executable in LABEL_EXECUTABLES else "Shell command")
 
 
-def operation(name, args, *, target_known=True):
+def operation(name, args, *, target_known=True, cwd=""):
+    return [replace(op, step=_step(name, args, target_known, cwd)) for op in _operation(name, args, target_known=target_known)]
+
+
+def _step(name, args, target_known, cwd):
+    leaf = tool_leaf(name)
+    if not target_known:
+        return Step(write=leaf in WRITE_TOOLS)
+    step = tool_step(name, args, cwd)
+    # Tool names stay out of the cache; reports label non-shell steps by activity.
+    return step if leaf in SHELL_TOOLS else replace(step, label="")
+
+
+def _operation(name, args, *, target_known=True):
     leaf = re.split(r"\.|__", name)[-1].lower()
     args = args if isinstance(args, dict) else {}
     if leaf in {"bash", "exec_command", "shell", "shell_command", "local_shell", "local_shell_call"}:
@@ -229,7 +246,8 @@ def codex_operations(name, payload, item):
     if name.split(".")[-1] == "exec" and item == "custom_tool_call":
         return exec_operations(payload.get("input"))
     if item == "local_shell_call":
-        return [shell_operation(d.command_from_payload(payload, item))]
+        command = d.command_from_payload(payload, item)
+        return [replace(shell_operation(command), step=tool_step(item, {"command": command}))]
     args = payload.get("arguments", payload.get("input", {}))
     if isinstance(args, str):
         try:
@@ -258,11 +276,61 @@ def claude_batches(path):
                 content = message.get("content") or []
                 for block in content if isinstance(content, list) else []:
                     if isinstance(block, dict) and block.get("type") == "tool_use" and block.get("id"):
-                        batch[block["id"]] = (operation(block.get("name", ""), block.get("input")), [], block.get("name", ""))
+                        batch[block["id"]] = (operation(block.get("name", ""), block.get("input"), cwd=record.get("cwd") or ""), [], block.get("name", ""))
                 if rid:
                     yield rid, batch
     except OSError:
         return
+
+
+def _result_text(content):
+    if isinstance(content, list):
+        return "\n".join(str(b.get("text", "")) if isinstance(b, dict) else str(b) for b in content)
+    return content
+
+
+def result_keys(harness, path):
+    """Masked-result hashes by call ID; result bodies are never kept."""
+    from . import drain as d
+    keys = {}
+    markers = ('"tool_result"',) if harness == "claude" else ('_call_output"',)
+    try:
+        with Path(path).open(encoding="utf-8") as stream:
+            for raw in stream:
+                if not any(marker in raw for marker in markers):
+                    continue
+                try:
+                    record = json.loads(raw)
+                except ValueError:
+                    continue
+                if not isinstance(record, dict):
+                    continue
+                if harness == "claude":
+                    content = (record.get("message") or {}).get("content") if record.get("type") == "user" else None
+                    for block in content if isinstance(content, list) else []:
+                        if isinstance(block, dict) and block.get("type") == "tool_result" and block.get("tool_use_id"):
+                            keys[block["tool_use_id"]] = result_key(_result_text(block.get("content", "")))
+                else:
+                    payload = record.get("payload")
+                    if (record.get("type") == "response_item" and isinstance(payload, dict)
+                            and payload.get("type") in d.CODEX_TOOL_OUTPUT_ITEMS and payload.get("call_id")):
+                        keys[payload["call_id"]] = result_key(_result_text(payload.get("output", "")))
+    except OSError:
+        pass
+    return keys
+
+
+def _cached_operation(op):
+    step = op.get("step")
+    return Operation(**dict(op, step=Step(**step) if isinstance(step, dict) else None))
+
+
+def _one_step_per_call(ops, result):
+    """The call's step rides on its first operation; the rest carry none (Codex exec runs several tools)."""
+    if not ops:
+        return ops
+    step = merge_steps([op.step or Step() for op in ops], result)
+    return [replace(ops[0], step=step)] + [replace(op, step=None) for op in ops[1:]]
 
 
 def operation_batches(harness, path):
@@ -274,16 +342,19 @@ def operation_batches(harness, path):
     except OSError:
         return []
     signature = [before.st_size, before.st_mtime_ns, before.st_ctime_ns]
-    destination = d.cache_dir() / "activities-v4" / (fingerprint([harness, str(source.resolve())]) + ".json")
+    destination = d.cache_dir() / "activities-v6" / (fingerprint([harness, str(source.resolve())]) + ".json")
     try:
         if destination.stat().st_size <= 64 * 1024 * 1024:
             cached = json.loads(destination.read_text())
             if cached["signature"] == signature:
-                return [(rid, {cid: ([Operation(**op) for op in ops], [], "")
+                return [(rid, {cid: ([_cached_operation(op) for op in ops], [], "")
                     for cid, ops in batch.items()}) for rid, batch in cached["batches"]]
     except (OSError, ValueError, KeyError, TypeError):
         pass
     batches = list(claude_batches(path) if harness == "claude" else _source_activity(path, codex_operations))
+    results = result_keys(harness, path)
+    batches = [(rid, {cid: (_one_step_per_call(ops, results.get(cid)), examples, name)
+                      for cid, (ops, examples, name) in batch.items()}) for rid, batch in batches]
     encoded = [[rid, {cid: [asdict(op) for op in ops] for cid, (ops, _, _) in batch.items()}]
                for rid, batch in batches if rid and batch]
     temporary = None
