@@ -213,10 +213,11 @@ def build_report(analysis, args):
         recipes=RECIPES)
     report["next"] = [dict(cmd=scoped_command(analysis, "polling", "--json"), why="Full JSON with sessions and prompts"),
         dict(cmd=scoped_command(analysis, "activities"), why="Rank all activities")]
+    from . import drain as d
+    known = d.analysis_session_ids(analysis)
     for row in report["sessions"]:
-        from . import drain as d
         row["inspect"] = scoped_command(analysis, "auto", "--harness", row["harness"],
-            "--session", d.pick_id(row["session_id"], d.analysis_session_ids(analysis)))
+            "--session", d.pick_id(row["session_id"], known))
     return report
 
 
