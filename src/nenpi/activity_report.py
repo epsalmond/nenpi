@@ -63,6 +63,13 @@ def bucket_responses(responses):
     return sorted(buckets.values(), key=lambda row: (-row["input_tokens"], row["activity"]))
 
 
+def _polling_section(responses, top):
+    """Polling and recipe flags keyed by session and prompt (docs/polling.md)."""
+    from .polling_report import build
+    report = build(responses, top=top, sweep=False)
+    return {key: report[key] for key in ("threshold", "window_steps", "summary", "by_kind", "by_recipe", "sessions")}
+
+
 def scoped_command(analysis, command, *flags):
     from . import drain as d
     flags = list(flags)
@@ -125,6 +132,7 @@ def build_report(analysis, session_key=None, prompt_index=None):
             key=lambda b: -b["repeated_input_tokens"])[:3],
         total_activities=len(matching), shake=shakes,
         estimated_shake_savings=estimates, savings_policy=POLICY,
+        polling=_polling_section(responses, analysis.args.top),
         next=[dict(cmd=scoped_command(analysis, "sessions"), why="See sessions"),
               dict(cmd=scoped_command(analysis, "activities", "--top", "0"), why="See all activities")],
     )

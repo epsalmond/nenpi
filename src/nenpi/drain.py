@@ -8771,6 +8771,26 @@ def build_parser() -> argparse.ArgumentParser:
         elif action.dest == "top":
             action.help = "number of activities; 0 shows all (default: 5)"
 
+    from .polling_report import command_polling
+
+    polling = sub.add_parser(
+        "polling", help="what the polling/recipe advisory would have flagged, and its cost",
+        description="Replay the shared polling and recipe classification (docs/polling.md) over recent "
+                    "transcripts: totals by kind and recipe, top patterns by input, and a threshold sweep "
+                    "for calibrating burn-governor.",
+    )
+    add_common(polling)
+    polling.add_argument("--threshold", type=int, default=3, metavar="N",
+                         help="same signature or source this many times flags (default: 3)")
+    polling.add_argument("--window-steps", type=int, default=30, metavar="N",
+                         help="earlier tool calls considered since the last write (default: 30)")
+    polling.set_defaults(handler=command_polling, since="7d", harness="all", top=10)
+    for action in polling._actions:
+        if action.dest == "since":
+            action.help = "include events since this lower bound (default: 7d)"
+        elif action.dest == "top":
+            action.help = "rows per list; 0 shows all (default: 10)"
+
     from .auto_report import command_auto
 
     auto = sub.add_parser(

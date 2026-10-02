@@ -107,7 +107,7 @@ class Activities(Harness):
         first = self.run_json("--json")
         second = self.run_json("--json")
         self.assertEqual(first, second)
-        caches = list((self.root / "cache" / "activities-v4").glob("*.json"))
+        caches = list((self.root / "cache" / "activities-v5").glob("*.json"))
         self.assertTrue(caches)
         for cache in caches:
             text = cache.read_text()
