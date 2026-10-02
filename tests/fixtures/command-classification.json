@@ -460,10 +460,12 @@
       "options": {"threshold": 2},
       "steps": [
         {"tool": "Bash", "command": "gh pr checks 12", "cwd": "/repo", "result": "pending"},
+        {"tool": "Bash", "command": "gh pr checks 12", "cwd": "/repo", "result": "pending"},
         {"tool": "Bash", "command": "gh pr checks 12", "cwd": "/repo"}
       ],
       "expect": [
         {"polling": false, "kind": "none", "recipe_id": null},
+        {"polling": true, "kind": "watch", "recipe_id": "wait-for-status"},
         {"polling": true, "kind": "pure_poll", "recipe_id": "wait-for-status"}
       ]
     }
