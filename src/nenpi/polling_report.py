@@ -55,7 +55,9 @@ def flag_responses(responses, threshold=THRESHOLD, window_steps=WINDOW_STEPS):
                     label=step.label or activity or "unknown", pattern=step.source if verdict.recipe_id and not verdict.polling else step.signature)
             if verdict.kind == "pure_poll" or (verdict.kind == "watch" and record["kind"] == "none"):
                 record["kind"] = verdict.kind
-            record["recipe_id"] = record["recipe_id"] or verdict.recipe_id
+            if verdict.recipe_id and not record["recipe_id"]:
+                # Label a mixed response by the step that names the script to use.
+                record.update(recipe_id=verdict.recipe_id, label=step.label or record["label"])
         flagged.extend(by_response.values())
     return flagged
 
@@ -67,14 +69,17 @@ def _totals(flagged, responses):
     summary = dict(_empty(), scope=total)
     by_kind = {kind: _empty() for kind in ("pure_poll", "watch", "recipe_only")}
     by_recipe = {recipe: _empty() for recipe in RECIPES}
+    by_harness = {}
     for f in flagged:
         r = f["response"]
         _add(summary, r)
+        _add(by_harness.setdefault(r.harness, _empty()), r)
         _add(by_kind[f["kind"] if f["kind"] != "none" else "recipe_only"], r)
         if f["recipe_id"]:
             _add(by_recipe[f["recipe_id"]], r)
     for key in ("responses", "input_tokens", "weighted_units"):
         summary[key + "_share"] = summary[key] / total[key] if total[key] else None
+    summary["by_harness"] = by_harness
     return summary, by_kind, by_recipe
 
 
@@ -103,14 +108,20 @@ def _advisory(flagged):
         r = f["response"]
         runs[(r.harness, r.session, f["label"], f["pattern"])].append(f)
     counts = sorted(len(v) for v in runs.values())
-    after = _empty()
+    after, gaps = _empty(), []
     for rows in runs.values():
-        for f in sorted(rows, key=lambda f: f["response"].timestamp)[1:]:
+        rows = sorted(rows, key=lambda f: f["response"].timestamp)
+        for before, f in zip(rows, rows[1:]):
             _add(after, f["response"])
-    return dict(session_patterns=len(counts),
-        flags_per_pattern=dict(median=statistics.median(counts) if counts else 0,
-            p90=counts[int(0.9 * (len(counts) - 1))] if counts else 0, max=counts[-1] if counts else 0),
-        after_first_advisory=after)
+            gaps.append(f["response"].timestamp - before["response"].timestamp)
+    return dict(session_patterns=len(counts), flags_per_pattern=_spread(counts),
+        seconds_between_flags=_spread(sorted(round(g) for g in gaps)), after_first_advisory=after)
+
+
+def _spread(values):
+    if not values:
+        return dict(median=0, p90=0, max=0)
+    return dict(median=statistics.median(values), p90=values[int(0.9 * (len(values) - 1))], max=values[-1])
 
 
 def _by_session(flagged, top):
@@ -227,7 +238,9 @@ def render(report):
         scope["since"] or "start", report["threshold"], report["window_steps"]),
         "  %d responses (%s of %d), input %s (%s), %.2f weighted units (%s)" % (
             s["responses"], _share(s["responses_share"]), s["scope"]["responses"], _tokens(s["input_tokens"]),
-            _share(s["input_tokens_share"]), s["weighted_units"], _share(s["weighted_units_share"])), ""]
+            _share(s["input_tokens_share"]), s["weighted_units"], _share(s["weighted_units_share"])),
+        "  " + ", ".join("%s %d resp / %s / %.2f units" % (h, row["responses"], _tokens(row["input_tokens"]),
+            row["weighted_units"]) for h, row in sorted(s["by_harness"].items())), ""]
     lines.append("  %-22s %9s %10s %10s" % ("by kind", "responses", "input", "units"))
     for name, row in report["by_kind"].items():
         lines.append("  %-22s %9d %10s %10.2f" % (name, row["responses"], _tokens(row["input_tokens"]), row["weighted_units"]))
@@ -244,7 +257,9 @@ def render(report):
               " later flags %d responses, input %s, %.2f units" % (
                   advisory["session_patterns"], advisory["flags_per_pattern"]["median"],
                   advisory["flags_per_pattern"]["p90"], advisory["flags_per_pattern"]["max"],
-                  after["responses"], _tokens(after["input_tokens"]), after["weighted_units"])]
+                  after["responses"], _tokens(after["input_tokens"]), after["weighted_units"]),
+              "  seconds between repeat flags: median %s / p90 %s" % (
+                  advisory["seconds_between_flags"]["median"], advisory["seconds_between_flags"]["p90"])]
     if report.get("threshold_sweep"):
         lines.append("  threshold sweep: " + ", ".join("%d → %d resp / %s" % (
             row["threshold"], row["responses"], _tokens(row["input_tokens"])) for row in report["threshold_sweep"]))

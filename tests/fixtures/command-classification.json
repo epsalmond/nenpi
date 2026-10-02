@@ -314,6 +314,21 @@
       ]
     },
     {
+      "name": "process-wait-output-ids-are-masked",
+      "steps": [
+        {"tool": "write_stdin", "input": {"session_id": 9, "chars": ""}, "result": "Chunk ID: 04237c\nWall time: 30.0 seconds\nOutput:\n"},
+        {"tool": "write_stdin", "input": {"session_id": 9, "chars": ""}, "result": "Chunk ID: a9f3e1\nWall time: 30.1 seconds\nOutput:\n"},
+        {"tool": "write_stdin", "input": {"session_id": 9, "chars": ""}, "result": "Chunk ID: 5b0d2f\nWall time: 30.0 seconds\nOutput:\ntests passed\n"},
+        {"tool": "write_stdin", "input": {"session_id": 9, "chars": ""}}
+      ],
+      "expect": [
+        {"polling": false, "kind": "none", "recipe_id": null},
+        {"polling": false, "kind": "none", "recipe_id": null},
+        {"polling": true, "kind": "pure_poll", "recipe_id": null},
+        {"polling": true, "kind": "watch", "recipe_id": null}
+      ]
+    },
+    {
       "name": "process-input-is-not-polling",
       "steps": [
         {"tool": "write_stdin", "input": {"session_id": 7, "chars": "y\n"}, "result": ""},

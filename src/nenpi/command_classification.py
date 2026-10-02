@@ -70,13 +70,16 @@ def digest(value):
     return hashlib.sha256(json.dumps(value, sort_keys=True, ensure_ascii=True, default=str).encode()).hexdigest()[:24]
 
 
+HEX_ID = re.compile(r"\b(?=[0-9a-f]*[0-9])[0-9a-f]{6,}\b")
+
+
 def result_key(text):
-    """Results compare equal after masking digit runs and collapsing whitespace."""
+    """Results compare equal after masking hex IDs and digit runs, collapsing whitespace."""
     if text is None:
         return None
     if not isinstance(text, str):
         text = json.dumps(text, sort_keys=True, default=str)
-    return digest(" ".join(re.sub(r"\d+", "0", text).split()))
+    return digest(" ".join(re.sub(r"\d+", "0", HEX_ID.sub("0", text)).split()))
 
 
 def split_statements(command):
