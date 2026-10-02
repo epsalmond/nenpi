@@ -14,7 +14,8 @@ from pathlib import Path
 import re
 import shlex
 
-from .command_classification import SHELL_TOOLS, WRITE_TOOLS, Step, result_key, tool_leaf, tool_step
+from .command_classification import (LABEL_EXECUTABLES, SHELL_TOOLS, WRITE_TOOLS, Step, merge_steps, result_key,
+                                     tool_leaf, tool_step)
 from .tool_activity import _JS_TOKEN, _object_properties, _source_activity
 
 
@@ -160,7 +161,7 @@ def shell_operation(command):
                 identity.append(word)
         if len(identity) > 2 and identity[1] == "run" and identity[2] in {"view", "watch"}:
             identity[2] = "status"
-    return Operation(activity, fingerprint(identity) if polling or (activity == "Reading/searching code" and executable not in {"sed", "awk"}) else "", polling, "shell: " + executable if re.fullmatch(r"[A-Za-z][A-Za-z0-9_.-]{0,63}", executable) else "Shell command")
+    return Operation(activity, fingerprint(identity) if polling or (activity == "Reading/searching code" and executable not in {"sed", "awk"}) else "", polling, "shell: " + executable if executable in LABEL_EXECUTABLES else "Shell command")
 
 
 def operation(name, args, *, target_known=True, cwd=""):
@@ -324,6 +325,14 @@ def _cached_operation(op):
     return Operation(**dict(op, step=Step(**step) if isinstance(step, dict) else None))
 
 
+def _one_step_per_call(ops, result):
+    """The call's step rides on its first operation; the rest carry none (Codex exec runs several tools)."""
+    if not ops:
+        return ops
+    step = merge_steps([op.step or Step() for op in ops], result)
+    return [replace(ops[0], step=step)] + [replace(op, step=None) for op in ops[1:]]
+
+
 def operation_batches(harness, path):
     """Cache only classifications and opaque identities; invalidate on source change."""
     from . import drain as d
@@ -333,7 +342,7 @@ def operation_batches(harness, path):
     except OSError:
         return []
     signature = [before.st_size, before.st_mtime_ns, before.st_ctime_ns]
-    destination = d.cache_dir() / "activities-v5" / (fingerprint([harness, str(source.resolve())]) + ".json")
+    destination = d.cache_dir() / "activities-v6" / (fingerprint([harness, str(source.resolve())]) + ".json")
     try:
         if destination.stat().st_size <= 64 * 1024 * 1024:
             cached = json.loads(destination.read_text())
@@ -344,8 +353,7 @@ def operation_batches(harness, path):
         pass
     batches = list(claude_batches(path) if harness == "claude" else _source_activity(path, codex_operations))
     results = result_keys(harness, path)
-    batches = [(rid, {cid: ([replace(op, step=replace(op.step, result=results.get(cid))) if op.step else op
-                            for op in ops], examples, name)
+    batches = [(rid, {cid: (_one_step_per_call(ops, results.get(cid)), examples, name)
                       for cid, (ops, examples, name) in batch.items()}) for rid, batch in batches]
     encoded = [[rid, {cid: [asdict(op) for op in ops] for cid, (ops, _, _) in batch.items()}]
                for rid, batch in batches if rid and batch]

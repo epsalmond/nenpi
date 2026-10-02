@@ -8,7 +8,7 @@ from collections import defaultdict
 import json
 import statistics
 
-from .command_classification import RECIPES, THRESHOLD, WINDOW_STEPS, Step, classify
+from .command_classification import RECIPES, THRESHOLD, WINDOW_STEPS, classify
 
 SWEEP = (2, 3, 4, 5)
 MECHANICAL_MIN_RESPONSES = 6
@@ -27,6 +27,11 @@ def _add(row, r):
     row["weighted_units"] += r.usage
 
 
+def _steps(r):
+    """One step per tool call: normalize puts each call's step on its first operation."""
+    return [op.step for op in r.operations if op.step is not None]
+
+
 def _sequences(responses):
     """Steps per thread and prompt in transcript order; unknown threads are left out."""
     groups = defaultdict(list)
@@ -35,7 +40,7 @@ def _sequences(responses):
             groups[(r.harness, r.session, r.thread, r.prompt)].append(r)
     for key, rows in groups.items():
         rows.sort(key=lambda r: (r.timestamp, r.response_id))
-        owners = [(r, op.step or Step()) for r in rows for op in r.operations]
+        owners = [(r, step) for r in rows for step in _steps(r)]
         yield key, rows, owners
 
 
@@ -157,7 +162,7 @@ def mechanical_runs(responses, top, window_steps=WINDOW_STEPS):
     for _key, rows, _owners in _sequences(responses):
         run = []
         for r in rows + [None]:
-            steps = [op.step or Step() for op in r.operations] if r else []
+            steps = _steps(r) if r else []
             small = r is not None and steps and sum(t for _ts, t in r.results) <= MECHANICAL_SMALL_RESULT_TOKENS
             if r is not None and small and not any(s.write for s in steps):
                 run.append(r)
@@ -167,7 +172,7 @@ def mechanical_runs(responses, top, window_steps=WINDOW_STEPS):
             run = []
     rows = []
     for run in found:
-        steps = [op.step or Step() for r in run for op in r.operations]
+        steps = [step for r in run for step in _steps(r)]
         signatures = [s.signature for s in steps if s.signature]
         distinct = len(set(signatures)) / len(signatures) if signatures else 0.0
         labels = []
