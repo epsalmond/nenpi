@@ -1,0 +1,471 @@
+{
+  "schema_version": 1,
+  "about": "Shared polling and recipe classification cases. nenpi tests and management-plane scripts/burn-governor (which vendors this file) must both pass every case. Contract and rules: docs/polling.md. Cases assert classification only, never normalized signatures.",
+  "schema": {
+    "defaults": "threshold and window_steps used unless a case sets options",
+    "cases[].steps": "ordered tool calls in one thread and one prompt",
+    "cases[].steps[].tool": "harness tool name; Bash is a shell step, Edit/Write/MultiEdit/NotebookEdit/apply_patch are writes, anything else is a generic tool",
+    "cases[].steps[].command": "shell steps only: the literal command text",
+    "cases[].steps[].cwd": "shell steps only: working directory",
+    "cases[].steps[].input": "non-shell steps only: the tool input object",
+    "cases[].steps[].result": "optional tool-result text; absent means unknown",
+    "cases[].expect": "one classification per step, judged before that step runs: {polling: bool, kind: pure_poll|watch|none, recipe_id: wait-for-status|merge-pr-when-green|query-logs|null}"
+  },
+  "defaults": {"threshold": 3, "window_steps": 30},
+  "recipes": {
+    "wait-for-status": "scripts/wait-for-status",
+    "merge-pr-when-green": "scripts/merge-pr-when-green",
+    "query-logs": "scripts/query-logs"
+  },
+  "cases": [
+    {
+      "name": "ci-checks-identical-results-pure-poll",
+      "steps": [
+        {"tool": "Bash", "command": "gh pr checks 12", "cwd": "/repo", "result": "build\tpending\ntest\tpending"},
+        {"tool": "Bash", "command": "gh pr checks 12", "cwd": "/repo", "result": "build\tpending\ntest\tpending"},
+        {"tool": "Bash", "command": "gh pr checks 12", "cwd": "/repo"}
+      ],
+      "expect": [
+        {"polling": false, "kind": "none", "recipe_id": null},
+        {"polling": false, "kind": "none", "recipe_id": null},
+        {"polling": true, "kind": "pure_poll", "recipe_id": "wait-for-status"}
+      ]
+    },
+    {
+      "name": "ci-checks-changing-results-watch",
+      "steps": [
+        {"tool": "Bash", "command": "gh pr checks 12", "cwd": "/repo", "result": "build\tpending\ntest\tpending"},
+        {"tool": "Bash", "command": "gh pr checks 12", "cwd": "/repo", "result": "build\tpass\ntest\tpending"},
+        {"tool": "Bash", "command": "gh pr checks 12", "cwd": "/repo", "result": "build\tpass\ntest\tpass"},
+        {"tool": "Bash", "command": "gh pr checks 12", "cwd": "/repo"}
+      ],
+      "expect": [
+        {"polling": false, "kind": "none", "recipe_id": null},
+        {"polling": false, "kind": "none", "recipe_id": null},
+        {"polling": true, "kind": "watch", "recipe_id": "wait-for-status"},
+        {"polling": true, "kind": "watch", "recipe_id": "wait-for-status"}
+      ]
+    },
+    {
+      "name": "ci-elapsed-time-digits-do-not-count-as-change",
+      "steps": [
+        {"tool": "Bash", "command": "gh pr checks 12", "cwd": "/repo", "result": "build\tpending\t1m2s"},
+        {"tool": "Bash", "command": "gh pr checks 12", "cwd": "/repo", "result": "build\tpending\t1m47s"},
+        {"tool": "Bash", "command": "gh pr checks 12", "cwd": "/repo"}
+      ],
+      "expect": [
+        {"polling": false, "kind": "none", "recipe_id": null},
+        {"polling": false, "kind": "none", "recipe_id": null},
+        {"polling": true, "kind": "pure_poll", "recipe_id": "wait-for-status"}
+      ]
+    },
+    {
+      "name": "ci-recent-results-decide-kind",
+      "steps": [
+        {"tool": "Bash", "command": "gh run view 345", "cwd": "/repo", "result": "queued"},
+        {"tool": "Bash", "command": "gh run view 345", "cwd": "/repo", "result": "in_progress"},
+        {"tool": "Bash", "command": "gh run view 345", "cwd": "/repo", "result": "in_progress"},
+        {"tool": "Bash", "command": "gh run view 345", "cwd": "/repo"}
+      ],
+      "expect": [
+        {"polling": false, "kind": "none", "recipe_id": null},
+        {"polling": false, "kind": "none", "recipe_id": null},
+        {"polling": true, "kind": "watch", "recipe_id": "wait-for-status"},
+        {"polling": true, "kind": "pure_poll", "recipe_id": "wait-for-status"}
+      ]
+    },
+    {
+      "name": "ci-unknown-results-are-watch",
+      "steps": [
+        {"tool": "Bash", "command": "gh run view 345", "cwd": "/repo"},
+        {"tool": "Bash", "command": "gh run view 345", "cwd": "/repo"},
+        {"tool": "Bash", "command": "gh run view 345", "cwd": "/repo"}
+      ],
+      "expect": [
+        {"polling": false, "kind": "none", "recipe_id": null},
+        {"polling": false, "kind": "none", "recipe_id": null},
+        {"polling": true, "kind": "watch", "recipe_id": "wait-for-status"}
+      ]
+    },
+    {
+      "name": "ci-output-format-flags-and-wrappers-ignored",
+      "steps": [
+        {"tool": "Bash", "command": "gh pr view 12 --json state --jq .state", "cwd": "/repo", "result": "OPEN"},
+        {"tool": "Bash", "command": "rtk proxy gh pr view 12 --json statusCheckRollup", "cwd": "/repo", "result": "{\"statusCheckRollup\":[{\"state\":\"PENDING\"}]}"},
+        {"tool": "Bash", "command": "bash -lc 'gh pr view 12 --json state'", "cwd": "/repo"}
+      ],
+      "expect": [
+        {"polling": false, "kind": "none", "recipe_id": null},
+        {"polling": false, "kind": "none", "recipe_id": null},
+        {"polling": true, "kind": "watch", "recipe_id": "wait-for-status"}
+      ]
+    },
+    {
+      "name": "ci-mixed-subcommands-same-pr-is-recipe-not-poll",
+      "steps": [
+        {"tool": "Bash", "command": "gh pr checks 12", "cwd": "/repo", "result": "build\tpending"},
+        {"tool": "Bash", "command": "gh pr view 12 --json mergeable", "cwd": "/repo", "result": "MERGEABLE"},
+        {"tool": "Bash", "command": "gh pr checks 12", "cwd": "/repo"}
+      ],
+      "expect": [
+        {"polling": false, "kind": "none", "recipe_id": null},
+        {"polling": false, "kind": "none", "recipe_id": null},
+        {"polling": false, "kind": "none", "recipe_id": "wait-for-status"}
+      ]
+    },
+    {
+      "name": "ci-sweep-of-distinct-prs-not-flagged",
+      "steps": [
+        {"tool": "Bash", "command": "gh pr view 1", "cwd": "/repo"},
+        {"tool": "Bash", "command": "gh pr view 2", "cwd": "/repo"},
+        {"tool": "Bash", "command": "gh pr view 3", "cwd": "/repo"}
+      ],
+      "expect": [
+        {"polling": false, "kind": "none", "recipe_id": null},
+        {"polling": false, "kind": "none", "recipe_id": null},
+        {"polling": false, "kind": "none", "recipe_id": null}
+      ]
+    },
+    {
+      "name": "ci-sleep-between-checks-is-still-polling",
+      "steps": [
+        {"tool": "Bash", "command": "sleep 30 && gh pr checks 12", "cwd": "/repo", "result": "build\tpending"},
+        {"tool": "Bash", "command": "sleep 60 && gh pr checks 12", "cwd": "/repo", "result": "build\tpending"},
+        {"tool": "Bash", "command": "sleep 30; gh pr checks 12", "cwd": "/repo"}
+      ],
+      "expect": [
+        {"polling": false, "kind": "none", "recipe_id": null},
+        {"polling": false, "kind": "none", "recipe_id": null},
+        {"polling": true, "kind": "pure_poll", "recipe_id": "wait-for-status"}
+      ]
+    },
+    {
+      "name": "bare-sleeps-are-polling-without-recipe",
+      "steps": [
+        {"tool": "Bash", "command": "sleep 60", "cwd": "/repo", "result": ""},
+        {"tool": "Bash", "command": "sleep 120", "cwd": "/repo", "result": ""},
+        {"tool": "Bash", "command": "sleep 60", "cwd": "/repo"}
+      ],
+      "expect": [
+        {"polling": false, "kind": "none", "recipe_id": null},
+        {"polling": false, "kind": "none", "recipe_id": null},
+        {"polling": true, "kind": "pure_poll", "recipe_id": null}
+      ]
+    },
+    {
+      "name": "excluded-watch-flag-and-gh-run-watch",
+      "steps": [
+        {"tool": "Bash", "command": "gh pr checks 12 --watch", "cwd": "/repo", "result": "ok"},
+        {"tool": "Bash", "command": "gh pr checks 12 --watch", "cwd": "/repo", "result": "ok"},
+        {"tool": "Bash", "command": "gh pr checks 12 --watch", "cwd": "/repo", "result": "ok"},
+        {"tool": "Bash", "command": "gh run watch 345 --exit-status", "cwd": "/repo", "result": "ok"},
+        {"tool": "Bash", "command": "gh run watch 345 --exit-status", "cwd": "/repo", "result": "ok"},
+        {"tool": "Bash", "command": "gh run watch 345 --exit-status", "cwd": "/repo"}
+      ],
+      "expect": [
+        {"polling": false, "kind": "none", "recipe_id": null},
+        {"polling": false, "kind": "none", "recipe_id": null},
+        {"polling": false, "kind": "none", "recipe_id": null},
+        {"polling": false, "kind": "none", "recipe_id": null},
+        {"polling": false, "kind": "none", "recipe_id": null},
+        {"polling": false, "kind": "none", "recipe_id": null}
+      ]
+    },
+    {
+      "name": "excluded-recommended-scripts",
+      "steps": [
+        {"tool": "Bash", "command": "scripts/wait-for-status --pr 12", "cwd": "/repo", "result": "success"},
+        {"tool": "Bash", "command": "scripts/wait-for-status --pr 12", "cwd": "/repo", "result": "success"},
+        {"tool": "Bash", "command": "scripts/wait-for-status --pr 12", "cwd": "/repo", "result": "success"},
+        {"tool": "Bash", "command": "~/git/management-plane/scripts/query-logs --container traefik --last 1h", "cwd": "/repo", "result": "0 lines"},
+        {"tool": "Bash", "command": "~/git/management-plane/scripts/query-logs --container traefik --last 1h", "cwd": "/repo", "result": "0 lines"},
+        {"tool": "Bash", "command": "~/git/management-plane/scripts/query-logs --container traefik --last 1h", "cwd": "/repo", "result": "0 lines"},
+        {"tool": "Bash", "command": "cd /repo && scripts/merge-pr-when-green 12", "cwd": "/repo"},
+        {"tool": "Bash", "command": "gh pr merge 12 --squash", "cwd": "/repo"}
+      ],
+      "expect": [
+        {"polling": false, "kind": "none", "recipe_id": null},
+        {"polling": false, "kind": "none", "recipe_id": null},
+        {"polling": false, "kind": "none", "recipe_id": null},
+        {"polling": false, "kind": "none", "recipe_id": null},
+        {"polling": false, "kind": "none", "recipe_id": null},
+        {"polling": false, "kind": "none", "recipe_id": null},
+        {"polling": false, "kind": "none", "recipe_id": null},
+        {"polling": false, "kind": "none", "recipe_id": null}
+      ]
+    },
+    {
+      "name": "excluded-sleeps-inside-scripts",
+      "steps": [
+        {"tool": "Bash", "command": "while ! gh pr checks 12; do sleep 30; done", "cwd": "/repo", "result": "ok"},
+        {"tool": "Bash", "command": "while ! gh pr checks 12; do sleep 30; done", "cwd": "/repo", "result": "ok"},
+        {"tool": "Bash", "command": "while ! gh pr checks 12; do sleep 30; done", "cwd": "/repo", "result": "ok"},
+        {"tool": "Bash", "command": "for i in 1 2 3; do journalctl -u traefik -n 5; sleep 10; done", "cwd": "/repo"},
+        {"tool": "Bash", "command": "python3 - <<'EOF'\nimport time, subprocess\nwhile subprocess.call(['gh', 'pr', 'checks', '12']):\n    time.sleep(30)\nEOF", "cwd": "/repo"},
+        {"tool": "Bash", "command": "until docker logs web | grep -q ready; do sleep 5; done", "cwd": "/repo"}
+      ],
+      "expect": [
+        {"polling": false, "kind": "none", "recipe_id": null},
+        {"polling": false, "kind": "none", "recipe_id": null},
+        {"polling": false, "kind": "none", "recipe_id": null},
+        {"polling": false, "kind": "none", "recipe_id": null},
+        {"polling": false, "kind": "none", "recipe_id": null},
+        {"polling": false, "kind": "none", "recipe_id": null}
+      ]
+    },
+    {
+      "name": "edit-between-repeats-resets-window",
+      "steps": [
+        {"tool": "Bash", "command": "make test", "cwd": "/repo", "result": "FAIL test_x"},
+        {"tool": "Bash", "command": "make test", "cwd": "/repo", "result": "FAIL test_x"},
+        {"tool": "Edit", "input": {"file_path": "/repo/x.py", "old_string": "a", "new_string": "b"}},
+        {"tool": "Bash", "command": "make test", "cwd": "/repo", "result": "FAIL test_x"},
+        {"tool": "Bash", "command": "make test", "cwd": "/repo", "result": "FAIL test_x"},
+        {"tool": "apply_patch", "input": {"patch": "*** Begin Patch"}},
+        {"tool": "Bash", "command": "make test", "cwd": "/repo"}
+      ],
+      "expect": [
+        {"polling": false, "kind": "none", "recipe_id": null},
+        {"polling": false, "kind": "none", "recipe_id": null},
+        {"polling": false, "kind": "none", "recipe_id": null},
+        {"polling": false, "kind": "none", "recipe_id": null},
+        {"polling": false, "kind": "none", "recipe_id": null},
+        {"polling": false, "kind": "none", "recipe_id": null},
+        {"polling": false, "kind": "none", "recipe_id": null}
+      ]
+    },
+    {
+      "name": "rerun-without-edit-is-polling",
+      "steps": [
+        {"tool": "Bash", "command": "make test", "cwd": "/repo", "result": "FAIL test_x"},
+        {"tool": "Bash", "command": "make test", "cwd": "/repo", "result": "FAIL test_x"},
+        {"tool": "Bash", "command": "make test", "cwd": "/repo"}
+      ],
+      "expect": [
+        {"polling": false, "kind": "none", "recipe_id": null},
+        {"polling": false, "kind": "none", "recipe_id": null},
+        {"polling": true, "kind": "pure_poll", "recipe_id": null}
+      ]
+    },
+    {
+      "name": "cwd-is-part-of-the-signature",
+      "steps": [
+        {"tool": "Bash", "command": "git status", "cwd": "/a", "result": "clean"},
+        {"tool": "Bash", "command": "git status", "cwd": "/b", "result": "clean"},
+        {"tool": "Bash", "command": "cd /c && git status", "cwd": "/a", "result": "clean"},
+        {"tool": "Bash", "command": "git status", "cwd": "/a"}
+      ],
+      "expect": [
+        {"polling": false, "kind": "none", "recipe_id": null},
+        {"polling": false, "kind": "none", "recipe_id": null},
+        {"polling": false, "kind": "none", "recipe_id": null},
+        {"polling": false, "kind": "none", "recipe_id": null}
+      ]
+    },
+    {
+      "name": "normal-exploration-distinct-reads-and-greps",
+      "steps": [
+        {"tool": "Read", "input": {"file_path": "/repo/a.py"}, "result": "a"},
+        {"tool": "Grep", "input": {"pattern": "foo", "path": "/repo"}, "result": "a.py:1"},
+        {"tool": "Bash", "command": "rg -n bar src", "cwd": "/repo", "result": ""},
+        {"tool": "Read", "input": {"file_path": "/repo/b.py"}, "result": "b"},
+        {"tool": "Bash", "command": "rg -n baz src", "cwd": "/repo", "result": ""},
+        {"tool": "Read", "input": {"file_path": "/repo/a.py", "offset": 200}, "result": "a2"},
+        {"tool": "Bash", "command": "tail -n 20 src/app.py", "cwd": "/repo", "result": "x"},
+        {"tool": "Bash", "command": "tail -n 40 src/app.py", "cwd": "/repo", "result": "x"},
+        {"tool": "Bash", "command": "tail -n 60 src/app.py", "cwd": "/repo"}
+      ],
+      "expect": [
+        {"polling": false, "kind": "none", "recipe_id": null},
+        {"polling": false, "kind": "none", "recipe_id": null},
+        {"polling": false, "kind": "none", "recipe_id": null},
+        {"polling": false, "kind": "none", "recipe_id": null},
+        {"polling": false, "kind": "none", "recipe_id": null},
+        {"polling": false, "kind": "none", "recipe_id": null},
+        {"polling": false, "kind": "none", "recipe_id": null},
+        {"polling": false, "kind": "none", "recipe_id": null},
+        {"polling": false, "kind": "none", "recipe_id": null}
+      ]
+    },
+    {
+      "name": "identical-tool-input-repeated-is-polling",
+      "steps": [
+        {"tool": "Read", "input": {"file_path": "/repo/status.txt"}, "result": "running"},
+        {"tool": "Read", "input": {"file_path": "/repo/status.txt"}, "result": "running"},
+        {"tool": "Read", "input": {"file_path": "/repo/status.txt"}}
+      ],
+      "expect": [
+        {"polling": false, "kind": "none", "recipe_id": null},
+        {"polling": false, "kind": "none", "recipe_id": null},
+        {"polling": true, "kind": "pure_poll", "recipe_id": null}
+      ]
+    },
+    {
+      "name": "process-wait-ignores-wait-duration",
+      "steps": [
+        {"tool": "write_stdin", "input": {"session_id": 7, "chars": "", "yield_time_ms": 30000}, "result": ""},
+        {"tool": "write_stdin", "input": {"session_id": 7, "chars": "", "yield_time_ms": 60000}, "result": ""},
+        {"tool": "write_stdin", "input": {"session_id": 7, "chars": "", "yield_time_ms": 30000}}
+      ],
+      "expect": [
+        {"polling": false, "kind": "none", "recipe_id": null},
+        {"polling": false, "kind": "none", "recipe_id": null},
+        {"polling": true, "kind": "pure_poll", "recipe_id": null}
+      ]
+    },
+    {
+      "name": "process-input-is-not-polling",
+      "steps": [
+        {"tool": "write_stdin", "input": {"session_id": 7, "chars": "y\n"}, "result": ""},
+        {"tool": "write_stdin", "input": {"session_id": 7, "chars": "y\n"}, "result": ""},
+        {"tool": "write_stdin", "input": {"session_id": 7, "chars": "y\n"}}
+      ],
+      "expect": [
+        {"polling": false, "kind": "none", "recipe_id": null},
+        {"polling": false, "kind": "none", "recipe_id": null},
+        {"polling": false, "kind": "none", "recipe_id": null}
+      ]
+    },
+    {
+      "name": "logs-journalctl-loop-same-unit",
+      "steps": [
+        {"tool": "Bash", "command": "journalctl -u traefik --since '5 min ago' -n 50", "cwd": "/repo", "result": "a"},
+        {"tool": "Bash", "command": "journalctl -u traefik --since '2 min ago'", "cwd": "/repo", "result": "b"},
+        {"tool": "Bash", "command": "sudo journalctl -u traefik -n 20 | grep -i error", "cwd": "/repo"}
+      ],
+      "expect": [
+        {"polling": false, "kind": "none", "recipe_id": null},
+        {"polling": false, "kind": "none", "recipe_id": null},
+        {"polling": false, "kind": "none", "recipe_id": "query-logs"}
+      ]
+    },
+    {
+      "name": "logs-docker-logs-identical-pure-poll",
+      "steps": [
+        {"tool": "Bash", "command": "docker logs --tail 20 web", "cwd": "/repo", "result": "listening on 8080"},
+        {"tool": "Bash", "command": "docker logs --tail 20 web", "cwd": "/repo", "result": "listening on 8080"},
+        {"tool": "Bash", "command": "docker logs --tail 20 web", "cwd": "/repo"}
+      ],
+      "expect": [
+        {"polling": false, "kind": "none", "recipe_id": null},
+        {"polling": false, "kind": "none", "recipe_id": null},
+        {"polling": true, "kind": "pure_poll", "recipe_id": "query-logs"}
+      ]
+    },
+    {
+      "name": "logs-tail-of-log-file-watch",
+      "steps": [
+        {"tool": "Bash", "command": "tail -n 40 /var/log/app.log", "cwd": "/repo", "result": "step one"},
+        {"tool": "Bash", "command": "tail -n 40 /var/log/app.log", "cwd": "/repo", "result": "step two"},
+        {"tool": "Bash", "command": "tail -n 40 /var/log/app.log", "cwd": "/repo"}
+      ],
+      "expect": [
+        {"polling": false, "kind": "none", "recipe_id": null},
+        {"polling": false, "kind": "none", "recipe_id": null},
+        {"polling": true, "kind": "watch", "recipe_id": "query-logs"}
+      ]
+    },
+    {
+      "name": "logs-distinct-sources-not-recipe",
+      "steps": [
+        {"tool": "Bash", "command": "journalctl -u traefik -n 20", "cwd": "/repo"},
+        {"tool": "Bash", "command": "journalctl -u coredns -n 20", "cwd": "/repo"},
+        {"tool": "Bash", "command": "docker logs --tail 20 traefik", "cwd": "/repo"}
+      ],
+      "expect": [
+        {"polling": false, "kind": "none", "recipe_id": null},
+        {"polling": false, "kind": "none", "recipe_id": null},
+        {"polling": false, "kind": "none", "recipe_id": null}
+      ]
+    },
+    {
+      "name": "merge-after-status-check",
+      "steps": [
+        {"tool": "Bash", "command": "gh pr checks 12", "cwd": "/repo", "result": "build\tpass"},
+        {"tool": "Bash", "command": "gh pr merge 12 --squash --delete-branch", "cwd": "/repo"}
+      ],
+      "expect": [
+        {"polling": false, "kind": "none", "recipe_id": null},
+        {"polling": false, "kind": "none", "recipe_id": "merge-pr-when-green"}
+      ]
+    },
+    {
+      "name": "merge-alone-not-flagged",
+      "steps": [
+        {"tool": "Bash", "command": "gh pr merge 12 --squash", "cwd": "/repo"}
+      ],
+      "expect": [
+        {"polling": false, "kind": "none", "recipe_id": null}
+      ]
+    },
+    {
+      "name": "merge-comments-resolve-merge-sequence",
+      "steps": [
+        {"tool": "Bash", "command": "gh api repos/o/r/pulls/12/comments --paginate", "cwd": "/repo", "result": "[]"},
+        {"tool": "Bash", "command": "gh api graphql -f query='mutation { resolveReviewThread(input: {threadId: \"T1\"}) { thread { isResolved } } }'", "cwd": "/repo"},
+        {"tool": "Bash", "command": "gh pr merge 12 --squash", "cwd": "/repo"}
+      ],
+      "expect": [
+        {"polling": false, "kind": "none", "recipe_id": null},
+        {"polling": false, "kind": "none", "recipe_id": "merge-pr-when-green"},
+        {"polling": false, "kind": "none", "recipe_id": "merge-pr-when-green"}
+      ]
+    },
+    {
+      "name": "merge-edit-between-comments-and-resolve",
+      "steps": [
+        {"tool": "Bash", "command": "gh api repos/o/r/pulls/12/comments", "cwd": "/repo", "result": "[]"},
+        {"tool": "Edit", "input": {"file_path": "/repo/x.py", "old_string": "a", "new_string": "b"}},
+        {"tool": "Bash", "command": "gh api graphql -f query='mutation { resolveReviewThread(input: {threadId: \"T1\"}) { thread { isResolved } } }'", "cwd": "/repo"}
+      ],
+      "expect": [
+        {"polling": false, "kind": "none", "recipe_id": null},
+        {"polling": false, "kind": "none", "recipe_id": null},
+        {"polling": false, "kind": "none", "recipe_id": null}
+      ]
+    },
+    {
+      "name": "merge-lone-comment-reads-not-flagged",
+      "steps": [
+        {"tool": "Bash", "command": "gh api repos/o/r/issues/12/comments", "cwd": "/repo"},
+        {"tool": "Read", "input": {"file_path": "/repo/a.py"}},
+        {"tool": "Bash", "command": "gh api repos/o/r/contents/README.md", "cwd": "/repo"}
+      ],
+      "expect": [
+        {"polling": false, "kind": "none", "recipe_id": null},
+        {"polling": false, "kind": "none", "recipe_id": null},
+        {"polling": false, "kind": "none", "recipe_id": null}
+      ]
+    },
+    {
+      "name": "window-steps-bounds-lookback",
+      "options": {"window_steps": 3},
+      "steps": [
+        {"tool": "Bash", "command": "gh pr checks 12", "cwd": "/repo"},
+        {"tool": "Read", "input": {"file_path": "/repo/a.py"}},
+        {"tool": "Read", "input": {"file_path": "/repo/b.py"}},
+        {"tool": "Bash", "command": "gh pr checks 12", "cwd": "/repo"},
+        {"tool": "Bash", "command": "gh pr checks 12", "cwd": "/repo"}
+      ],
+      "expect": [
+        {"polling": false, "kind": "none", "recipe_id": null},
+        {"polling": false, "kind": "none", "recipe_id": null},
+        {"polling": false, "kind": "none", "recipe_id": null},
+        {"polling": false, "kind": "none", "recipe_id": null},
+        {"polling": false, "kind": "none", "recipe_id": null}
+      ]
+    },
+    {
+      "name": "threshold-option",
+      "options": {"threshold": 2},
+      "steps": [
+        {"tool": "Bash", "command": "gh pr checks 12", "cwd": "/repo", "result": "pending"},
+        {"tool": "Bash", "command": "gh pr checks 12", "cwd": "/repo"}
+      ],
+      "expect": [
+        {"polling": false, "kind": "none", "recipe_id": null},
+        {"polling": true, "kind": "pure_poll", "recipe_id": "wait-for-status"}
+      ]
+    }
+  ]
+}
