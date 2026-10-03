@@ -211,6 +211,14 @@ class Export(Harness):
         self.assertTrue(any(p["record_id"] == old["record_id"] and p["deleted"] and p["output_tokens"] == 0 for p in parts))
         self.assertEqual(sum(p["output_tokens"] for p in parts),50)
 
+    def test_missing_lineage_metadata_is_unknown_and_bad_native_ids_do_not_collide(self):
+        from nenpi.export import native_id,native_lineage
+        from types import SimpleNamespace
+        analysis = SimpleNamespace(scan=SimpleNamespace(thread_metadata={}))
+        self.assertEqual(native_lineage(analysis,"codex","session","session"),"unknown")
+        self.assertNotEqual(native_id("private native id one"),native_id("private native id two"))
+        self.assertNotIn("private",native_id("private native id one"))
+
 
 if __name__ == "__main__":
     unittest.main()

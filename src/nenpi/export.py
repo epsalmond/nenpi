@@ -39,7 +39,16 @@ def digest(value):
 
 
 def native_id(value):
-    return value if isinstance(value, str) and NATIVE_ID.fullmatch(value) else "unknown"
+    if isinstance(value,str) and NATIVE_ID.fullmatch(value):
+        return value
+    return "opaque-" + digest(value)[:32] if value else "unknown"
+
+
+def native_lineage(analysis, harness, session, thread):
+    metadata = analysis.scan.thread_metadata.get((harness,session,thread))
+    if not metadata or (metadata.get("classification") != "root" and not metadata.get("parent_thread_id")):
+        return "unknown"
+    return d._drill_thread_classification(analysis.scan.thread_metadata,session,thread,{},harness=harness)
 
 
 def tool_family(name):
@@ -136,7 +145,7 @@ def accounting(events, analysis, identity):
     known_reasoning = 0
     for event in events:
         thread = str(event[d.EVENT_THREAD] or (event[d.EVENT_SESSION] if not event[d.EVENT_SUB] else ""))
-        role = d._drill_thread_classification(analysis.scan.thread_metadata, event[d.EVENT_SESSION], thread, {}, harness=harness)
+        role = native_lineage(analysis,harness,event[d.EVENT_SESSION],thread)
         role = role if role in counts else "unknown"
         counts[role] += 1
         if len(event) > d.EVENT_REASONING_KNOWN and event[d.EVENT_REASONING_KNOWN] is True:
@@ -195,7 +204,7 @@ def project(analysis, identity, args):
         for event in events:
             thread = str(event[d.EVENT_THREAD] or (session if not event[d.EVENT_SUB] else ""))
             metadata = analysis.scan.thread_metadata.get((harness, session, thread), {})
-            role = d._drill_thread_classification(analysis.scan.thread_metadata, session, thread, {}, harness=harness)
+            role = native_lineage(analysis,harness,session,thread)
             role = role if role in {"root", "descendant"} else "unknown"
             agent_type = metadata.get("agent_type")
             agent_type = agent_type if agent_type in AGENT_TYPES else "unknown"
@@ -458,9 +467,10 @@ def command_export(args):
             else:
                 print(encoded(health), file=sys.stderr)
         return 0
-    except (OSError, ValueError, sqlite3.Error) as error:
-        # Exceptions may contain a private path; keep diagnostics content-free.
-        print("nenpi export: " + (str(error) if isinstance(error, ValueError) else type(error).__name__), file=sys.stderr)
+    except (OSError, ValueError, TypeError, sqlite3.Error) as error:
+        # Parser conversion errors can contain native record values as well as
+        # paths. Diagnostics never repeat exception messages from transcripts.
+        print("nenpi export: rejected configuration, accounting or scan budget (" + type(error).__name__ + ")",file=sys.stderr)
         return 1
 
 
