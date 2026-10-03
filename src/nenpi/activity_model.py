@@ -49,6 +49,7 @@ class Response:
     results: list[tuple[float, int]] = field(default_factory=list)
     reset: bool = False
     cache_write_kind: str = ""
+    native_tokens: dict = field(default_factory=dict)
 
 
 def fingerprint(value):
@@ -333,7 +334,7 @@ def _one_step_per_call(ops, result):
     return [replace(ops[0], step=step)] + [replace(op, step=None) for op in ops[1:]]
 
 
-def operation_batches(harness, path):
+def operation_batches(harness, path, read_budget=None):
     """Cache only classifications and opaque identities; invalidate on source change."""
     from . import drain as d
     source = Path(path)
@@ -342,20 +343,29 @@ def operation_batches(harness, path):
     except OSError:
         return []
     signature = [before.st_size, before.st_mtime_ns, before.st_ctime_ns]
-    destination = d.cache_dir() / "activities-v6" / (fingerprint([harness, str(source.resolve())]) + ".json")
+    destination = d.cache_dir() / "activities-v7" / (fingerprint([harness, str(source.resolve())]) + ".json")
     try:
         if destination.stat().st_size <= 64 * 1024 * 1024:
             cached = json.loads(destination.read_text())
             if cached["signature"] == signature:
-                return [(rid, {cid: ([_cached_operation(op) for op in ops], [], "")
-                    for cid, ops in batch.items()}) for rid, batch in cached["batches"]]
+                return [(rid, {cid: ([_cached_operation(op) for op in value[0]], [], value[1])
+                    for cid, value in batch.items()}) for rid, batch in cached["batches"]]
     except (OSError, ValueError, KeyError, TypeError):
         pass
+    if read_budget is not None:
+        # Classification rereads each changed source for operations and masked
+        # results. Native usage can still be exported when this budget runs out.
+        needed = 2 * before.st_size
+        if needed > read_budget["remaining"]:
+            read_budget["incomplete"] = True
+            return []
+        read_budget["remaining"] -= needed
     batches = list(claude_batches(path) if harness == "claude" else _source_activity(path, codex_operations))
     results = result_keys(harness, path)
     batches = [(rid, {cid: (_one_step_per_call(ops, results.get(cid)), examples, name)
                       for cid, (ops, examples, name) in batch.items()}) for rid, batch in batches]
-    encoded = [[rid, {cid: [asdict(op) for op in ops] for cid, (ops, _, _) in batch.items()}]
+    from .export import tool_family
+    encoded = [[rid, {cid: [[asdict(op) for op in ops], tool_family(name)] for cid, (ops, _, name) in batch.items()}]
                for rid, batch in batches if rid and batch]
     temporary = None
     try:
@@ -404,6 +414,7 @@ def normalize(analysis, session_key=None, prompt_index=None):
                 int(tokens.get("cache_read", tokens.get("cached_input", 0))), tokens["output"],
                 d.event_units(harness, event, kinds, analysis.weights, analysis.args), prices,
                 cache_write_kind=write_kind,
+                native_tokens=tokens,
             )
             responses.append(response)
             if response.response_id:
@@ -417,7 +428,7 @@ def normalize(analysis, session_key=None, prompt_index=None):
     linked = set()
     for (harness, path), ids in sources.items():
         d.check_cancelled(analysis.cancellation)
-        batches = operation_batches(harness, path)
+        batches = operation_batches(harness, path, getattr(analysis.args, "activity_read_budget", None))
         for rid, batch in batches:
             response = by_id.get((harness, ids.get(rid), rid))
             if response is None:

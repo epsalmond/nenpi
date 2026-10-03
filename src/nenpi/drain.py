@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import bisect
 import contextlib
+import contextvars
 import hashlib
 import json
 import math
@@ -80,7 +81,7 @@ except ImportError:  # bench can load drain.py as a standalone quota module.
         serialized_cache,
     )
 
-CACHE_SCHEMA = 9
+CACHE_SCHEMA = 10
 JSON_SCHEMA = 1
 LONG_CONTEXT_THRESHOLD = 200_000
 CONTEXT_REDUCTION_FRACTION = 0.30
@@ -886,6 +887,9 @@ def codex_transcripts(
             yield path, root
 
 
+PARSE_BYTE_BUDGET = contextvars.ContextVar("nenpi_parse_byte_budget", default=None)
+
+
 def read_lines_from(
     path: Path, offset: int, cancellation: Cancellation = None
 ) -> Iterator[Tuple[int, bytes]]:
@@ -893,13 +897,22 @@ def read_lines_from(
     with open(path, "rb") as handle:
         handle.seek(offset)
         position = offset
-        for raw in handle:
+        budget = PARSE_BYTE_BUDGET.get()
+        while True:
+            raw = handle.readline((budget["remaining"] + 1) if budget is not None else -1)
+            if not raw:
+                break
+            if budget is not None and len(raw) > budget["remaining"]:
+                budget["exhausted"] = True
+                break
             check_cancelled(cancellation)
             if not raw.endswith(b"\n"):
                 # A transcript being appended to right now; stop before the
                 # partial line so the next run re-reads it whole.
                 break
             position += len(raw)
+            if budget is not None:
+                budget["remaining"] -= len(raw)
             yield position, raw
 
 
@@ -1026,6 +1039,7 @@ class FileIndex:
         self.harness = harness
         self.size = 0
         self.mtime = 0.0
+        self.ctime_ns = 0
         self.offset = 0
         self.sessions = {}  # type: Dict[str, SessionSummary]
         self.events = []  # type: List[List[Any]]
@@ -1094,6 +1108,7 @@ class FileIndex:
             "harness": self.harness,
             "size": self.size,
             "mtime": self.mtime,
+            "ctime_ns": self.ctime_ns,
             "offset": self.offset,
             "sessions": dict((key, value.to_json()) for key, value in self.sessions.items()),
             "events": self.events,
@@ -1127,6 +1142,7 @@ class FileIndex:
         index = cls(str(payload.get("harness", "claude")))
         index.size = int(payload.get("size") or 0)
         index.mtime = float(payload.get("mtime") or 0.0)
+        index.ctime_ns = int(payload.get("ctime_ns") or 0)
         index.offset = int(payload.get("offset") or 0)
         for key, value in (payload.get("sessions") or {}).items():
             index.sessions[str(key)] = SessionSummary.from_json(value)
@@ -1159,6 +1175,7 @@ class FileIndex:
     def stamp(self, path: Path, stat: os.stat_result) -> None:
         self.size = stat.st_size
         self.mtime = stat.st_mtime
+        self.ctime_ns = stat.st_ctime_ns
         self.head_hash, self.tail_hash = content_fingerprint(path, self.offset)
 
 
@@ -1210,6 +1227,7 @@ EVENT_REASONING = 15
 EVENT_ACTIONS = 16
 EVENT_WAIT = 17
 EVENT_REASONING_KNOWN = 18
+EVENT_TOKEN_KINDS_KNOWN = 19
 
 # Absolute token-area indices for the kinds each harness actually prices, in
 # the order its `*_units` method sums them. `Weights.event_vector` pairs these
@@ -2119,6 +2137,12 @@ def parse_claude_file(
                 None, reasoning, actions,
                 claude_wait_for_actions(actions),
                 bool(reasoning_known),
+                [kind for kind, present in (
+                    ("input", "input_tokens" in usage), ("cache_read", "cache_read_input_tokens" in usage),
+                    ("cache_write_5m", isinstance(usage.get("cache_creation"), dict) and "ephemeral_5m_input_tokens" in usage["cache_creation"]),
+                    ("cache_write_1h", isinstance(usage.get("cache_creation"), dict) and "ephemeral_1h_input_tokens" in usage["cache_creation"]),
+                    ("cache_write_unknown", "cache_creation_input_tokens" in usage), ("output", "output_tokens" in usage),
+                ) if present],
             ]
             index.events.append(event)
             if isinstance(message_id, str) and message_id:
@@ -2393,6 +2417,9 @@ def parse_codex_file(
                 reasoning_output=tokens.get("reasoning_output", 0),
                 actions=actions,
                 pure_wait=pure_wait,
+                token_kinds_known=[kind for kind, field in (("input", "input_tokens"), ("cached_input", "cached_input_tokens"),
+                    ("cache_write", "cache_write_input_tokens"), ("output", "output_tokens")) if field in usage],
+                reasoning_known="reasoning_output_tokens" in usage,
             )
             index.pending_actions = []
             index.pending_response_seen = False
@@ -2590,6 +2617,8 @@ def record_event(
     reasoning_output: int = 0,
     actions: Optional[Sequence[str]] = None,
     pure_wait: Optional[bool] = None,
+    token_kinds_known: Optional[Sequence[str]] = None,
+    reasoning_known: bool = False,
 ) -> None:
     context_size = tokens.get("input", 0) + tokens.get("cached_input", 0)
     long_context = context_size > LONG_CONTEXT_THRESHOLD
@@ -2608,6 +2637,8 @@ def record_event(
     row.append(int(reasoning_output))
     row.append(list(actions) if actions is not None else None)
     row.append(pure_wait)
+    row.append(reasoning_known)
+    row.append(list(token_kinds_known or []))
     events.append(row)
 
 
@@ -2800,6 +2831,10 @@ class Cache:
         if stat.st_size < entry.size or stat.st_mtime < entry.mtime - 1:
             # Truncated or rewritten behind our back; the stored offset is
             # meaningless, so start the file over.
+            entry = FileIndex(harness)
+            self.entries[key] = entry
+            return entry, True
+        if stat.st_size == entry.size and entry.ctime_ns and stat.st_ctime_ns != entry.ctime_ns:
             entry = FileIndex(harness)
             self.entries[key] = entry
             return entry, True
@@ -8752,6 +8787,9 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     sub = parser.add_subparsers(dest="command", metavar="COMMAND")
+
+    from .export import add_parser as add_export_parser
+    add_export_parser(sub)
 
     from .activity_report import command_activities
 

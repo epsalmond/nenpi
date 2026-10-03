@@ -1,6 +1,7 @@
 """Synthetic accounting, delivery, and privacy contracts for the native exporter."""
 import json
 import unittest
+import time
 from pathlib import Path
 
 from tests.test_drain import Harness, claude_assistant_line, claude_user_prompt_line
@@ -50,6 +51,165 @@ class Export(Harness):
         self.assertEqual(new["record_id"], old["record_id"])
         self.assertEqual(new["revision"], old["revision"] + 1)
         self.assertEqual(new["turns"], 2)
+
+    def test_bounded_parse_resumes_cached_offsets(self):
+        self.seed()
+        first = self.export("--max-scan-bytes", "600")
+        self.assertEqual(first[0]["coverage"], "incomplete")
+        second = self.export("--max-scan-bytes", "600")
+        self.assertTrue(any(r["event"] == "analytics_prompt" for r in second))
+        self.assertEqual(next(r for r in second if r["event"] == "analytics_prompt")["turns"], 1)
+
+    def test_pages_are_durable_until_each_ack(self):
+        self.seed()
+        page = self.export("--max-records", "2")
+        self.assertEqual(len(page), 2)
+        kinds = []
+        for _ in range(3):
+            kinds.append(page[0]["event"])
+            self.assertEqual(page, self.export("--max-records", "2"))
+            self.export("--ack", page[-1]["batch_id"])
+            page = self.export("--max-records", "2")
+        self.assertEqual(set(kinds), {"analytics_prompt", "analytics_partition", "analytics_session"})
+        self.assertEqual(page[0]["event"], "analytics_export_health")
+
+    def test_unknown_prompt_is_excluded_from_human_denominator(self):
+        self.write_claude("unknown.jsonl", [claude_assistant_line(101, "session", "msg", input_tokens=100)])
+        batch = self.export()
+        prompt = next(r for r in batch if r["event"] == "analytics_prompt")
+        self.assertEqual(prompt["prompt_membership"], "unknown")
+        self.assertFalse(prompt["human_prompt"])
+
+    def test_invalid_identity_label_is_rejected(self):
+        from nenpi.export import identity_sources
+        mapping = self.root / "bad-map.json"
+        mapping.write_text(json.dumps({"sources": [{"harness": "claude", "source_root": str(self.home),
+            "provider": "anthropic", "account_alias": "person@example.com"}]}))
+        with self.assertRaises(ValueError):
+            identity_sources(mapping)
+
+    def test_longest_root_and_ambiguous_outcomes(self):
+        from nenpi.export import resolve_identity
+        sources = [dict(harness="codex", root=Path("/home/a"), provider="openai", account_alias="one"),
+            dict(harness="codex", root=Path("/home/a/project"), provider="openai", account_alias="two")]
+        self.assertEqual(resolve_identity(Path("/home/a/project/file"), "codex", sources)["account_alias"], "two")
+        sources.append(dict(sources[-1], account_alias="three"))
+        self.assertEqual(resolve_identity(Path("/home/a/project/file"), "codex", sources)["identity_status"], "ambiguous")
+        self.assertEqual(resolve_identity(Path("/elsewhere"), "codex", sources)["identity_status"], "unknown")
+
+    def test_replayed_response_is_not_counted_twice(self):
+        self.seed()
+        self.write_claude("replayed.jsonl", [claude_assistant_line(101, "session", "msg", input_tokens=100,
+            cache_read=200, cache_write_5m=300, cache_write_1h=400, output_tokens=50)])
+        batch = self.export()
+        prompt = next(r for r in batch if r["event"] == "analytics_prompt")
+        self.assertEqual(prompt["turns"], 1)
+
+    def test_late_descendant_revises_parent_and_uses_native_type(self):
+        self.seed()
+        first = self.export()
+        self.export("--ack", first[-1]["batch_id"])
+        child = self.write_claude("session/subagents/agent-child.jsonl", [claude_assistant_line(105, "session", "child-msg",
+            input_tokens=20, output_tokens=3, sidechain=True)])
+        child.with_suffix(".meta.json").write_text(json.dumps({"agentType": "implementation"}))
+        batch = self.export()
+        prompt = next(r for r in batch if r["event"] == "analytics_prompt")
+        self.assertEqual(prompt["turns"], 2)
+        parts = [r for r in batch if r["event"] == "analytics_partition"]
+        self.assertTrue(any(p["agent_type"] == "implementation" for p in parts))
+
+    def test_combined_batch_counts_output_once_and_cached_family_is_stable(self):
+        line = json.loads(claude_assistant_line(101, "session", "msg", input_tokens=100, output_tokens=50))
+        line["message"]["content"] = [{"type": "tool_use", "id": "one", "name": "Bash", "input": {"command": "cat SECRET_PATH"}},
+            {"type": "tool_use", "id": "two", "name": "Read", "input": {"file_path": "SECRET_PATH"}}]
+        self.write_claude("batch.jsonl", [claude_user_prompt_line(100, "session", text="secret"), json.dumps(line)])
+        first = self.export()
+        part = next(r for r in first if r["event"] == "analytics_partition")
+        self.assertEqual(part["tool_association"], "combined_batch")
+        self.assertEqual(part["tool_batch"], "read+shell")
+        self.assertEqual(part["tokens"]["output"], 50)
+        self.assertNotIn("SECRET_PATH", json.dumps(first))
+        self.export("--ack", first[-1]["batch_id"])
+        self.write_claude("batch.jsonl", [claude_assistant_line(102, "session", "next", input_tokens=1)])
+        second = self.export()
+        self.assertTrue(any(p.get("tool_batch") == "read+shell" for p in second))
+
+    def test_wrong_ack_preserves_pending(self):
+        self.seed()
+        batch = self.export()
+        mapping = self.root / "identities.json"
+        result = self.run_tool("export", "--identity-map", str(mapping), "--export-state", str(self.root / "export.sqlite"), "--ack", "wrong")
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(batch, self.export())
+
+    def test_native_cache_write_zero_presence_differs_from_missing(self):
+        line = json.loads(claude_assistant_line(101, "session", "msg", input_tokens=100))
+        line["message"]["usage"].pop("cache_creation_input_tokens")
+        line["message"]["usage"].pop("cache_creation")
+        self.write_claude("missing.jsonl", [json.dumps(line)])
+        prompt = next(r for r in self.export() if r["event"] == "analytics_prompt")
+        self.assertEqual(prompt["tokens"]["cache_write_5m"], 0)
+        self.assertFalse(prompt["token_kinds_known"]["cache_write_5m"])
+
+    def test_same_size_rewrite_revises_native_usage(self):
+        self.seed()
+        first = self.export()
+        self.export("--ack", first[-1]["batch_id"])
+        path = self.claude_projects / "proj" / "export.jsonl"
+        before = path.read_text()
+        path.write_text(before.replace('"output_tokens": 50', '"output_tokens": 55'))
+        self.assertEqual(path.stat().st_size, len(before.encode()))
+        batch = self.export()
+        prompt = next(r for r in batch if r["event"] == "analytics_prompt")
+        self.assertEqual(prompt["output_tokens"], 55)
+
+    def test_root_human_prompt_without_usage_is_present(self):
+        self.write_claude("no-response.jsonl", [claude_user_prompt_line(100,"session",text="pending")])
+        batch = self.export()
+        prompt = next(r for r in batch if r["event"] == "analytics_prompt")
+        self.assertTrue(prompt["human_prompt"])
+        self.assertEqual(prompt["turns"], 0)
+
+    def test_removed_source_emits_zero_tombstones(self):
+        self.seed()
+        first = self.export()
+        self.export("--ack",first[-1]["batch_id"])
+        (self.claude_projects / "proj" / "export.jsonl").unlink()
+        batch = self.export()
+        records = [r for r in batch if r["event"] != "analytics_export_batch"]
+        self.assertTrue(records)
+        self.assertTrue(all(r["deleted"] and r["turns"] == 0 and r["output_tokens"] == 0 for r in records))
+
+    def test_accounts_and_providers_with_same_native_ids_stay_separate(self):
+        sources = []
+        for alias,provider,tokens in (("one","anthropic",100),("two","anthropic",200),("three","other",300)):
+            root = self.home / (".claude-" + alias)
+            path = root / "projects/proj/session.jsonl"
+            path.parent.mkdir(parents=True)
+            path.write_text(claude_user_prompt_line(100,"same-session",text="private") + "\n" +
+                claude_assistant_line(101,"same-session","same-message",input_tokens=tokens) + "\n")
+            sources.append(dict(harness="claude",source_root=str(root),provider=provider,account_alias=alias))
+        mapping = self.root / "identity-map.json"
+        mapping.write_text(json.dumps(dict(sources=sources)))
+        result = self.run_tool("export","--identity-map",str(mapping),"--export-state",str(self.root / "export.sqlite"))
+        self.assertEqual(result.returncode,0,result.stderr)
+        prompts = [json.loads(line) for line in result.stdout.splitlines() if json.loads(line)["event"] == "analytics_prompt"]
+        self.assertEqual({(p["provider"],p["account_alias"],p["tokens"]["input"]) for p in prompts},
+            {("anthropic","one",100),("anthropic","two",200),("other","three",300)})
+
+    def test_reclassification_tombstones_old_unknown_partition(self):
+        self.seed()
+        first = self.export()
+        old = next(r for r in first if r["event"] == "analytics_partition")
+        self.export("--ack",first[-1]["batch_id"])
+        record = json.loads(claude_assistant_line(101,"session","msg",input_tokens=100,cache_read=200,
+            cache_write_5m=300,cache_write_1h=400,output_tokens=50))
+        record["message"]["content"] = [dict(type="tool_use",id="call",name="Read",input=dict(file_path="PRIVATE"))]
+        self.write_claude("export.jsonl",[json.dumps(record)])
+        batch = self.export()
+        parts = [r for r in batch if r["event"] == "analytics_partition"]
+        self.assertTrue(any(p["record_id"] == old["record_id"] and p["deleted"] and p["output_tokens"] == 0 for p in parts))
+        self.assertEqual(sum(p["output_tokens"] for p in parts),50)
 
 
 if __name__ == "__main__":

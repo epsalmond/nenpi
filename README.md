@@ -1,5 +1,7 @@
 # nenpi
 
+For content-free accounting JSONL consumed by monitoring, see [native analytics export](docs/export.md).
+
 nenpi (燃費, fuel economy) shows where Claude Code and Codex CLI usage goes,
 including repeated checks that keep sending a large context to the model.
 It reads local transcripts. Requires Python 3.11+.
