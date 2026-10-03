@@ -172,7 +172,7 @@ class PollingReport(Harness):
         text = json.dumps(report)
         self.assertNotIn(PR, text)
         self.assertNotIn(SECRET_RESULT, text)
-        caches = list((self.root / "cache" / "activities-v6").glob("*.json"))
+        caches = list((self.root / "cache" / "activities-v7").glob("*.json"))
         self.assertTrue(caches)
         for cache in caches:
             self.assertNotIn(PR, cache.read_text())

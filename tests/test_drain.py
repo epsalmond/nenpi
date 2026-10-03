@@ -5408,7 +5408,7 @@ class PromptRanking(Harness):
 
     def test_cache_schema_includes_drilldown_metadata(self) -> None:
         # 9 adds Claude sidecar lineage and disjoint unknown cache-write data.
-        self.assertEqual(QD.CACHE_SCHEMA, 9)
+        self.assertEqual(QD.CACHE_SCHEMA, 10)
 
     def test_codex_label_comes_from_the_user_message(self) -> None:
         now = time.time() - 3600
