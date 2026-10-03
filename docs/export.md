@@ -28,7 +28,10 @@ the native type explicitly says `implementation`.
 
 Native token kinds stay separate: Claude input, cache read, write at five-minute
 TTL, write at one-hour TTL, write with unknown TTL, and output; Codex uncached
-input, cached input, cache write and output. `token_kinds_known` distinguishes
+input, cached input, cache write and output.
+Codex cache writes remain a reported input subset: do not add them again to
+uncached plus cached input when summing input processed. The export does not
+infer a disjoint fresh-input/cache-write split. `token_kinds_known` distinguishes
 an absent measurement from measured zero. Reasoning is an output subset with
 its own known-turn count. Tool-result estimates are not generated output.
 Each partition counts a whole generating response once: a single linked tool
