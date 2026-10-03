@@ -120,6 +120,53 @@ class Export(Harness):
         parts = [r for r in batch if r["event"] == "analytics_partition"]
         self.assertTrue(any(p["agent_type"] == "implementation" for p in parts))
 
+    def test_late_child_preserves_parent_outside_active_discovery_window(self):
+        self.seed()
+        first = self.export()
+        original = next(r for r in first if r["event"] == "analytics_prompt")
+        self.export("--ack", first[-1]["batch_id"])
+        os.utime(self.claude_projects / "proj/export.jsonl", (1, 1))
+        self.write_claude("session/subagents/agent-late.jsonl", [claude_assistant_line(105, "session", "late-child",
+            input_tokens=20, output_tokens=3, sidechain=True)])
+        batch = self.export()
+        prompt = next(r for r in batch if r["event"] == "analytics_prompt" and r["record_id"] == original["record_id"])
+        self.assertFalse(prompt.get("deleted", False))
+        self.assertEqual((prompt["turns"], prompt["output_tokens"]), (2, 53))
+        self.assertTrue(prompt["human_prompt"])
+
+    def test_resumed_parent_preserves_child_outside_active_discovery_window(self):
+        self.seed()
+        child = self.write_claude("session/subagents/agent-old.jsonl", [claude_assistant_line(105, "session", "old-child",
+            input_tokens=20, output_tokens=3, sidechain=True)])
+        first = self.export()
+        original = next(r for r in first if r["event"] == "analytics_prompt")
+        self.export("--ack", first[-1]["batch_id"])
+        os.utime(child, (1, 1))
+        self.write_claude("export.jsonl", [claude_assistant_line(110, "session", "resume", output_tokens=7)])
+        batch = self.export()
+        prompt = next(r for r in batch if r["event"] == "analytics_prompt" and r["record_id"] == original["record_id"])
+        self.assertEqual((prompt["turns"], prompt["output_tokens"]), (3, 60))
+
+    def test_historical_closure_expansion_respects_file_budget_without_tombstones(self):
+        self.seed()
+        first = self.export()
+        self.export("--ack", first[-1]["batch_id"])
+        os.utime(self.claude_projects / "proj/export.jsonl", (1, 1))
+        self.write_claude("session/subagents/agent-late.jsonl", [claude_assistant_line(105, "session", "late-child",
+            input_tokens=20, output_tokens=3, sidechain=True)])
+        batch = self.export("--max-files", "1")
+        self.assertEqual(batch[-1]["coverage"], "incomplete")
+        self.assertFalse(any(r.get("deleted") for r in batch))
+
+    def test_classifier_budget_limit_marks_batch_incomplete_and_retries(self):
+        self.seed()
+        path = self.claude_projects / "proj/export.jsonl"
+        first = self.export("--max-scan-bytes", str(path.stat().st_size))
+        self.assertEqual(first[-1]["coverage"], "incomplete")
+        self.export("--ack", first[-1]["batch_id"])
+        later = self.export("--max-scan-bytes", str(path.stat().st_size * 4))
+        self.assertEqual(later[-1]["coverage"], "complete")
+
     def test_combined_batch_counts_output_once_and_cached_family_is_stable(self):
         line = json.loads(claude_assistant_line(101, "session", "msg", input_tokens=100, output_tokens=50))
         line["message"]["content"] = [{"type": "tool_use", "id": "one", "name": "Bash", "input": {"command": "cat SECRET_PATH"}},

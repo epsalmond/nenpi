@@ -25,7 +25,7 @@ from .polling_report import flag_responses
 SCHEMA = 1
 CLASSIFIER = "closed-recipes-v1"
 # Projection semantics can change without changing the consumer's wire schema.
-PROJECTION_VERSION = 3
+PROJECTION_VERSION = 4
 LABEL = re.compile(r"[a-zA-Z][a-zA-Z0-9_.-]{0,47}\Z")
 NATIVE_ID = re.compile(r"[A-Za-z0-9_.:-]{1,160}\Z")
 AGENT_TYPES = {"general-purpose", "Explore", "Plan", "implementation", "review", "implementer", "reviewer"}
@@ -458,6 +458,7 @@ def command_export(args):
             updated_scopes = set()
             incomplete = any(not source["root"].is_dir() for source in sources)
             total_bytes = 0
+            closure_file_count = len(files)
             activity_bytes_remaining = args.max_scan_bytes
             for identity_key, paths in sorted(grouped.items()):
                 identity = json.loads(identity_key)
@@ -470,6 +471,9 @@ def command_export(args):
                     break
                 # Prime incremental native shards within a finite byte budget.
                 cache = d.Cache(d.cache_dir(), False)
+                known_paths = {str(path) for path, _ in paths}
+                # The rolling window discovers changed work. A touched session
+                # must still include its retained historical parent/descendants.
                 for path, _ in paths:
                     stat = path.stat()
                     sidecar_signature, metadata = d.claude_sidecar(path) if identity["harness"] == "claude" else ("", {})
@@ -498,7 +502,30 @@ def command_export(args):
                             if budget["exhausted"]:
                                 incomplete = True
                                 break
+                        for session in entry.sessions:
+                            scope_key = "scope:" + identity_key + ":" + encoded(native_id(session))
+                            historical = store.execute("SELECT paths FROM scope_files WHERE scope=?", (scope_key,)).fetchone()
+                            for member in json.loads(historical[0]) if historical else []:
+                                if member in known_paths:
+                                    continue
+                                historical_path = Path(member)
+                                if not historical_path.is_file():
+                                    continue
+                                if encoded(resolve_identity(historical_path.resolve(), identity["harness"], sources)) != identity_key:
+                                    continue
+                                if closure_file_count >= args.max_files or time.monotonic() - started > args.scan_seconds:
+                                    incomplete = True
+                                    break
+                                member_stat = historical_path.stat()
+                                sidecar, _ = d.claude_sidecar(historical_path) if identity["harness"] == "claude" else ("", {})
+                                paths.append((historical_path, [member_stat.st_size, member_stat.st_mtime_ns, member_stat.st_ctime_ns, sidecar]))
+                                known_paths.add(member)
+                                closure_file_count += 1
+                            if incomplete:
+                                break
                         cache.forget(path)
+                    if incomplete:
+                        break
                 if incomplete:
                     break
                 scan = d.Scan()
@@ -552,6 +579,7 @@ def command_export(args):
                     if not analysis_args.activity_read_budget["incomplete"]:
                         store.execute("INSERT OR REPLACE INTO sources VALUES (?,?)", (scope_key,closure_signature))
                     else:
+                        incomplete = True
                         complete_group = False
                 if complete_group:
                     for key in existing_scopes:

@@ -76,6 +76,9 @@ Defaults are a 24-hour initial source-mtime backfill, 10,000 active source files
 reads, 90 seconds before beginning another scan unit, 4,000 records and 8 MiB
 per delivery page. Later scans revisit files written within 24 hours. Existing
 inactive files retain historical snapshots; window expiration is not deletion.
+When a session changes, its retained parent and descendant source files join
+the rebuild even outside the discovery window, under the same file/byte/time
+budgets. Classification budget exhaustion also marks delivery incomplete.
 Native parse offsets persist when a scan budget expires;
 the next scheduled invocation continues. A single JSONL record larger than
 the parse budget requires increasing `--max-scan-bytes`. Large classification
