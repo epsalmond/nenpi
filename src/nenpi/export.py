@@ -456,7 +456,9 @@ def command_export(args):
                 grouped[encoded(identity)].append((path, signature))
             records = []
             updated_scopes = set()
-            incomplete = any(not source["root"].is_dir() for source in sources)
+            source_incomplete = any(not source["root"].is_dir() for source in sources)
+            incomplete = False
+            classification_incomplete = False
             total_bytes = 0
             closure_file_count = len(files)
             activity_bytes_remaining = args.max_scan_bytes
@@ -579,7 +581,7 @@ def command_export(args):
                     if not analysis_args.activity_read_budget["incomplete"]:
                         store.execute("INSERT OR REPLACE INTO sources VALUES (?,?)", (scope_key,closure_signature))
                     else:
-                        incomplete = True
+                        classification_incomplete = True
                         complete_group = False
                 if complete_group:
                     for key in existing_scopes:
@@ -596,9 +598,10 @@ def command_export(args):
                 counter_scan = d.Scan()
                 counter_scan.events[identity["harness"]] = counter_events
                 records.append(account_counter_record(store,counter_scan,identity,args,now))
-            output = make_batch(store, records, now, args, "incomplete" if incomplete else "complete", updated_scopes)
+            coverage = "incomplete" if incomplete or classification_incomplete or source_incomplete else "complete"
+            output = make_batch(store, records, now, args, coverage, updated_scopes)
             health = dict(event="analytics_export_health", schema_version=SCHEMA, observed_at=now,
-                coverage="incomplete" if incomplete else "complete", scan_bytes=total_bytes, files=len(files),
+                coverage=coverage, scan_bytes=total_bytes, files=len(files),
                 duration_seconds=time.monotonic() - started, classifier_version=CLASSIFIER)
             for record in output:
                 print(encoded(record))

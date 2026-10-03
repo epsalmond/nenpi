@@ -158,6 +158,48 @@ class Export(Harness):
         self.assertEqual(batch[-1]["coverage"], "incomplete")
         self.assertFalse(any(r.get("deleted") for r in batch))
 
+    def test_classification_limit_does_not_starve_another_cached_account(self):
+        sources = []
+        for alias,output in (("aaa",50),("bbb",7)):
+            root = self.home / (".claude-" + alias)
+            path = root / "projects/proj/session.jsonl"
+            path.parent.mkdir(parents=True)
+            path.write_text(claude_user_prompt_line(100,"session",text="private") + "\n" +
+                claude_assistant_line(101,"session","message",input_tokens=10,output_tokens=output) + "\n")
+            sources.append(dict(harness="claude",source_root=str(root),provider="anthropic",account_alias=alias))
+        mapping = self.root / "mapped.json"
+        mapping.write_text(json.dumps(dict(sources=sources)))
+        command = ["export","--identity-map",str(mapping),"--export-state",str(self.root / "export.sqlite")]
+        first = self.run_tool(*command)
+        self.assertEqual(first.returncode,0,first.stderr)
+        batch = [json.loads(r) for r in first.stdout.splitlines()]
+        self.assertEqual(self.run_tool(*command,"--ack",batch[-1]["batch_id"]).returncode,0)
+        first_path = Path(sources[0]["source_root"]) / "projects/proj/session.jsonl"
+        first_path.write_text(first_path.read_text().replace('"output_tokens": 50','"output_tokens": 55'))
+        # Native data fits; a classification reread requires twice the budget.
+        result = self.run_tool(*command,"--threshold","4","--max-scan-bytes",str(first_path.stat().st_size))
+        self.assertEqual(result.returncode,0,result.stderr)
+        batch = [json.loads(r) for r in result.stdout.splitlines()]
+        self.assertEqual(batch[-1]["coverage"],"incomplete")
+        self.assertEqual({r["account_alias"] for r in batch if r["event"] == "analytics_prompt"},{"aaa","bbb"})
+
+    def test_unavailable_mapped_root_does_not_starve_available_account(self):
+        self.seed()
+        mapping = self.root / "mapped.json"
+        mapping.write_text(json.dumps(dict(sources=[
+            dict(harness="claude", source_root=str(self.home / ".claude-unavailable"),
+                 provider="anthropic", account_alias="missing"),
+            dict(harness="claude", source_root=str(self.claude_projects.parent),
+                 provider="anthropic", account_alias="personal") ])))
+        result = self.run_tool("export", "--since", "1970-01-01", "--identity-map", str(mapping),
+                               "--export-state", str(self.root / "export.sqlite"))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        batch = [json.loads(line) for line in result.stdout.splitlines()]
+        prompts = [r for r in batch if r["event"] == "analytics_prompt"]
+        self.assertEqual(len(prompts), 1)
+        self.assertEqual((prompts[0]["account_alias"], prompts[0]["output_tokens"]), ("personal", 50))
+        self.assertEqual(batch[-1]["coverage"], "incomplete")
+
     def test_classifier_budget_limit_marks_batch_incomplete_and_retries(self):
         self.seed()
         path = self.claude_projects / "proj/export.jsonl"
