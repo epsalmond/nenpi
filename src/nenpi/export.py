@@ -25,7 +25,7 @@ from .polling_report import flag_responses
 SCHEMA = 1
 CLASSIFIER = "closed-recipes-v1"
 # Projection semantics can change without changing the consumer's wire schema.
-PROJECTION_VERSION = 2
+PROJECTION_VERSION = 3
 LABEL = re.compile(r"[a-zA-Z][a-zA-Z0-9_.-]{0,47}\Z")
 NATIVE_ID = re.compile(r"[A-Za-z0-9_.:-]{1,160}\Z")
 AGENT_TYPES = {"general-purpose", "Explore", "Plan", "implementation", "review", "implementer", "reviewer"}
@@ -106,7 +106,7 @@ def resolve_identity(path, harness, sources):
 def discover(sources, args, lower):
     """Bound discovery and deduplicate overlapping roots before attribution."""
     found = {}
-    visited = 0
+    started = time.monotonic()
     for source in sources:
         leaf = source["root"] / ("projects" if source["harness"] == "claude" else "sessions")
         if not leaf.is_dir():
@@ -114,17 +114,16 @@ def discover(sources, args, lower):
         iterator = (Path(directory) / name for directory, _, filenames in os.walk(leaf)
             for name in filenames if name.endswith(".jsonl") and (source["harness"] == "claude" or name.startswith("rollout-")))
         for path in iterator:
-            visited += 1
-            if visited > args.max_files:
-                raise ValueError("source file budget exceeded; narrow source roots")
+            if time.monotonic() - started > args.scan_seconds:
+                raise ValueError("source discovery time budget exceeded")
             key = (source["harness"], str(path.resolve()))
             if key in found:
                 continue
-            if len(found) >= args.max_files:
-                raise ValueError("source file budget exceeded; narrow source roots")
             stat = path.stat()
             if stat.st_mtime < lower:
                 continue
+            if len(found) >= args.max_files:
+                raise ValueError("source file budget exceeded; narrow source roots")
             identity = resolve_identity(path.resolve(), source["harness"], sources)
             sidecar_signature, _ = d.claude_sidecar(path) if source["harness"] == "claude" else ("", {})
             found[key] = (path, identity, [stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns, sidecar_signature])
@@ -156,11 +155,13 @@ def accounting(events, analysis, identity):
     tokens = totals(events, harness)
     # Claude records carry native TTL buckets. Codex cache writes have no TTL.
     return dict(tokens=tokens, turns=len(events), root_turns=counts["root"], descendant_turns=counts["descendant"],
+        response_identity_known_turns=sum(isinstance(e[d.EVENT_ID],str) and bool(NATIVE_ID.fullmatch(e[d.EVENT_ID])) for e in events),
         cache_write_tokens=sum(value for kind, value in tokens.items() if kind.startswith("cache_write")), output_tokens=tokens.get("output", 0),
         unknown_turns=counts["unknown"], reasoning_tokens=reasoning,
         reasoning_known_turns=known_reasoning, context_start=d.event_context(events[0], harness) if events else 0,
         context_peak=max((d.event_context(e, harness) for e in events), default=0),
-        token_kinds_known={kind: bool(events) and all(len(e) > d.EVENT_TOKEN_KINDS_KNOWN and kind in e[d.EVENT_TOKEN_KINDS_KNOWN] for e in events) for kind in tokens},
+        token_kinds_known={kind: bool(events) and all(len(e) > d.EVENT_TOKEN_KINDS_KNOWN and kind in e[d.EVENT_TOKEN_KINDS_KNOWN]
+            and (harness != "codex" or kind != "input" or "cached_input" in e[d.EVENT_TOKEN_KINDS_KNOWN]) for e in events) for kind in tokens},
         attribution_complete=counts["unknown"] == 0)
 
 
@@ -262,23 +263,116 @@ def open_store(path):
         CREATE TABLE IF NOT EXISTS projections (id TEXT PRIMARY KEY, revision INTEGER NOT NULL, payload TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS pending (batch TEXT NOT NULL, position INTEGER PRIMARY KEY, payload TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS sources (identity TEXT PRIMARY KEY, signature TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS response_usage (id TEXT PRIMARY KEY, identity TEXT NOT NULL, tokens TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS account_counters (identity TEXT NOT NULL, kind TEXT NOT NULL, value INTEGER NOT NULL, PRIMARY KEY(identity,kind));
+        CREATE TABLE IF NOT EXISTS account_measurements (identity TEXT NOT NULL, kind TEXT NOT NULL, value INTEGER NOT NULL, PRIMARY KEY(identity,kind));
+        CREATE TABLE IF NOT EXISTS projection_scopes (id TEXT PRIMARY KEY, scope TEXT NOT NULL);
+        CREATE INDEX IF NOT EXISTS projection_scope_lookup ON projection_scopes(scope);
+        CREATE TABLE IF NOT EXISTS scope_files (scope TEXT PRIMARY KEY, paths TEXT NOT NULL);
     """)
+    if not connection.execute("SELECT value FROM meta WHERE key='projection_scope_schema'").fetchone():
+        connection.execute("""INSERT OR IGNORE INTO projection_scopes
+        SELECT id,json_array(json_object('account_alias',json_extract(payload,'$.account_alias'),
+            'harness',json_extract(payload,'$.harness'),'identity_status',json_extract(payload,'$.identity_status'),
+            'provider',json_extract(payload,'$.provider')),json_extract(payload,'$.session_id'))
+        FROM projections WHERE json_extract(payload,'$.event')!='analytics_account'
+        AND id NOT IN (SELECT id FROM projection_scopes)""")
+        connection.execute("INSERT INTO meta VALUES ('projection_scope_schema','1')")
+        connection.commit()
     return connection
+
+
+def account_counter_record(store,scan,identity,args,now):
+    """Native response IDs keep forks and prompt reassignment out of counters."""
+    identity_key = encoded(identity)
+    count = store.execute("SELECT COUNT(*) FROM response_usage").fetchone()[0]
+    kinds = ("input_processed","cache_write","output")
+    changed = False
+    complete_key = "counter_complete:" + identity_key
+    limit_key = "counter_limit:" + identity_key
+    old_limit = store.execute("SELECT value FROM meta WHERE key=?",(limit_key,)).fetchone()
+    old_complete = store.execute("SELECT value FROM meta WHERE key=?",(complete_key,)).fetchone()
+    budget_complete = not old_complete or old_complete[0] == "1" or not old_limit or int(old_limit[0]) != args.max_response_ids
+    for event in scan.events[identity["harness"]]:
+        response_id = event[d.EVENT_ID]
+        if not isinstance(response_id,str) or not NATIVE_ID.fullmatch(response_id):
+            continue
+        key = digest([identity,response_id])
+        previous = store.execute("SELECT tokens FROM response_usage WHERE id=?",(key,)).fetchone()
+        if previous is None and count >= args.max_response_ids:
+            budget_complete = False
+            continue
+        before_record = json.loads(previous[0]) if previous else {}
+        before = before_record.get("tokens",{})
+        before_known = set(before_record.get("known",[]))
+        native_kinds = d.CLAUDE_KINDS if identity["harness"] == "claude" else d.CODEX_KINDS
+        native_tokens = d.event_tokens(event,native_kinds)
+        tokens = dict(input_processed=d.event_context(event,identity["harness"]),cache_write=sum(v for k,v in native_tokens.items() if k.startswith("cache_write")),output=native_tokens.get("output",0))
+        presence = set(event[d.EVENT_TOKEN_KINDS_KNOWN]) if len(event) > d.EVENT_TOKEN_KINDS_KNOWN else set()
+        if identity["harness"] == "codex":
+            context_known = "input" in presence
+            write_known = "cache_write" in presence
+        else:
+            write_known = "cache_write_unknown" in presence or {"cache_write_5m","cache_write_1h"} <= presence
+            context_known = {"input","cache_read"} <= presence and write_known
+        known = ({"input_processed"} if context_known else set()) | ({"cache_write"} if write_known else set()) | ({"output"} if "output" in presence else set())
+        if any(type(value) is not int or value < 0 for value in tokens.values()):
+            raise ValueError("invalid native usage")
+        observed = {kind:max(value if kind in known else 0,before.get(kind,0)) for kind,value in tokens.items()}
+        if previous is None:
+            count += 1
+            changed = True
+        for kind,value in observed.items():
+            delta = value - before.get(kind,0)
+            if delta:
+                changed = True
+                store.execute("INSERT INTO account_counters VALUES (?,?,?) ON CONFLICT(identity,kind) DO UPDATE SET value=value+excluded.value",(identity_key,kind,delta))
+        for kind in known - before_known:
+            changed = True
+            store.execute("INSERT INTO account_measurements VALUES (?,?,1) ON CONFLICT(identity,kind) DO UPDATE SET value=value+1",(identity_key,kind))
+        payload = encoded(dict(tokens=observed,known=sorted(known | before_known)))
+        if previous is None or previous[0] != payload:
+            store.execute("INSERT OR REPLACE INTO response_usage VALUES (?,?,?)",(key,identity_key,payload))
+    started_key = "counter_started:" + identity_key
+    source_key = "counter_updated:" + identity_key
+    store.execute("INSERT OR IGNORE INTO meta VALUES (?,?)",(started_key,str(now)))
+    if changed:
+        store.execute("INSERT OR REPLACE INTO meta VALUES (?,?)",(source_key,str(now)))
+    source_row = store.execute("SELECT value FROM meta WHERE key=?",(source_key,)).fetchone()
+    store.execute("INSERT OR REPLACE INTO meta VALUES (?,?)",(complete_key,"1" if budget_complete else "0"))
+    store.execute("INSERT OR REPLACE INTO meta VALUES (?,?)",(limit_key,str(args.max_response_ids)))
+    tokens = dict.fromkeys(kinds,0)
+    tokens.update(dict(store.execute("SELECT kind,value FROM account_counters WHERE identity=?",(identity_key,))))
+    return dict(identity,event="analytics_account",record_id=digest([identity,"account"]),source_timestamp=float(source_row[0]) if source_row else 0,
+        counter_started_at=float(store.execute("SELECT value FROM meta WHERE key=?",(started_key,)).fetchone()[0]),tokens=tokens,
+        native_responses=store.execute("SELECT COUNT(*) FROM response_usage WHERE identity=?",(identity_key,)).fetchone()[0],
+        measurements={kind:dict(store.execute("SELECT kind,value FROM account_measurements WHERE identity=?",(identity_key,))).get(kind,0) for kind in kinds},
+        missing_response_ids_excluded=True,counter_identity_budget_complete=budget_complete)
 
 
 def make_batch(store, records, now, args, coverage="complete", updated_scopes=None):
     """Update all disappeared partitions with tombstones in the same transaction."""
-    old = {rid: (revision, json.loads(payload)) for rid, revision, payload in store.execute("SELECT id, revision, payload FROM projections")}
+    if not records and not updated_scopes:
+        return []
+    scopes = sorted(updated_scopes or [])
+    rows = []
+    for offset in range(0,len(scopes),200):
+        selected = scopes[offset:offset + 200]
+        rows.extend(store.execute("SELECT p.id,p.revision,p.payload FROM projections p JOIN projection_scopes s ON s.id=p.id WHERE s.scope IN (" + ",".join("?" for _ in selected) + ")",selected))
+    for record in records:
+        if record["event"] == "analytics_account":
+            rows.extend(store.execute("SELECT id,revision,payload FROM projections WHERE id=?",(record["record_id"],)))
+    old = {rid:(revision,json.loads(payload)) for rid,revision,payload in rows}
     changed = []
     current_ids = {r["record_id"] for r in records}
     updated_prompts = {r["prompt_id"] for r in records if r["event"] == "analytics_prompt"}
     for rid, (revision, previous) in old.items():
         identity = {key:previous[key] for key in ("harness","provider","account_alias","identity_status")}
-        disappeared = updated_scopes is not None and encoded([identity, previous["session_id"]]) in updated_scopes and rid not in current_ids
+        disappeared = previous["event"] != "analytics_account" and updated_scopes is not None and encoded([identity,previous["session_id"]]) in updated_scopes and rid not in current_ids
         if ((previous["event"] == "analytics_partition" and previous.get("prompt_id") in updated_prompts and rid not in current_ids) or disappeared) and not previous.get("deleted"):
             tombstone = dict(previous, deleted=True)
             tombstone["tokens"] = dict.fromkeys(previous["tokens"], 0)
-            for key in ("turns", "root_turns", "descendant_turns", "unknown_turns", "reasoning_tokens", "reasoning_known_turns", "context_start", "context_peak", "cache_write_tokens", "output_tokens"):
+            for key in ("turns", "root_turns", "descendant_turns", "unknown_turns", "reasoning_tokens", "reasoning_known_turns", "context_start", "context_peak", "cache_write_tokens", "output_tokens", "response_identity_known_turns"):
                 tombstone[key] = 0
             if "human_prompt" in tombstone:
                 tombstone["human_prompt"] = False
@@ -295,6 +389,9 @@ def make_batch(store, records, now, args, coverage="complete", updated_scopes=No
         revision = previous[0] + 1 if previous else 1
         changed.append(dict(record, schema_version=SCHEMA, revision=revision, observed_at=now))
         store.execute("INSERT OR REPLACE INTO projections VALUES (?, ?, ?)", (rid, revision, encoded(record)))
+        if record["event"] != "analytics_account":
+            identity = {key:record[key] for key in ("harness","provider","account_alias","identity_status")}
+            store.execute("INSERT OR REPLACE INTO projection_scopes VALUES (?,?)",(rid,encoded([identity,record["session_id"]])))
     if not changed:
         return []
     # Pages are durable before delivery. The following invocation returns the
@@ -346,7 +443,8 @@ def command_export(args):
             sources = identity_sources(Path(args.identity_map))
             now = time.time()
             row = store.execute("SELECT value FROM meta WHERE key='backfill_start'").fetchone()
-            lower = float(row[0]) if row else (d.parse_since(args.since, now) or now - 86400)
+            requested = d.parse_since(args.since,now)
+            lower = max(float(row[0]),now - 86400) if row else (requested if requested is not None else now - 86400)
             store.execute("INSERT OR IGNORE INTO meta VALUES ('backfill_start', ?)", (str(lower),))
             files = discover(sources, args, lower)
             grouped = defaultdict(list)
@@ -363,7 +461,7 @@ def command_export(args):
             activity_bytes_remaining = args.max_scan_bytes
             for identity_key, paths in sorted(grouped.items()):
                 identity = json.loads(identity_key)
-                signature = digest([PROJECTION_VERSION,d.CACHE_SCHEMA,CLASSIFIER,args.threshold,args.window_steps,[[str(p),s] for p,s in paths]])
+                signature = digest([PROJECTION_VERSION,d.CACHE_SCHEMA,CLASSIFIER,args.threshold,args.window_steps,args.max_response_ids,[[str(p),s] for p,s in paths]])
                 previous = store.execute("SELECT signature FROM sources WHERE identity=?", (identity_key,)).fetchone()
                 if previous and previous[0] == signature:
                     continue
@@ -413,6 +511,7 @@ def command_export(args):
                 d.resolve_claude_thread_metadata(scan)
                 d.rebuild_totals(scan)
                 closures = defaultdict(list)
+                counter_events = []
                 path_signatures = {str(path):stamp for path,stamp in paths}
                 for entry, _, source_path in scan._tool_sources:
                     for session in entry.sessions:
@@ -424,7 +523,7 @@ def command_export(args):
                     scope_key = prefix + encoded(native_id(session))
                     existing_scopes.discard(scope_key)
                     native_events = [e for e in scan.events[identity["harness"]] if e[d.EVENT_SESSION] == session]
-                    closure_signature = digest([PROJECTION_VERSION,d.CACHE_SCHEMA,CLASSIFIER,args.threshold,args.window_steps,closures[session],[[e[d.EVENT_ID],e[d.EVENT_SUB],e[d.EVENT_THREAD]] for e in native_events]])
+                    closure_signature = digest([PROJECTION_VERSION,d.CACHE_SCHEMA,CLASSIFIER,args.threshold,args.window_steps,args.max_response_ids,closures[session],[[e[d.EVENT_ID],e[d.EVENT_SUB],e[d.EVENT_THREAD]] for e in native_events]])
                     previous_closure = store.execute("SELECT signature FROM sources WHERE identity=?", (scope_key,)).fetchone()
                     if previous_closure and previous_closure[0] == closure_signature:
                         continue
@@ -437,6 +536,7 @@ def command_export(args):
                         setattr(selected,field,{key:value for key,value in getattr(scan,field).items() if key == (identity["harness"],session)})
                     selected.thread_metadata = {key:value for key,value in scan.thread_metadata.items() if key[0:2] == (identity["harness"],session)}
                     selected.events[identity["harness"]] = native_events
+                    counter_events.extend(native_events)
                     for entry, source_harness, source_path in scan._tool_sources:
                         if session in entry.sessions:
                             selected.defer_tools(entry,source_harness,source_path)
@@ -447,6 +547,7 @@ def command_export(args):
                     analysis.prompts = d.assemble_prompts(selected,analysis.weights,analysis_args)
                     records.extend(project(analysis,identity,args))
                     updated_scopes.add(encoded([identity,native_id(session)]))
+                    store.execute("INSERT OR REPLACE INTO scope_files VALUES (?,?)",(scope_key,encoded([p for p,_ in closures[session]])))
                     activity_bytes_remaining = analysis_args.activity_read_budget["remaining"]
                     if not analysis_args.activity_read_budget["incomplete"]:
                         store.execute("INSERT OR REPLACE INTO sources VALUES (?,?)", (scope_key,closure_signature))
@@ -454,10 +555,19 @@ def command_export(args):
                         complete_group = False
                 if complete_group:
                     for key in existing_scopes:
+                        previous_files = store.execute("SELECT paths FROM scope_files WHERE scope=?",(key,)).fetchone()
+                        if previous_files and any(Path(p).exists() for p in json.loads(previous_files[0])):
+                            # An inactive source retains its historical snapshot;
+                            # expiration of the scan window is not deletion.
+                            continue
                         removed_session = json.loads(key[len(prefix):])
                         updated_scopes.add(encoded([identity,removed_session]))
                         store.execute("DELETE FROM sources WHERE identity=?", (key,))
+                        store.execute("DELETE FROM scope_files WHERE scope=?",(key,))
                     store.execute("INSERT OR REPLACE INTO sources VALUES (?, ?)", (identity_key, signature))
+                counter_scan = d.Scan()
+                counter_scan.events[identity["harness"]] = counter_events
+                records.append(account_counter_record(store,counter_scan,identity,args,now))
             output = make_batch(store, records, now, args, "incomplete" if incomplete else "complete", updated_scopes)
             health = dict(event="analytics_export_health", schema_version=SCHEMA, observed_at=now,
                 coverage="incomplete" if incomplete else "complete", scan_bytes=total_bytes, files=len(files),
@@ -487,6 +597,7 @@ def add_parser(sub):
     parser.add_argument("--max-records", type=int, default=4000)
     parser.add_argument("--max-output-bytes", type=int, default=8 * 1024 * 1024)
     parser.add_argument("--scan-seconds", type=int, default=90)
+    parser.add_argument("--max-response-ids",type=int,default=1_000_000,help="native response identities retained for monotonic counter deduplication")
     parser.add_argument("--threshold", type=int, default=3)
     parser.add_argument("--window-steps", type=int, default=30)
     parser.set_defaults(handler=command_export, since="24h", quiet=True, json=False)

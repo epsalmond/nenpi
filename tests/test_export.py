@@ -2,6 +2,8 @@
 import json
 import unittest
 import time
+import os
+import sqlite3
 from pathlib import Path
 
 from tests.test_drain import Harness, claude_assistant_line, claude_user_prompt_line
@@ -65,12 +67,12 @@ class Export(Harness):
         page = self.export("--max-records", "2")
         self.assertEqual(len(page), 2)
         kinds = []
-        for _ in range(3):
+        for _ in range(4):
             kinds.append(page[0]["event"])
             self.assertEqual(page, self.export("--max-records", "2"))
             self.export("--ack", page[-1]["batch_id"])
             page = self.export("--max-records", "2")
-        self.assertEqual(set(kinds), {"analytics_prompt", "analytics_partition", "analytics_session"})
+        self.assertEqual(set(kinds), {"analytics_prompt","analytics_partition","analytics_session","analytics_account"})
         self.assertEqual(page[0]["event"], "analytics_export_health")
 
     def test_unknown_prompt_is_excluded_from_human_denominator(self):
@@ -236,6 +238,62 @@ class Export(Harness):
         prompt = next(json.loads(line) for line in output.getvalue().splitlines() if json.loads(line)["event"] == "analytics_prompt")
         self.assertEqual(prompt["revision"],2)
         self.assertEqual(prompt["unknown_turns"],1)
+
+    def test_native_counter_survives_fork_ownership_reassignment(self):
+        self.seed()
+        first = self.export()
+        self.export("--ack",first[-1]["batch_id"])
+        fork = self.write_claude("fork.jsonl",[claude_assistant_line(101,"fork","msg",input_tokens=100,
+            cache_read=200,cache_write_5m=300,cache_write_1h=400,output_tokens=50)])
+        now = time.time()
+        os.utime(fork,(now - 10,now - 10))
+        os.utime(self.claude_projects / "proj/export.jsonl",(now + 10,now + 10))
+        second = self.export()
+        self.assertTrue(any(r.get("session_id") == "fork" for r in second))
+        with sqlite3.connect(self.root / "export.sqlite") as database:
+            self.assertEqual(database.execute("SELECT SUM(value) FROM account_counters WHERE kind='cache_write'").fetchone()[0],700)
+            self.assertEqual(database.execute("SELECT COUNT(*) FROM response_usage").fetchone()[0],1)
+
+    def test_counter_write_ttl_reclassification_does_not_add_tokens(self):
+        line = json.loads(claude_assistant_line(101,"session","msg",input_tokens=100,cache_write_5m=300))
+        line["message"]["usage"].pop("cache_creation")
+        path = self.write_claude("ttl.jsonl",[json.dumps(line)])
+        first = self.export()
+        self.export("--ack",first[-1]["batch_id"])
+        line["message"]["usage"]["cache_creation"] = dict(ephemeral_5m_input_tokens=300,ephemeral_1h_input_tokens=0)
+        path.write_text(json.dumps(line) + "\n")
+        self.export()
+        with sqlite3.connect(self.root / "export.sqlite") as database:
+            self.assertEqual(database.execute("SELECT SUM(value) FROM account_counters WHERE kind='cache_write'").fetchone()[0],300)
+
+    def test_counter_identity_capacity_is_explicit(self):
+        self.seed()
+        first = self.export("--max-response-ids","1")
+        self.export("--ack",first[-1]["batch_id"])
+        self.write_claude("export.jsonl",[claude_assistant_line(102,"session","next",input_tokens=10)])
+        second = self.export("--max-response-ids","1")
+        counter = next(r for r in second if r["event"] == "analytics_account")
+        self.assertFalse(counter["counter_identity_budget_complete"])
+        self.assertEqual(counter["native_responses"],1)
+
+    def test_old_sources_do_not_consume_active_file_budget(self):
+        from nenpi.export import discover
+        from types import SimpleNamespace
+        self.seed()
+        old = self.write_claude("old.jsonl",[])
+        os.utime(old,(1,1))
+        sources = [dict(harness="claude",root=self.claude_projects.parent,provider="anthropic",account_alias="personal")]
+        files = discover(sources,SimpleNamespace(max_files=1,scan_seconds=10),time.time() - 86400)
+        self.assertEqual(len(files),1)
+
+    def test_source_window_expiration_preserves_historical_snapshots(self):
+        self.seed()
+        first = self.export()
+        self.export("--ack",first[-1]["batch_id"])
+        path = self.claude_projects / "proj/export.jsonl"
+        os.utime(path,(1,1))
+        batch = self.export()
+        self.assertFalse(any(r.get("deleted") for r in batch))
 
 
 if __name__ == "__main__":

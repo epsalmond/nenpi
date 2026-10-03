@@ -26,6 +26,20 @@ by the current human prompt. Full native lineage IDs and allowlisted native
 Claude agent types are exported. An implementation role is known only when
 the native type explicitly says `implementation`.
 
+`analytics_account` provides monotonic observed token counters keyed by
+provider/account and native response ID. Its token kinds are `input_processed`,
+aggregate `cache_write` and `output`; writes are a subset of processed input.
+Aggregating write TTLs prevents a later TTL classification from counting
+the same write again. Counters use each native response's maximum observed
+value, so fork reassignment and replay do not add tokens. Downward corrections
+remain visible in the latest prompt/partition snapshots.
+Missing response IDs are excluded from counters. `response_identity_known_turns`
+and account `measurements` report coverage; absent measurements are not zero.
+The private ledger retains at most 1,000,000 response identities, adjustable
+with `--max-response-ids`, and exposes an exhausted-budget flag.
+Back up the export and consumer stores together; removing the ledger loses
+the history needed to deduplicate requests.
+
 Native token kinds stay separate: Claude input, cache read, write at five-minute
 TTL, write at one-hour TTL, write with unknown TTL, and output; Codex uncached
 input, cached input, cache write and output.
@@ -57,10 +71,12 @@ children revise existing logical records. Updated prompts reemit all current
 partitions and zero-valued tombstones for disappeared partitions. Journal
 flushing is best effort; it is not a Loki acknowledgement.
 
-Defaults are a 24-hour initial source-mtime backfill, 10,000 discovered files,
+Defaults are a 24-hour initial source-mtime backfill, 10,000 active source files,
 64 MiB of incremental native parsing, 64 MiB of operation/result classification
 reads, 90 seconds before beginning another scan unit, 4,000 records and 8 MiB
-per delivery page. Native parse offsets persist when a scan budget expires;
+per delivery page. Later scans revisit files written within 24 hours. Existing
+inactive files retain historical snapshots; window expiration is not deletion.
+Native parse offsets persist when a scan budget expires;
 the next scheduled invocation continues. A single JSONL record larger than
 the parse budget requires increasing `--max-scan-bytes`. Large classification
 sources retain unknown association rather than exceeding the read budget.
@@ -70,7 +86,8 @@ SQLite store under `~/.local/state/nenpi/analytics.sqlite`.
 
 `analytics_export_health` reports complete/incomplete scan coverage when no
 batch is produced; pending pages also carry coverage on their final marker.
-Source signatures skip unchanged projection work. Native shard schema 10 and
+Source and session-closure signatures skip unchanged projection work. Projection
+lookups use an index of changed session scopes. Native shard schema 10 and
 operation cache schema 7 preserve token presence and bounded tool families;
 old shards rebuild on the next read. The cache and export do not change quota
 weights, calibration, statusline sampling or the burn governor.
