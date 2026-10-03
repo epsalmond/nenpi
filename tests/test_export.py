@@ -158,6 +158,31 @@ class Export(Harness):
         self.assertEqual(batch[-1]["coverage"], "incomplete")
         self.assertFalse(any(r.get("deleted") for r in batch))
 
+    def test_classification_limit_does_not_starve_another_cached_account(self):
+        sources = []
+        for alias,output in (("aaa",50),("bbb",7)):
+            root = self.home / (".claude-" + alias)
+            path = root / "projects/proj/session.jsonl"
+            path.parent.mkdir(parents=True)
+            path.write_text(claude_user_prompt_line(100,"session",text="private") + "\n" +
+                claude_assistant_line(101,"session","message",input_tokens=10,output_tokens=output) + "\n")
+            sources.append(dict(harness="claude",source_root=str(root),provider="anthropic",account_alias=alias))
+        mapping = self.root / "mapped.json"
+        mapping.write_text(json.dumps(dict(sources=sources)))
+        command = ["export","--identity-map",str(mapping),"--export-state",str(self.root / "export.sqlite")]
+        first = self.run_tool(*command)
+        self.assertEqual(first.returncode,0,first.stderr)
+        batch = [json.loads(r) for r in first.stdout.splitlines()]
+        self.assertEqual(self.run_tool(*command,"--ack",batch[-1]["batch_id"]).returncode,0)
+        first_path = Path(sources[0]["source_root"]) / "projects/proj/session.jsonl"
+        first_path.write_text(first_path.read_text().replace('"output_tokens": 50','"output_tokens": 55'))
+        # Native data fits; a classification reread requires twice the budget.
+        result = self.run_tool(*command,"--threshold","4","--max-scan-bytes",str(first_path.stat().st_size))
+        self.assertEqual(result.returncode,0,result.stderr)
+        batch = [json.loads(r) for r in result.stdout.splitlines()]
+        self.assertEqual(batch[-1]["coverage"],"incomplete")
+        self.assertEqual({r["account_alias"] for r in batch if r["event"] == "analytics_prompt"},{"aaa","bbb"})
+
     def test_classifier_budget_limit_marks_batch_incomplete_and_retries(self):
         self.seed()
         path = self.claude_projects / "proj/export.jsonl"
