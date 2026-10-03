@@ -24,6 +24,8 @@ from .polling_report import flag_responses
 
 SCHEMA = 1
 CLASSIFIER = "closed-recipes-v1"
+# Projection semantics can change without changing the consumer's wire schema.
+PROJECTION_VERSION = 2
 LABEL = re.compile(r"[a-zA-Z][a-zA-Z0-9_.-]{0,47}\Z")
 NATIVE_ID = re.compile(r"[A-Za-z0-9_.:-]{1,160}\Z")
 AGENT_TYPES = {"general-purpose", "Explore", "Plan", "implementation", "review", "implementer", "reviewer"}
@@ -361,7 +363,7 @@ def command_export(args):
             activity_bytes_remaining = args.max_scan_bytes
             for identity_key, paths in sorted(grouped.items()):
                 identity = json.loads(identity_key)
-                signature = digest([[str(p), s] for p, s in paths])
+                signature = digest([PROJECTION_VERSION,d.CACHE_SCHEMA,CLASSIFIER,args.threshold,args.window_steps,[[str(p),s] for p,s in paths]])
                 previous = store.execute("SELECT signature FROM sources WHERE identity=?", (identity_key,)).fetchone()
                 if previous and previous[0] == signature:
                     continue
@@ -422,7 +424,7 @@ def command_export(args):
                     scope_key = prefix + encoded(native_id(session))
                     existing_scopes.discard(scope_key)
                     native_events = [e for e in scan.events[identity["harness"]] if e[d.EVENT_SESSION] == session]
-                    closure_signature = digest([closures[session], [[e[d.EVENT_ID],e[d.EVENT_SUB],e[d.EVENT_THREAD]] for e in native_events]])
+                    closure_signature = digest([PROJECTION_VERSION,d.CACHE_SCHEMA,CLASSIFIER,args.threshold,args.window_steps,closures[session],[[e[d.EVENT_ID],e[d.EVENT_SUB],e[d.EVENT_THREAD]] for e in native_events]])
                     previous_closure = store.execute("SELECT signature FROM sources WHERE identity=?", (scope_key,)).fetchone()
                     if previous_closure and previous_closure[0] == closure_signature:
                         continue

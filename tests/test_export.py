@@ -219,6 +219,24 @@ class Export(Harness):
         self.assertNotEqual(native_id("private native id one"),native_id("private native id two"))
         self.assertNotIn("private",native_id("private native id one"))
 
+    def test_projection_upgrade_revisits_unchanged_sources(self):
+        import contextlib
+        import io
+        from unittest.mock import patch
+        from nenpi import export as exporter
+        from nenpi import drain
+        self.seed()
+        first = self.export()
+        self.export("--ack",first[-1]["batch_id"])
+        output = io.StringIO()
+        with self.env_applied(),patch.object(exporter,"PROJECTION_VERSION",exporter.PROJECTION_VERSION + 1), \
+                patch.object(exporter,"native_lineage",return_value="unknown"),contextlib.redirect_stdout(output),contextlib.redirect_stderr(io.StringIO()):
+            result = drain.main(["export","--identity-map",str(self.root / "identities.json"),"--export-state",str(self.root / "export.sqlite")])
+        self.assertEqual(result,0)
+        prompt = next(json.loads(line) for line in output.getvalue().splitlines() if json.loads(line)["event"] == "analytics_prompt")
+        self.assertEqual(prompt["revision"],2)
+        self.assertEqual(prompt["unknown_turns"],1)
+
 
 if __name__ == "__main__":
     unittest.main()
