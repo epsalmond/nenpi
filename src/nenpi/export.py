@@ -456,7 +456,8 @@ def command_export(args):
                 grouped[encoded(identity)].append((path, signature))
             records = []
             updated_scopes = set()
-            incomplete = any(not source["root"].is_dir() for source in sources)
+            source_incomplete = any(not source["root"].is_dir() for source in sources)
+            incomplete = False
             classification_incomplete = False
             total_bytes = 0
             closure_file_count = len(files)
@@ -597,7 +598,7 @@ def command_export(args):
                 counter_scan = d.Scan()
                 counter_scan.events[identity["harness"]] = counter_events
                 records.append(account_counter_record(store,counter_scan,identity,args,now))
-            coverage = "incomplete" if incomplete or classification_incomplete else "complete"
+            coverage = "incomplete" if incomplete or classification_incomplete or source_incomplete else "complete"
             output = make_batch(store, records, now, args, coverage, updated_scopes)
             health = dict(event="analytics_export_health", schema_version=SCHEMA, observed_at=now,
                 coverage=coverage, scan_bytes=total_bytes, files=len(files),

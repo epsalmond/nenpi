@@ -181,6 +181,23 @@ class Export(Harness):
         self.assertEqual(result.returncode,0,result.stderr)
         batch = [json.loads(r) for r in result.stdout.splitlines()]
         self.assertEqual(batch[-1]["coverage"],"incomplete")
+
+    def test_unavailable_mapped_root_does_not_starve_available_account(self):
+        self.seed()
+        mapping = self.root / "mapped.json"
+        mapping.write_text(json.dumps(dict(sources=[
+            dict(harness="claude", source_root=str(self.home / ".claude-unavailable"),
+                 provider="anthropic", account_alias="missing"),
+            dict(harness="claude", source_root=str(self.claude_projects.parent),
+                 provider="anthropic", account_alias="personal") ])))
+        result = self.run_tool("export", "--since", "1970-01-01", "--identity-map", str(mapping),
+                               "--export-state", str(self.root / "export.sqlite"))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        batch = [json.loads(line) for line in result.stdout.splitlines()]
+        prompts = [r for r in batch if r["event"] == "analytics_prompt"]
+        self.assertEqual(len(prompts), 1)
+        self.assertEqual((prompts[0]["account_alias"], prompts[0]["output_tokens"]), ("personal", 50))
+        self.assertEqual(batch[-1]["coverage"], "incomplete")
         self.assertEqual({r["account_alias"] for r in batch if r["event"] == "analytics_prompt"},{"aaa","bbb"})
 
     def test_classifier_budget_limit_marks_batch_incomplete_and_retries(self):
