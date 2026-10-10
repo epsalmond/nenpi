@@ -137,6 +137,8 @@ CLAUDE_PRICES = {
 # they are guessed at the sol rate and flagged.
 CODEX_CREDITS = {
     "gpt-6-astra": (250.0, 25.0, 1250.0, False),
+    "gpt-6.1-sol": (50.0, 2.5, 250.0, False),
+    "gpt-6-luna": (2.5, 0.25, 12.5, False),
     "gpt-5.6-sol": (100.0, 10.0, 500.0, False),
     "gpt-5.6-terra": (50.0, 5.0, 300.0, False),
     "gpt-5.6-luna": (5.0, 0.5, 30.0, False),
@@ -154,6 +156,18 @@ CODEX_MODEL_ALIASES = {
     "terra": "gpt-5.6-terra",
     "astra": "gpt-6-astra",
 }
+
+# A model missing from the weight table is priced as the current model of the
+# tier its name contains, else the middle tier, and flagged as guessed; pricing
+# it at zero would hide its usage and hand its measured drain to other sessions.
+MODEL_TIERS = {
+    "codex": (("astra", "gpt-6-astra"), ("sol", "gpt-6.1-sol"),
+              ("terra", "gpt-5.6-terra"), ("luna", "gpt-6-luna")),
+    "claude": (("fable", "claude-fable-5-1"), ("opus", "claude-opus-5"),
+               ("sonnet", "claude-sonnet-5"), ("haiku", "claude-haiku-4-5")),
+}
+DEFAULT_TIER_MODEL = {"codex": "gpt-6.1-sol", "claude": "claude-sonnet-5"}
+MODEL_NAME_PARTS = re.compile(r"[^a-z0-9]+")
 
 CLAUDE_DATE_SUFFIX = re.compile(r"-20\d{6}$")
 DURATION_ARG = re.compile(r"^(\d+(?:\.\d+)?)([hdwm])$")
@@ -611,8 +625,37 @@ class Weights:
         models = section.get("models") or {}
         entry = models.get(model)
         resolved = entry if isinstance(entry, Mapping) else None
+        if resolved is None:
+            resolved = self.guessed_entry(harness, model, models)
         entries[key] = resolved
         return resolved
+
+    def guessed_entry(
+        self, harness: str, model: str, models: Mapping[str, Any]
+    ) -> Optional[Mapping[str, Any]]:
+        """Price an unrecognised model as its tier's current model, flagged."""
+        if not model or model == UNWEIGHTED or harness not in MODEL_TIERS:
+            return None
+        parts = set(MODEL_NAME_PARTS.split(model.lower()))
+        priced_as = DEFAULT_TIER_MODEL[harness]
+        for tier, current in MODEL_TIERS[harness]:
+            if tier in parts:
+                priced_as = current
+                break
+        base = models.get(priced_as)
+        if not isinstance(base, Mapping):
+            return None
+        if harness == "claude":
+            # Resolve null (unfitted) coefficients against the model priced
+            # as, since `claude_price` cannot look the guessed name up.
+            guessed = dict(
+                (kind, claude_price(base, priced_as, kind)) for kind in CLAUDE_KINDS
+            )  # type: Dict[str, Any]
+        else:
+            guessed = dict(base)
+        guessed["guessed"] = True
+        guessed["priced_as"] = priced_as
+        return guessed
 
     def price_row(
         self, harness: str, model: str, cache_read_weight: Optional[float] = None
@@ -3004,6 +3047,8 @@ class Scan:
         # (harness, session) -> {boundary epoch: redacted prompt label}. One
         # short line per prompt; see `prompt_label`.
         self.prompt_labels = {}  # type: Dict[Tuple[str, str], Dict[float, str]]
+        # (harness, session) -> the harness's own redacted thread title.
+        self.session_titles = {}  # type: Dict[Tuple[str, str], str]
         self.compactions = {}  # type: Dict[Tuple[str, str], List[float]]
         self.claimed = {}  # type: Dict[Tuple[str, str], str]
         # First in-memory event row for a deduplicated message ID. Claude
@@ -3074,6 +3119,34 @@ class Scan:
         self._tool_filters = []
 
 
+def codex_session_titles(roots: Sequence[Path]) -> Dict[Tuple[str, str], str]:
+    """The thread names `codex resume` lists, from each root's session_index.
+
+    A rename appends a later entry for the same id, so the last one wins.
+    Titles are summaries of a prompt, so they get the prompt label's cut and
+    redaction.
+    """
+    titles = {}  # type: Dict[Tuple[str, str], str]
+    for root in roots:
+        try:
+            handle = open(root / "session_index.jsonl", "r", encoding="utf-8")
+        except OSError:
+            continue
+        with handle:
+            for line in handle:
+                try:
+                    entry = json.loads(line)
+                except ValueError:
+                    continue
+                if not isinstance(entry, dict):
+                    continue
+                session_id, name = entry.get("id"), entry.get("thread_name")
+                if isinstance(session_id, str) and isinstance(name, str) and name.strip():
+                    title = redact_label(" ".join(name.split()))[:PROMPT_LABEL_CHARS]
+                    titles[("codex", session_id)] = title
+    return titles
+
+
 def collect(
     args: argparse.Namespace,
     since: Optional[float],
@@ -3089,6 +3162,7 @@ def collect(
 
     targets = []  # type: List[Tuple[Path, str, Path]]
     target_keys = set()
+    codex_roots = []  # type: List[Path]
 
     def add_target(path: Path, kind: str, root: Path) -> None:
         key = (kind, str(path.resolve()))
@@ -3111,6 +3185,7 @@ def collect(
             if not getattr(args, "discover", True)
             else resolve_roots("codex", args.codex_root, config)
         )
+        codex_roots = list(roots)
         for path, root in codex_transcripts(roots, run.cancellation):
             add_target(path, "codex", root)
     run.files_seen = len(targets)
@@ -3140,6 +3215,7 @@ def collect(
 
     scan = Scan()
     scan.files_seen = len(targets)
+    scan.session_titles = codex_session_titles(codex_roots)
     progress = Progress(
         sys.stderr.isatty()
         and not getattr(args, "no_color", False)
@@ -3580,6 +3656,9 @@ def build_intervals(
         current = UNSET  # type: Any
         running = 0.0
         anchor_ts = None  # type: Optional[float]
+        # (high-water mark, its anchor) held across a drop that is not yet
+        # confirmed by a second reading.
+        held = None  # type: Optional[Tuple[float, Optional[float]]]
         for row in rows:
             if watch:
                 check_cancelled(cancellation)
@@ -3618,7 +3697,16 @@ def build_intervals(
                         Interval(key, start, row["ts"], drain, row.get("resets_at"), True)
                     )
                 current, running, anchor_ts = bucket, used, row["ts"]
+                held = None
                 continue
+            if held is not None:
+                # Concurrent sessions interleave snapshots, and one can write
+                # a stale, lower reading. A drop the very next reading climbs
+                # back from was that stale reading, so the high-water mark
+                # stands; one the next reading stays below is confirmed.
+                if used >= held[0] - JITTER_TOLERANCE:
+                    running, anchor_ts = held
+                held = None
             delta = used - running
             if delta <= 0:
                 # A same-bucket reset cannot happen, so a decrease is vendor
@@ -3628,6 +3716,7 @@ def build_intervals(
                 # as the baseline so the next rise is not re-charged for
                 # percent already attributed against the old high-water mark.
                 if delta < 0 and (running - used) > JITTER_TOLERANCE:
+                    held = (running, anchor_ts)
                     running, anchor_ts = used, row["ts"]
                 continue
             # `used_percent` is reported in whole percent, so a step covers
@@ -5621,6 +5710,19 @@ class Row:
         self.resent_units = 0.0
         self.account = ""
         self.account_label = ""
+        self.title = ""
+
+
+def session_title(scan: Scan, harness: str, session_id: str) -> str:
+    """The harness's own thread title, else the session's first prompt label."""
+    title = scan.session_titles.get((harness, session_id))
+    if title:
+        return title
+    labels = scan.prompt_labels.get((harness, session_id)) or {}
+    for epoch in sorted(labels):
+        if labels[epoch]:
+            return labels[epoch]
+    return ""
 
 
 def session_rows(
@@ -5656,6 +5758,8 @@ def session_rows(
         if not summary.models and not summary.sub_models:
             continue
         row = Row(summary)
+        if getattr(args, "label", True) is not False:
+            row.title = session_title(scan, harness, session_id)
         account = scan.session_accounts.get((harness, session_id))
         if account is not None:
             row.account, row.account_label = account
@@ -5918,9 +6022,15 @@ def header_lines(
     for row in rows:
         target = used_claude if row.summary.harness == "claude" else used_codex
         target.update(row.summary.models)
-    guessed = weights.guessed_models("codex", used_codex)
-    if guessed:
-        lines.append("caveat: guessed Codex weights for %s (weights_guessed)" % ", ".join(guessed))
+    for harness, used, name in (("codex", used_codex, "Codex"), ("claude", used_claude, "Claude")):
+        guessed = []
+        for model in weights.guessed_models(harness, used):
+            priced_as = (weights.model_entry(harness, model) or {}).get("priced_as")
+            guessed.append("%s (priced as %s)" % (model, priced_as) if priced_as else model)
+        if guessed:
+            lines.append(
+                "caveat: guessed %s weights for %s (weights_guessed)" % (name, ", ".join(guessed))
+            )
     if any(row.summary.harness == "claude" for row in rows):
         if args.claude_cache_read_weight is None:
             lines.append(
@@ -6075,6 +6185,8 @@ def render_sessions(rows: Sequence[Row], args: argparse.Namespace, paint: Painte
             body += " " + paint(bar(row.relative, 1.0, bar_width), style)
         lines.append(body)
         detail = []
+        if row.title:
+            detail.append('"%s"' % row.title)
         if row.api_turns:
             detail.append(
                 "api turns %d, turns/prompt p90 %.0f, peak context %s"
@@ -6108,14 +6220,28 @@ def score_rows(rows: Sequence[Row]) -> None:
     modelled dollar equivalent. The two cannot share a scale, so ranking and
     the bar both use a within-harness fraction.
     """
+    # A row with no measured drain yet (no interval covers it) has only
+    # units; put it on its harness's measured scale so it is not ranked
+    # units-against-percent.
+    measured = {}  # type: Dict[str, List[float]]
+    for row in rows:
+        if row.drain_percent is not None and row.units > 0:
+            totals = measured.setdefault(row.summary.harness, [0.0, 0.0])
+            totals[0] += row.drain_percent
+            totals[1] += row.units
+    rates = {harness: drain / units for harness, (drain, units) in measured.items()}
+
+    def value(row: Row) -> float:
+        if row.drain_percent is not None:
+            return row.drain_percent
+        return (row.units or 0.0) * rates.get(row.summary.harness, 1.0)
+
     peaks = {}  # type: Dict[str, float]
     for row in rows:
-        value = row.drain_percent if row.drain_percent is not None else row.units
-        peaks[row.summary.harness] = max(peaks.get(row.summary.harness, 0.0), value or 0.0)
+        peaks[row.summary.harness] = max(peaks.get(row.summary.harness, 0.0), value(row))
     for row in rows:
-        value = row.drain_percent if row.drain_percent is not None else row.units
         peak = peaks.get(row.summary.harness) or 0.0
-        row.relative = (value or 0.0) / peak if peak > 0 else 0.0
+        row.relative = value(row) / peak if peak > 0 else 0.0
 
 
 def sort_rows(rows: List[Row], key: str) -> List[Row]:
@@ -6133,6 +6259,7 @@ def row_json(row: Row) -> Dict[str, Any]:
         "session_id": summary.session_id,
         "short_id": short_id(summary.session_id),
         "cwd": summary.cwd,
+        "title": row.title,
         "primary_model": row.primary_model,
         "start": summary.start,
         "end": summary.end,
@@ -8859,6 +8986,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--sort", choices=("drain", "tokens", "start"), default="drain",
         help="sort by within-harness drain share, token count, or newest start "
              "(default: drain)",
+    )
+    session_label = sessions.add_mutually_exclusive_group()
+    session_label.add_argument(
+        "--label", dest="label", action="store_true", default=True,
+        help="show each session's title: Codex's thread name, else its first "
+             "redacted prompt label (the default)",
+    )
+    session_label.add_argument(
+        "--no-label", dest="label", action="store_false",
+        help="hide session titles",
     )
     sessions.set_defaults(handler=command_sessions)
 

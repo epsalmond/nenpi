@@ -197,7 +197,7 @@ class ShakeReport(Harness):
         ]
         child_lines = [
             codex_subagent_meta_line(now + 1, child, self.session, "/project"),
-            codex_turn_context_line(now + 2, "gpt-5-codex"),
+            codex_turn_context_line(now + 2, "unweighted"),
             codex_task_started_line(now + 2),
             codex_usage_record_line(now + 3.1, child, input_tokens=200_000,
                                     cached_input_tokens=195_000, output_tokens=20),

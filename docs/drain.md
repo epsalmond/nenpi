@@ -335,6 +335,11 @@ walks forward, keeping a running maximum:
   decrease is a real drop and becomes the new baseline (but still emits no
   interval - a same-bucket reset cannot happen), so the next rise is not
   re-charged against percent already attributed to the old high-water mark.
+  The drop is only provisional until the next reading: concurrent sessions
+  interleave their snapshots and one can write a stale, lower reading
+  (53, 47, 53). If the next reading climbs back to within `JITTER_TOLERANCE`
+  of the old high-water mark, the dip was stale and the high-water mark and
+  its anchor stand; otherwise the drop is confirmed.
 - A reading from a window that has already rolled over is a stale poll from a
   concurrent session and is dropped.
 - Otherwise (same bucket, a rise past the running maximum) drain is the
@@ -486,9 +491,10 @@ dollar-denominated metering. Built-in prices (USD per million tokens):
 | claude-haiku-4-5 | 1.00 | 0.10 | 1.25 | 2.00 | 5.00 |
 
 Model ids are normalised by stripping a trailing date suffix, so
-`claude-haiku-4-5-20251001` prices as `claude-haiku-4-5`. `<synthetic>` and
-unrecognised model strings are counted in an `unweighted` bucket and priced at
-zero; the header reports the total.
+`claude-haiku-4-5-20251001` prices as `claude-haiku-4-5`. `<synthetic>` is
+counted in an `unweighted` bucket and priced at zero; the header reports the
+total. Unrecognised model strings are priced as a guess (see the Codex weights
+below).
 
 Working directories are stored and printed as a **basename only**, with a
 stable hash of the full path for grouping. The full path is customer-
@@ -815,6 +821,8 @@ Built-in Codex weights come from the OpenAI credit rate card
 | model | input | cached | output |
 | --- | --- | --- | --- |
 | gpt-6-astra | 250 | 25 | 1250 |
+| gpt-6.1-sol | 50 | 2.5 | 250 |
+| gpt-6-luna | 2.5 | 0.25 | 12.5 |
 | gpt-5.6-sol | 100 | 10 | 500 |
 | gpt-5.6-terra | 50 | 5 | 300 |
 | gpt-5.6-luna | 5 | 0.5 | 30 |
@@ -822,8 +830,16 @@ Built-in Codex weights come from the OpenAI credit rate card
 `gpt-5.5`, `gpt-5.4`, `gpt-5.4-mini`, `gpt-5.3-codex` and
 `gpt-5.3-codex-spark` have no published rate. They are guessed at the sol rate
 and carry `"guessed": true`, which the report header names. Model strings are
-lowercased, and `luna` / `gpt-luna` map to `gpt-5.6-luna`; anything else
-unrecognised is left unweighted.
+lowercased, and `luna` / `gpt-luna` map to `gpt-5.6-luna`.
+
+Any other model missing from the table is priced as a guess, not at zero:
+pricing it at zero would hide its usage and hand its share of measured drain
+to whichever weighted sessions ran beside it. It takes the rate of the current
+model of the tier its name contains (`astra`, `sol`, `terra`, `luna` for Codex;
+`fable`, `opus`, `sonnet`, `haiku` for Claude), else the middle tier
+(`gpt-6.1-sol`, `claude-sonnet-5`). The header names each one as
+`caveat: guessed Codex weights for gpt-7-luna (priced as gpt-6-luna)`. Add
+the model to a weights override to replace the guess.
 
 ## Performance and state
 
