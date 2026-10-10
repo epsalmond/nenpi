@@ -335,6 +335,11 @@ walks forward, keeping a running maximum:
   decrease is a real drop and becomes the new baseline (but still emits no
   interval - a same-bucket reset cannot happen), so the next rise is not
   re-charged against percent already attributed to the old high-water mark.
+  The drop is only provisional until the next reading: concurrent sessions
+  interleave their snapshots and one can write a stale, lower reading
+  (53, 47, 53). If the next reading climbs back to within `JITTER_TOLERANCE`
+  of the old high-water mark, the dip was stale and the high-water mark and
+  its anchor stand; otherwise the drop is confirmed.
 - A reading from a window that has already rolled over is a stale poll from a
   concurrent session and is dropped.
 - Otherwise (same bucket, a rise past the running maximum) drain is the

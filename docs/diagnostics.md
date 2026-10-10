@@ -158,8 +158,10 @@ and coverage details.
 the first line the person typed, cut to 120 characters and scrubbed of email
 addresses and secret-shaped tokens. Injected blocks and pasted content never
 become a label — a turn that is only an injected block is named, not quoted.
-That short **label** is the only prompt text nenpi stores or prints;
-`--no-label` hides it. With `--session` it is the per-prompt breakdown of one
+That short **label** is the only prompt text nenpi stores or prints, besides
+the Codex thread name (`session_index.jsonl`) that `nenpi sessions` shows as
+each session's title, with the same cut and redaction, falling back to the
+first prompt label; `--no-label` hides either. With `--session` it is the per-prompt breakdown of one
 session, unchanged.
 
 Add `--prompt N --drilldown` to inspect one prompt's root, child-agent, and

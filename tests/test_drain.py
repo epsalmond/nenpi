@@ -658,6 +658,35 @@ class CodexParsing(Harness):
         # 0.1 Mtok uncached * 100 + 0.05 Mtok cached * 10 + 0.006 Mtok out * 500
         self.assertAlmostEqual(row["weighted_units"], 10.0 + 0.5 + 3.0, places=6)
 
+    def test_session_title_comes_from_codex_session_index(self) -> None:
+        # The thread name `codex resume` shows is what makes a session
+        # recognisable; a rename appends a later entry, which wins.
+        now = time.time() - 1200
+        session = "codex-ttt-4444"
+        self.write_codex(
+            "rollout-4-ttt.jsonl",
+            [
+                codex_session_meta_line(now, session, "/home/agent/repo"),
+                codex_turn_context_line(now, "gpt-5.6-sol"),
+                codex_usage_record_line(
+                    now + 10, session,
+                    input_tokens=1_000, cached_input_tokens=0, output_tokens=100,
+                ),
+            ],
+        )
+        index = self.codex_sessions.parent / "session_index.jsonl"
+        index.write_text(
+            json.dumps({"id": session, "thread_name": "First name"}) + "\n"
+            + json.dumps({"id": session, "thread_name": "Orchestrate work for a@b.com"}) + "\n",
+            encoding="utf-8",
+        )
+        row = self.run_json("sessions", "--harness", "codex", "--json")["sessions"][0]
+        self.assertEqual(row["title"], "Orchestrate work for [redacted]")
+        text = self.run_tool("sessions", "--harness", "codex").stdout.decode("utf-8")
+        self.assertIn("Orchestrate work for [redacted]", text)
+        hidden = self.run_tool("sessions", "--harness", "codex", "--no-label")
+        self.assertNotIn("Orchestrate", hidden.stdout.decode("utf-8"))
+
     def test_cumulative_fallback_when_no_usage_records(self) -> None:
         now = time.time() - 1200
         session = "codex-bbb-2222"
@@ -961,6 +990,37 @@ class DrainIntervalRules(Harness):
         self.assertEqual(intervals[0].start, now)
         self.assertEqual(intervals[0].end, now + 1200)
 
+    def test_lone_stale_reading_does_not_recharge_the_high_water_mark(self) -> None:
+        # Concurrent sessions interleave their snapshots, and one can report
+        # a stale, lower reading: 53 -> 47 -> 53 -> 54. The dip is
+        # contradicted by the very next reading, so only the 1-point rise to
+        # 54 is drain; re-charging 47 -> 53 doubled one day's measured drain.
+        now = time.time() - 3600
+        resets = int(now) + 7200
+        rows = [
+            self.make_row(now, 53.0, resets),
+            self.make_row(now + 10, 47.0, resets),
+            self.make_row(now + 20, 53.0, resets),
+            self.make_row(now + 600, 54.0, resets),
+        ]
+        intervals = QD.build_intervals(rows, 300)
+        self.assertEqual([interval.drain for interval in intervals], [1.0])
+        self.assertEqual(intervals[0].start, now)
+
+    def test_unmeasured_codex_session_ranks_on_the_measured_scale(self) -> None:
+        # A session with no interval yet has only units. Ranking 21 units
+        # against a peak of 24.7 percent put a 7-minute session second.
+        def row(session_id: str, units: float, drain: Optional[float]) -> Any:
+            item = QD.Row(QD.SessionSummary("codex", session_id))
+            item.units, item.drain_percent = units, drain
+            return item
+
+        rows = [row("big", 1458.0, 24.7), row("mid", 842.0, 13.2), row("new", 21.0, None)]
+        QD.score_rows(rows)
+        ranked = [item.summary.session_id for item in QD.sort_rows(rows, "drain")]
+        self.assertEqual(ranked, ["big", "mid", "new"])
+        self.assertLess(rows[2].relative, 0.05)
+
     def test_decrease_beyond_tolerance_is_not_jitter(self) -> None:
         now = time.time() - 3600
         resets = int(now) + 7200
@@ -978,8 +1038,10 @@ class DrainIntervalRules(Harness):
         snapshots = [
             self.make_row(now, 80.0, resets, window_minutes=10080),
             self.make_row(now + 60, 20.0, resets, window_minutes=10080),
+            self.make_row(now + 90, 20.0, resets, window_minutes=10080),
             self.make_row(now + 120, 90.0, resets, window_minutes=10080),
             self.make_row(now + 180, 10.0, resets, window_minutes=10080),
+            self.make_row(now + 210, 10.0, resets, window_minutes=10080),
             self.make_row(now + 240, 90.0, resets, window_minutes=10080),
         ]
         intervals = QD.build_intervals(snapshots, 10080)
