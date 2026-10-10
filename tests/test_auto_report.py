@@ -122,7 +122,7 @@ class AutoReport(Harness):
         self.assertEqual(second["summary"]["unlinked_tool_results"], 1)
 
     def test_unknown_weights_do_not_hide_input_burden(self):
-        self.loop(20, model="unknown-future-model")
+        self.loop(20, model="unweighted")
         result = self.report()
         self.assertEqual(result["summary"]["responses"], 20)
         self.assertEqual(result["summary"]["unweighted_responses"], 20)

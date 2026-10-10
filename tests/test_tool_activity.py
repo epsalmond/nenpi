@@ -82,7 +82,7 @@ class ToolActivityReport(Harness):
         now = time.time() - 3600
         self.write_codex("rollout-activity.jsonl", [
             codex_session_meta_line(now, self.session, "/project"),
-            codex_turn_context_line(now + 1, "gpt-5-codex"),
+            codex_turn_context_line(now + 1, "unweighted"),
             codex_task_started_line(now + 1),
             codex_tool_call_line(now + 2, "search", "exec", item="custom_tool_call",
                                  command='await tools.exec_command({cmd:"rg -n UNIQUE_SEARCH src"});'),
@@ -92,7 +92,7 @@ class ToolActivityReport(Harness):
             codex_tool_output_line(now + 3, "poll", "", item="custom_tool_call_output"),
             codex_usage_record_line(now + 4, self.session, input_tokens=5000,
                                     cached_input_tokens=4000, output_tokens=50, turn_id="one"),
-            codex_turn_context_line(now + 10, "gpt-5-codex"),
+            codex_turn_context_line(now + 10, "unweighted"),
             codex_task_started_line(now + 10),
             codex_tool_call_line(now + 11, "edit", "exec", item="custom_tool_call",
                                  command='await tools.apply_patch("UNIQUE_PATCH_BODY");'),
@@ -175,7 +175,7 @@ class ToolActivityReport(Harness):
         thread = "24000000-1111-2222-3333-444444444444"
         self.write_codex("rollout-child.jsonl", [
             codex_subagent_meta_line(now + 2, thread, self.session, "/project"),
-            codex_turn_context_line(now + 2, "gpt-5-codex"),
+            codex_turn_context_line(now + 2, "unweighted"),
             codex_tool_call_line(now + 3, "child", "exec", item="custom_tool_call",
                                  command='await tools.exec_command({cmd:"git diff"});'),
             codex_tool_output_line(now + 4, "child", "diff", item="custom_tool_call_output"),
@@ -209,12 +209,12 @@ class ToolActivityReport(Harness):
         now = time.time() - 3600
         self.write_codex("rollout-boundary.jsonl", [
             codex_session_meta_line(now, self.session, "/project"),
-            codex_turn_context_line(now + 1, "gpt-5-codex"),
+            codex_turn_context_line(now + 1, "unweighted"),
             codex_task_started_line(now + 1),
             codex_tool_call_line(now + 2, "first", "exec", item="custom_tool_call",
                                  command='await tools.write_stdin({session_id:7, chars:""});'),
             codex_tool_output_line(now + 3, "first", "ok", item="custom_tool_call_output"),
-            codex_turn_context_line(now + 4, "gpt-5-codex"),
+            codex_turn_context_line(now + 4, "unweighted"),
             codex_tool_call_line(now + 5, "second", "exec", item="custom_tool_call",
                                  command='await tools.write_stdin({session_id:7, chars:""});'),
             codex_tool_output_line(now + 6, "second", "ok", item="custom_tool_call_output"),
@@ -235,7 +235,7 @@ class ToolActivityReport(Harness):
         now = time.time() - 3600
         self.write_codex("rollout-output-order.jsonl", [
             codex_session_meta_line(now, self.session, "/project"),
-            codex_turn_context_line(now + 1, "gpt-5-codex"),
+            codex_turn_context_line(now + 1, "unweighted"),
             codex_task_started_line(now + 1),
             codex_tool_call_line(now + 2, "one", "exec", item="custom_tool_call",
                                  command='await tools.write_stdin({session_id:7, chars:""});'),
@@ -267,7 +267,7 @@ class ToolActivityReport(Harness):
         sentinel = "RESULT_BODY_MUST_NOT_BE_DECODED"
         self.write_codex("rollout-large-output.jsonl", [
             codex_session_meta_line(now, self.session, "/project"),
-            codex_turn_context_line(now + 1, "gpt-5-codex"),
+            codex_turn_context_line(now + 1, "unweighted"),
             codex_task_started_line(now + 1),
             codex_tool_call_line(now + 2, "large", "exec", item="custom_tool_call",
                                  command='await tools.write_stdin({session_id:7, chars:""});'),
@@ -293,7 +293,7 @@ class ToolActivityReport(Harness):
         now = time.time() - 3600
         self.write_codex("rollout-mixed.jsonl", [
             codex_session_meta_line(now, self.session, "/project"),
-            codex_turn_context_line(now + 1, "gpt-5-codex"),
+            codex_turn_context_line(now + 1, "unweighted"),
             codex_task_started_line(now + 1),
             codex_tool_call_line(now + 2, "exec", "exec", item="custom_tool_call",
                                  command='await tools.write_stdin({session_id:7, chars:""});'),
@@ -322,7 +322,7 @@ class ToolActivityReport(Harness):
         now = time.time() - 3600
         lines = [
             codex_session_meta_line(now, self.session, "/project"),
-            codex_turn_context_line(now + 1, "gpt-5-codex"),
+            codex_turn_context_line(now + 1, "unweighted"),
             codex_task_started_line(now + 1),
         ]
         for index in range(400):

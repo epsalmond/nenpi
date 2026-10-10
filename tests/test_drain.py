@@ -1204,7 +1204,7 @@ class AttributionCap(Harness):
         opened = tiny_start - 60
         resets_b = opened + 18000
         exotic_session = "eeeeeeee-exotic-000-000-000000000000"
-        self.write_jump(tiny_start, exotic_session, "gpt-9000-nonexistent", 6_000, resets_b, 29.0)
+        self.write_jump(tiny_start, exotic_session, QD.UNWEIGHTED, 6_000, resets_b, 29.0)
 
         payload = self.run_json("sessions", "--harness", "codex", "--json", "--top", "20")
         exotic_row = self.session_by_short_id(payload, QD.short_id(exotic_session))
@@ -1367,13 +1367,20 @@ class AttributionCap(Harness):
                     tiny_start + 5, capped_session, input_tokens=6_000,
                     cached_input_tokens=0, output_tokens=0
                 ),
+                codex_token_count_line(tiny_start + 15, rate_limits=rate_limits(29.0, resets_b)),
+            ],
+        )
+        # Its own rollout, so the exempt session does not inherit the capped
+        # session's model and stays genuinely unweighted.
+        self.write_codex(
+            "rollout-mixed-exempt.jsonl",
+            [
                 codex_session_meta_line(tiny_start + 6, exempt_session, "/home/agent/exempt"),
-                codex_turn_context_line(tiny_start + 6, "gpt-9000-nonexistent"),
+                codex_turn_context_line(tiny_start + 6, QD.UNWEIGHTED),
                 codex_usage_record_line(
                     tiny_start + 10, exempt_session, input_tokens=6_000,
                     cached_input_tokens=0, output_tokens=0
                 ),
-                codex_token_count_line(tiny_start + 15, rate_limits=rate_limits(29.0, resets_b)),
             ],
         )
 
@@ -4362,9 +4369,11 @@ class WeightMemoization(unittest.TestCase):
         self.assertEqual(self.claude_models.lookups, after_first)
 
     def test_a_repeated_miss_is_remembered_as_a_miss(self) -> None:
+        # One lookup for the model and one for the tier it would be priced
+        # as, which this table does not have either.
         self.assertIsNone(self.counted.model_entry("claude", "no-such-model"))
         after_first = self.claude_models.lookups
-        self.assertEqual(after_first, 1)
+        self.assertEqual(after_first, 2)
         for _ in range(5):
             self.assertIsNone(self.counted.model_entry("claude", "no-such-model"))
         self.assertEqual(self.claude_models.lookups, after_first)
@@ -4395,16 +4404,17 @@ class WeightMemoization(unittest.TestCase):
     def test_memo_does_not_leak_between_harnesses(self) -> None:
         # "gpt-5.5" is a Codex model and has no Claude entry; a memo keyed on
         # the model alone would hand the Codex entry back for Claude.
-        self.assertIsNotNone(self.weights.model_entry("codex", "gpt-5.5"))
-        self.assertIsNone(self.weights.model_entry("claude", "gpt-5.5"))
-        self.assertIsNotNone(self.weights.model_entry("codex", "gpt-5.5"))
+        codex = self.weights.model_entry("codex", "gpt-5.5")
+        claude = self.weights.model_entry("claude", "gpt-5.5")
+        self.assertEqual(claude["priced_as"], "claude-sonnet-5")
+        self.assertIs(self.weights.model_entry("codex", "gpt-5.5"), codex)
 
     def test_invalidate_picks_up_a_table_edit(self) -> None:
-        self.assertIsNone(self.weights.model_entry("codex", "made-up-model"))
+        self.assertTrue(self.weights.model_entry("codex", "made-up-model")["guessed"])
         self.weights.table["codex"]["models"]["made-up-model"] = {
             "input": 1.0, "cached_input": 0.5, "output": 2.0
         }
-        self.assertIsNone(self.weights.model_entry("codex", "made-up-model"))
+        self.assertTrue(self.weights.model_entry("codex", "made-up-model")["guessed"])
         self.weights.invalidate()
         self.assertIsNotNone(self.weights.model_entry("codex", "made-up-model"))
         self.assertEqual(
@@ -4470,8 +4480,45 @@ class EventVectorEquivalence(unittest.TestCase):
         self.assertGreater(QD.vector_units(full, row), 0.0)
 
     def test_unweighted_model_has_no_vector(self) -> None:
-        self.assertIsNone(self.weights.event_vector("codex", "not-a-real-model"))
-        self.assertIsNone(self.weights.event_vector("claude", "not-a-real-model"))
+        self.assertIsNone(self.weights.event_vector("codex", QD.UNWEIGHTED))
+        self.assertIsNone(self.weights.event_vector("claude", QD.UNWEIGHTED))
+
+
+class UnknownModelWeights(unittest.TestCase):
+    """A model missing from the table is priced as a flagged guess, never zero."""
+
+    def setUp(self) -> None:
+        self.weights = QD.load_weights(False)
+
+    def test_published_gpt6_rates(self) -> None:
+        sol = self.weights.model_entry("codex", "gpt-6.1-sol")
+        luna = self.weights.model_entry("codex", "gpt-6-luna")
+        self.assertEqual((sol["input"], sol["cached_input"], sol["output"]), (50.0, 2.5, 250.0))
+        self.assertEqual((luna["input"], luna["cached_input"], luna["output"]), (2.5, 0.25, 12.5))
+        self.assertFalse(sol.get("guessed"))
+
+    def test_unknown_codex_model_takes_its_tier_rate(self) -> None:
+        entry = self.weights.model_entry("codex", "gpt-7-luna")
+        luna = self.weights.model_entry("codex", "gpt-6-luna")
+        self.assertEqual(entry["input"], luna["input"])
+        self.assertTrue(entry["guessed"])
+        self.assertEqual(entry["priced_as"], "gpt-6-luna")
+
+    def test_unknown_model_without_a_tier_takes_the_mid_tier(self) -> None:
+        self.assertEqual(self.weights.model_entry("codex", "gpt-7")["priced_as"], "gpt-6.1-sol")
+        self.assertEqual(
+            self.weights.model_entry("claude", "claude-next")["priced_as"], "claude-sonnet-5"
+        )
+        self.assertEqual(
+            self.weights.model_entry("claude", "claude-opus-6")["priced_as"], "claude-opus-5"
+        )
+
+    def test_guessed_models_name_what_they_were_priced_as(self) -> None:
+        self.assertEqual(
+            self.weights.guessed_models("codex", ["gpt-7-luna", "gpt-6-astra"]),
+            ["gpt-7-luna"],
+        )
+        self.assertIsNone(self.weights.model_entry("codex", QD.UNWEIGHTED))
 
 
 class ProfileFlag(Harness):

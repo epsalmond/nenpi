@@ -137,6 +137,8 @@ CLAUDE_PRICES = {
 # they are guessed at the sol rate and flagged.
 CODEX_CREDITS = {
     "gpt-6-astra": (250.0, 25.0, 1250.0, False),
+    "gpt-6.1-sol": (50.0, 2.5, 250.0, False),
+    "gpt-6-luna": (2.5, 0.25, 12.5, False),
     "gpt-5.6-sol": (100.0, 10.0, 500.0, False),
     "gpt-5.6-terra": (50.0, 5.0, 300.0, False),
     "gpt-5.6-luna": (5.0, 0.5, 30.0, False),
@@ -154,6 +156,18 @@ CODEX_MODEL_ALIASES = {
     "terra": "gpt-5.6-terra",
     "astra": "gpt-6-astra",
 }
+
+# A model missing from the weight table is priced as the current model of the
+# tier its name contains, else the middle tier, and flagged as guessed; pricing
+# it at zero would hide its usage and hand its measured drain to other sessions.
+MODEL_TIERS = {
+    "codex": (("astra", "gpt-6-astra"), ("sol", "gpt-6.1-sol"),
+              ("terra", "gpt-5.6-terra"), ("luna", "gpt-6-luna")),
+    "claude": (("fable", "claude-fable-5-1"), ("opus", "claude-opus-5"),
+               ("sonnet", "claude-sonnet-5"), ("haiku", "claude-haiku-4-5")),
+}
+DEFAULT_TIER_MODEL = {"codex": "gpt-6.1-sol", "claude": "claude-sonnet-5"}
+MODEL_NAME_PARTS = re.compile(r"[^a-z0-9]+")
 
 CLAUDE_DATE_SUFFIX = re.compile(r"-20\d{6}$")
 DURATION_ARG = re.compile(r"^(\d+(?:\.\d+)?)([hdwm])$")
@@ -611,8 +625,37 @@ class Weights:
         models = section.get("models") or {}
         entry = models.get(model)
         resolved = entry if isinstance(entry, Mapping) else None
+        if resolved is None:
+            resolved = self.guessed_entry(harness, model, models)
         entries[key] = resolved
         return resolved
+
+    def guessed_entry(
+        self, harness: str, model: str, models: Mapping[str, Any]
+    ) -> Optional[Mapping[str, Any]]:
+        """Price an unrecognised model as its tier's current model, flagged."""
+        if not model or model == UNWEIGHTED or harness not in MODEL_TIERS:
+            return None
+        parts = set(MODEL_NAME_PARTS.split(model.lower()))
+        priced_as = DEFAULT_TIER_MODEL[harness]
+        for tier, current in MODEL_TIERS[harness]:
+            if tier in parts:
+                priced_as = current
+                break
+        base = models.get(priced_as)
+        if not isinstance(base, Mapping):
+            return None
+        if harness == "claude":
+            # Resolve null (unfitted) coefficients against the model priced
+            # as, since `claude_price` cannot look the guessed name up.
+            guessed = dict(
+                (kind, claude_price(base, priced_as, kind)) for kind in CLAUDE_KINDS
+            )  # type: Dict[str, Any]
+        else:
+            guessed = dict(base)
+        guessed["guessed"] = True
+        guessed["priced_as"] = priced_as
+        return guessed
 
     def price_row(
         self, harness: str, model: str, cache_read_weight: Optional[float] = None
@@ -5979,9 +6022,15 @@ def header_lines(
     for row in rows:
         target = used_claude if row.summary.harness == "claude" else used_codex
         target.update(row.summary.models)
-    guessed = weights.guessed_models("codex", used_codex)
-    if guessed:
-        lines.append("caveat: guessed Codex weights for %s (weights_guessed)" % ", ".join(guessed))
+    for harness, used, name in (("codex", used_codex, "Codex"), ("claude", used_claude, "Claude")):
+        guessed = []
+        for model in weights.guessed_models(harness, used):
+            priced_as = (weights.model_entry(harness, model) or {}).get("priced_as")
+            guessed.append("%s (priced as %s)" % (model, priced_as) if priced_as else model)
+        if guessed:
+            lines.append(
+                "caveat: guessed %s weights for %s (weights_guessed)" % (name, ", ".join(guessed))
+            )
     if any(row.summary.harness == "claude" for row in rows):
         if args.claude_cache_read_weight is None:
             lines.append(
